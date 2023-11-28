@@ -1,4 +1,4 @@
-use std::{fmt::Debug, sync::Arc, rc::Rc, cell::RefCell, borrow::BorrowMut};
+use std::{fmt::Debug, borrow::BorrowMut};
 
 use log::{debug, info};
 
@@ -116,18 +116,24 @@ impl Pawn {
 impl Piece for Pawn {
 
     fn move_to(&self, position: Position, mut board: Board) -> Result<Board,ChessError> {
-        if position.to_index() <= self.position.to_index() {
-            return Err(ChessError::InvalidMove);
-        }
-
+        
         let new_index = position.to_index();
         let old_index = self.position.to_index();
-        let jump: usize = new_index - old_index;
+        let jump = new_index - old_index;
         info!("Pawn jump is {}", jump);
-        if jump <= 0 {
-            debug!("Invalid move jump is {}", jump );
-            return Err(ChessError::InvalidMove);
+        match self.color {
+            Color::Black => {
+                if jump > 0 {
+                    return Err(ChessError::InvalidMove);
+                }
+            },
+            Color::White => {
+                if jump < 0 {
+                    return Err(ChessError::InvalidMove);
+                }
+            },
         }
+        let jump = jump.abs();
         if jump != 8 && jump != 16 && jump != 7 && jump != 9 {
             return Err(ChessError::InvalidMove);
         }
@@ -136,8 +142,7 @@ impl Piece for Pawn {
             return Err(ChessError::InvalidMove);
         }
         
-        // let cloned_board = board.clone();
-        let square =  &board.squares[new_index];
+        let square =  &board.squares[new_index as usize];
         if (jump == 8 || jump == 16) && square.piece.is_some(){
             return Err(ChessError::InvalidMove);
         }
@@ -146,9 +151,16 @@ impl Piece for Pawn {
             return Err(ChessError::InvalidMove);
         }
         
-        board.squares[self.position.to_index()].piece = None;
+       
         println!("{:?} Pawn moved to {:?}", self.color, position);
-        board.borrow_mut().squares[new_index].piece = Some(Box::new(Pawn {
+        let other_piece = &square.piece;
+        if let Some(other_piece) = other_piece {
+            if other_piece.color() == self.color {
+                return Err(ChessError::InvalidMove);
+            }
+        }
+        board.squares[self.position.to_index() as usize].piece = None;
+        board.borrow_mut().squares[new_index as usize].piece = Some(Box::new(Pawn {
             color: self.color,
             position,
             is_first_move: false,
@@ -185,7 +197,60 @@ impl Piece for Rook {
             return Err(ChessError::InvalidMove);
         }
 
-        let square = &mut board.borrow_mut().squares[new_index];
+        if jump % 8 == 0 {
+            let mut index = old_index;
+            if new_index > old_index {
+                while index != new_index {
+                    index += 8;
+                    let square = &mut board.borrow_mut().squares[index as usize];
+                    if square.piece.is_some() {
+                        return Err(ChessError::InvalidMove);
+                    }
+                }
+            } else {
+                while index != new_index {
+                    index -= 8;
+                    let square = &mut board.borrow_mut().squares[index as usize];
+                    if square.piece.is_some() {
+                        return Err(ChessError::InvalidMove);
+                    }
+                }
+            }
+            
+        } else {
+            let mut index = old_index;
+            if new_index > old_index {
+                while index != new_index {
+                    index += 1;
+                    let square = &mut board.borrow_mut().squares[index as usize];
+                    if square.piece.is_some() {
+                        return Err(ChessError::InvalidMove);
+                    }
+                }
+            } else {
+                while index != new_index {
+                    index -= 1;
+                    let square = &mut board.borrow_mut().squares[index as usize];
+                    if square.piece.is_some() {
+                        return Err(ChessError::InvalidMove);
+                    }
+                }
+            }
+            
+        }
+
+        let square = &mut board.borrow_mut().squares[new_index as usize];
+        if square.piece.is_some() {
+            if square.piece.as_ref().unwrap().color() == self.color {
+                return Err(ChessError::InvalidMove);
+            }
+        }
+
+        board.squares[self.position.to_index() as usize].piece = None;
+        board.borrow_mut().squares[new_index as usize].piece = Some(Box::new(Rook {
+            color: self.color,
+            position,
+        }));
 
         println!("{:?} Rook move_to",self.color);
         Ok(board)
@@ -218,7 +283,7 @@ impl Piece for Bishop {
             return Err(ChessError::InvalidMove);
         }
 
-        let square = &mut board.borrow_mut().squares[new_index];
+        let square = &mut board.borrow_mut().squares[new_index as usize];
 
         println!("{:?} Bishop move_to",self.color);
         Ok(board)
@@ -251,7 +316,7 @@ impl Piece for Knight {
             return Err(ChessError::InvalidMove);
         }
 
-        let square = &mut board.borrow_mut().squares[new_index];
+        let square = &mut board.borrow_mut().squares[new_index as usize];
 
         println!("{:?} Knight move_to",self.color);
         Ok(board)
@@ -284,7 +349,7 @@ impl Piece for Queen {
             return Err(ChessError::InvalidMove);
         }
 
-        let square = &mut board.borrow_mut().squares[new_index];
+        let square = &mut board.borrow_mut().squares[new_index as usize];
 
         println!("{:?} Queen move_to",self.color);
         Ok(board)
@@ -316,7 +381,7 @@ impl Piece for King {
             return Err(ChessError::InvalidMove);
         }
 
-        let square = &mut board.borrow_mut().squares[new_index];
+        let square = &mut board.borrow_mut().squares[new_index as usize];
 
         println!("{:?} King move_to",self.color);
         Ok(board)
@@ -330,9 +395,7 @@ impl Piece for King {
 
 #[cfg(test)]
 mod test {
-    use std::{sync::Arc, rc::Rc, cell::RefCell};
-
-    use crate::{Board, Position, pieces::ChessError};
+    use crate::{Board, Position, pieces::{ChessError, Color}};
 
     fn init() {
         let _ = env_logger::builder().is_test(true).try_init();
@@ -364,12 +427,14 @@ mod test {
     }
 
     #[test]
-    fn test_pawn_invalid_moves() {
+    fn test_white_pawn_invalid_moves() {
         init();
         let board = Board::new();
         let pawn = board.get_piece(Position::new('b', 2)).unwrap().as_ref();
         
         let new_board = pawn.move_to(Position::new('b', 4), board.clone()).unwrap();
+        let black_pawn = new_board.get_piece(Position::new('b', 7)).unwrap().as_ref();
+        let new_board = black_pawn.move_to(Position::new('b', 5), new_board.clone()).unwrap();
         let pawn = new_board.get_piece(Position::new('b', 4)).unwrap().as_ref();
 
         let same_position = pawn.move_to(Position::new('b', 4), new_board.clone()).err().unwrap();
@@ -384,8 +449,186 @@ mod test {
         let wrong_back_move = pawn.move_to(Position::new('b', 3), new_board.clone()).err().unwrap();
         assert_eq!(wrong_back_move, ChessError::InvalidMove);
 
+        let wrong_move_two_squares = pawn.move_to(Position::new('b', 5), new_board.clone()).err().unwrap();
+        assert_eq!(wrong_move_two_squares, ChessError::InvalidMove,"Pawn can't move to a already occupied square");
     }
 
+
+    #[test]
+    fn test_black_pawn_invalid_moves() {
+        init();
+        let board = Board::new();
+        let pawn = board.get_piece(Position::new('c', 7)).unwrap().as_ref();
+        
+        let new_board = pawn.move_to(Position::new('c', 5), board.clone()).unwrap();
+        let pawn = new_board.get_piece(Position::new('c', 5)).unwrap().as_ref();
+
+        let same_position = pawn.move_to(Position::new('c', 5), new_board.clone()).err().unwrap();
+        assert_eq!(same_position, ChessError::InvalidMove);
+
+        let wrong_right_side_move = pawn.move_to(Position::new('d', 5), new_board.clone()).err().unwrap();
+        assert_eq!(wrong_right_side_move, ChessError::InvalidMove);
+
+        let wrong_left_side_move = pawn.move_to(Position::new('b', 5), new_board.clone()).err().unwrap();
+        assert_eq!(wrong_left_side_move, ChessError::InvalidMove);
+
+        let wrong_back_move = pawn.move_to(Position::new('c', 6), new_board.clone()).err().unwrap();
+        assert_eq!(wrong_back_move, ChessError::InvalidMove);
+
+    }
+
+    #[test]
+    fn test_white_pawn_no_to_piece_capture() {
+        init();
+        let board = Board::new();
+        let white_pawn = board.get_piece(Position::new('b', 2)).unwrap().as_ref();
+        
+        let new_board = white_pawn.move_to(Position::new('c', 3), board.clone());
+        assert_eq!(new_board.err().unwrap(), ChessError::InvalidMove,"No piece to capture on right side of the white pawn");
+        
+        let new_board = white_pawn.move_to(Position::new('a', 3), board.clone());
+        assert_eq!(new_board.err().unwrap(), ChessError::InvalidMove,"No piece to capture on left side of the white pawn");
+
+    }
+
+    #[test]
+    fn test_black_pawn_no_to_piece_capture() {
+        init();
+        let board = Board::new();
+        let black_pawn = board.get_piece(Position::new('b', 7)).unwrap().as_ref();
+        
+        let new_board = black_pawn.move_to(Position::new('c', 6), board.clone());
+        assert_eq!(new_board.err().unwrap(), ChessError::InvalidMove,"No piece to capture on right side of the black pawn");
+
+        let new_board = black_pawn.move_to(Position::new('a', 6), board.clone());
+        assert_eq!(new_board.err().unwrap(), ChessError::InvalidMove,"No piece to capture on left side of the black pawn");
+    }
+
+    #[test]
+    fn test_white_pawn_invalid_capture() {
+        init();
+        let board = Board::new();
+        let white_pawn = board.get_piece(Position::new('b', 2)).unwrap().as_ref();
+        
+        let other_white_pawn = board.get_piece(Position::new('c', 2)).unwrap().as_ref();
+        let new_board = other_white_pawn.move_to(Position::new('c', 3), board.clone()).unwrap();
+
+        let failed_board = white_pawn.move_to(Position::new('c', 3), new_board.clone());
+        assert_eq!(failed_board.err().unwrap(), ChessError::InvalidMove,"Capturing same color piece");
+    }
+
+    #[test]
+    fn test_black_pawn_invalid_capture() {
+        init();
+        let board = Board::new();
+        let black_pawn = board.get_piece(Position::new('b', 7)).unwrap().as_ref();
+        
+        let other_black_pawn = board.get_piece(Position::new('c', 7)).unwrap().as_ref();
+        let new_board = other_black_pawn.move_to(Position::new('c', 6), board.clone()).unwrap();
+
+        let failed_board = black_pawn.move_to(Position::new('c', 6), new_board.clone());
+        assert_eq!(failed_board.err().unwrap(), ChessError::InvalidMove,"Capturing same color piece");
+    }
+
+
+    #[test]
+    fn test_white_pawn_capture() {
+        init();
+        let board = Board::new();
+        let black_pawn = board.get_piece(Position::new('c', 7)).unwrap().as_ref();
+        let new_board = black_pawn.move_to(Position::new('c', 5), board.clone()).unwrap();
+        
+        let white_pawn = new_board.get_piece(Position::new('b', 2)).unwrap().as_ref();
+        let new_board = white_pawn.move_to(Position::new('b', 4), new_board.clone()).unwrap();
+
+        let white_pawn = new_board.get_piece(Position::new('b', 4)).unwrap().as_ref();
+        let new_board = white_pawn.move_to(Position::new('c', 5), new_board.clone());
+        assert!(new_board.is_ok(), "White pawn should capture black pawn");
+
+        let new_board = new_board.unwrap();
+        let white_pawn = new_board.get_piece(Position::new('c', 5));
+        assert_eq!(white_pawn.unwrap().color(),Color::White, "White pawn should be in c5");
+    }
+
+    #[test]
+    fn test_black_pawn_capture() {
+        init();
+        let board = Board::new();
+        let black_pawn = board.get_piece(Position::new('c', 7)).unwrap().as_ref();
+        let new_board = black_pawn.move_to(Position::new('c', 5), board.clone()).unwrap();
+        
+        let white_pawn = new_board.get_piece(Position::new('b', 2)).unwrap().as_ref();
+        let new_board = white_pawn.move_to(Position::new('b', 4), new_board.clone()).unwrap();
+
+        let black_pawn = new_board.get_piece(Position::new('c', 5)).unwrap().as_ref();
+        let new_board = black_pawn.move_to(Position::new('b', 4), new_board.clone());
+        assert!(new_board.is_ok(), "Black pawn should capture black pawn");
+
+        let new_board = new_board.unwrap();
+        let white_pawn = new_board.get_piece(Position::new('b', 4));
+        assert_eq!(white_pawn.unwrap().color(),Color::Black, "Black pawn should be in b4");
+    }
+
+    #[test]
+    fn test_white_rook_invalid_initial_move() {
+        init();
+        let board = Board::new();
+        let left_rook = board.get_piece(Position::new('a', 1)).unwrap().as_ref();
+        let new_board = left_rook.move_to(Position::new('a', 2), board.clone());
+        assert_eq!(new_board.err().unwrap(), ChessError::InvalidMove,"White left rook can't move to a2");
+
+        let new_board = left_rook.move_to(Position::new('b', 1), board.clone());
+        assert_eq!(new_board.err().unwrap(), ChessError::InvalidMove,"White left Rook can't move to b1");
+       
+        let right_rook = board.get_piece(Position::new('h', 1)).unwrap().as_ref();
+
+        let new_board = right_rook.move_to(Position::new('h', 2), board.clone());
+        assert_eq!(new_board.err().unwrap(), ChessError::InvalidMove,"White right Rook can't move to h2");
+
+        let new_board = right_rook.move_to(Position::new('g', 1), board.clone());
+        assert_eq!(new_board.err().unwrap(), ChessError::InvalidMove,"White right Rook can't move to g1");
+    }
+
+    #[test]
+    fn test_black_rook_invalid_initial_move() {
+        init();
+        let board = Board::new();
+        let left_rook = board.get_piece(Position::new('a', 8)).unwrap().as_ref();
+        let new_board = left_rook.move_to(Position::new('a', 7), board.clone());
+        assert_eq!(new_board.err().unwrap(), ChessError::InvalidMove,"Black left rook can't move to a7");
+
+        let new_board = left_rook.move_to(Position::new('b', 7), board.clone());
+        assert_eq!(new_board.err().unwrap(), ChessError::InvalidMove,"Black left Rook can't move to b1");
+       
+        let right_rook = board.get_piece(Position::new('h', 8)).unwrap().as_ref();
+
+        let new_board = right_rook.move_to(Position::new('h', 7), board.clone());
+        assert_eq!(new_board.err().unwrap(), ChessError::InvalidMove,"Black right Rook can't move to h2");
+
+        let new_board = right_rook.move_to(Position::new('g', 8), board.clone());
+        assert_eq!(new_board.err().unwrap(), ChessError::InvalidMove,"Black right Rook can't move to g1");
+    }
+
+    #[test]
+    fn test_rook_blocked_move() {
+        init();
+        let mut board = Board::new();
+        board.squares[Position::new('a', 2).to_index() as usize].piece = None;
+        let mut index = 2;
+        while index < 7 {
+            index += 1;
+            board.squares[index as usize].piece = None;
+        }
+        let left_rook = board.get_piece(Position::new('a', 1)).unwrap().as_ref();
+        
+        let new_board = left_rook.move_to(Position::new('a', 8), board.clone());
+        assert_eq!(new_board.err().unwrap(), ChessError::InvalidMove,"White left rook can't move to a6, blocked by black pawn");
+
+        let new_board = left_rook.move_to(Position::new('g', 1), board.clone());
+        assert_eq!(new_board.err().unwrap(), ChessError::InvalidMove,"White left Rook can't move to g1, blocked by white knight");
+    }
+
+    
 
 
 }

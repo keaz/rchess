@@ -63,7 +63,7 @@ impl Board {
     pub fn move_piece(&mut self, from: Position, to: Position) -> Result<(), ChessError> {
         let from_index = from.to_index();
         let to_index = to.to_index();
-        let piece = self.squares[from_index].piece.take();
+        let piece = self.squares[from_index as usize].piece.take();
         if piece.is_none() {
             return Err(ChessError::NoPiece);
         }
@@ -76,7 +76,7 @@ impl Board {
 
     pub fn get_piece(&self, position: Position) -> Option<&Box<dyn Piece>> {
         let index = position.to_index();
-        self.squares[index].piece.as_ref()
+        self.squares[index as usize].piece.as_ref()
     }
 
 }
@@ -119,10 +119,10 @@ impl Position {
         }
     }
 
-    pub fn to_index(&self) -> usize {
+    pub fn to_index(&self) -> i32 {
         let x = self.x as i32 - 97;
         let y = self.y - 1;
-        (x + (y * 8) as i32) as usize
+        x + (y * 8) as i32
     }
     
 }
