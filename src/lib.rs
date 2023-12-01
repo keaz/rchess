@@ -30,12 +30,12 @@ impl Board {
 
     fn fill_white(mut squares: Vec<Square>) -> Vec<Square> {
         squares[0].piece = Some(Box::new(pieces::rook::Rook::new(pieces::Color::White, Position::new('a', 1))));
-        squares[1].piece = Some(Box::new(pieces::Knight::new(pieces::Color::White, Position::new('b', 1))));
+        squares[1].piece = Some(Box::new(pieces::knight::Knight::new(pieces::Color::White, Position::new('b', 1))));
         squares[2].piece = Some(Box::new(pieces::bishop::Bishop::new(pieces::Color::White, Position::new('c', 1))));
         squares[3].piece = Some(Box::new(pieces::Queen::new(pieces::Color::White, Position::new('d', 1))));
         squares[4].piece = Some(Box::new(pieces::King::new(pieces::Color::White, Position::new('e', 1))));
         squares[5].piece = Some(Box::new(pieces::bishop::Bishop::new(pieces::Color::White, Position::new('f', 1))));
-        squares[6].piece = Some(Box::new(pieces::Knight::new(pieces::Color::White, Position::new('g', 1))));
+        squares[6].piece = Some(Box::new(pieces::knight::Knight::new(pieces::Color::White, Position::new('g', 1))));
         squares[7].piece = Some(Box::new(pieces::rook::Rook::new(pieces::Color::White, Position::new('h', 1))));
         for i in 8..16 {
             squares[i].piece = Some(Box::new(pieces::pawn::Pawn::new(pieces::Color::White, Position::new((i as i8 - 8 + 97) as u8 as char, 2))));
@@ -46,12 +46,12 @@ impl Board {
 
     fn fill_black(mut squares: Vec<Square>) -> Vec<Square> {
         squares[56].piece = Some(Box::new(pieces::rook::Rook::new(pieces::Color::Black, Position::new('a', 8))));
-        squares[57].piece = Some(Box::new(pieces::Knight::new(pieces::Color::Black, Position::new('b', 8))));
+        squares[57].piece = Some(Box::new(pieces::knight::Knight::new(pieces::Color::Black, Position::new('b', 8))));
         squares[58].piece = Some(Box::new(pieces::bishop::Bishop::new(pieces::Color::Black, Position::new('c', 8))));
         squares[59].piece = Some(Box::new(pieces::Queen::new(pieces::Color::Black, Position::new('d', 8))));
         squares[60].piece = Some(Box::new(pieces::King::new(pieces::Color::Black, Position::new('e', 8))));
         squares[61].piece = Some(Box::new(pieces::bishop::Bishop::new(pieces::Color::Black, Position::new('f', 8))));
-        squares[62].piece = Some(Box::new(pieces::Knight::new(pieces::Color::Black, Position::new('g', 8))));
+        squares[62].piece = Some(Box::new(pieces::knight::Knight::new(pieces::Color::Black, Position::new('g', 8))));
         squares[63].piece = Some(Box::new(pieces::rook::Rook::new(pieces::Color::Black, Position::new('h', 8))));
         for i in 48..56 {
             squares[i].piece = Some(Box::new(pieces::pawn::Pawn::new(pieces::Color::Black, Position::new((i as i8 - 48 + 97) as u8 as char, 7))));

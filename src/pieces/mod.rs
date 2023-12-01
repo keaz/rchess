@@ -5,6 +5,7 @@ use crate::{Board, Position};
 pub mod pawn;
 pub mod rook;
 pub mod bishop;
+pub mod knight;
 
 pub trait Piece : Debug + CloneAsPiece + 'static {
 
@@ -81,45 +82,7 @@ pub struct King {
     pub position: Position,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct Knight {
-    pub color: Color,
-    pub position: Position,
-}
 
-
-impl Knight {
-    pub fn new(color: Color, position: Position) -> Self {
-        Knight {
-            color,
-            position,
-        }
-    }
-    
-}
-
-impl Piece for Knight {
-
-    fn move_to(&self, position: Position,  mut board: Board) -> Result<Board,ChessError>{
-        let new_index = position.to_index();
-        let old_index = self.position.to_index();
-
-        let jump = new_index - old_index;
-        if jump != 6 && jump != 10 && jump != 15 && jump != 17 {
-            return Err(ChessError::InvalidMove);
-        }
-
-        let square = &mut board.borrow_mut().squares[new_index as usize];
-
-        println!("{:?} Knight move_to",self.color);
-        Ok(board)
-    }
-
-    fn color(&self) -> &Color {
-        &self.color
-    }
-    
-}
 
 impl Queen {
     pub fn new(color: Color, position: Position) -> Self {
