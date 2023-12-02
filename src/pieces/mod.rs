@@ -6,10 +6,11 @@ pub mod pawn;
 pub mod rook;
 pub mod bishop;
 pub mod knight;
+pub mod queen;
 
 pub trait Piece : Debug + CloneAsPiece + 'static {
 
-    fn move_to(&self, position: Position,  board: Board) -> Result<Board,ChessError>;
+    fn move_to(&mut self, position: Position,  board: Board) -> Result<Board,ChessError>;
 
     fn color(&self) -> &Color;
 
@@ -70,11 +71,6 @@ impl Debug for Color {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct Queen {
-    pub color: Color,
-    pub position: Position,
-}
 
 #[derive(Clone, Copy, Debug)]
 pub struct King {
@@ -82,40 +78,6 @@ pub struct King {
     pub position: Position,
 }
 
-
-
-impl Queen {
-    pub fn new(color: Color, position: Position) -> Self {
-        Queen {
-            color,
-            position,
-        }
-    }
-    
-}
-
-impl Piece for Queen {
-
-    fn move_to(&self, position: Position,  mut board: Board) -> Result<Board,ChessError> {
-        let new_index = position.to_index();
-        let old_index = self.position.to_index();
-
-        let jump = new_index - old_index;
-        if jump % 7 != 0 && jump % 9 != 0 && jump % 8 != 0 && jump / 8 != 0 {
-            return Err(ChessError::InvalidMove);
-        }
-
-        let square = &mut board.borrow_mut().squares[new_index as usize];
-
-        println!("{:?} Queen move_to",self.color);
-        Ok(board)
-    }
-
-    fn color(&self) -> &Color {
-        &self.color
-    }
-    
-}
 
 impl King {
     pub fn new(color: Color, position: Position) -> Self {
@@ -128,7 +90,7 @@ impl King {
 
 impl Piece for King {
 
-    fn move_to(&self, position: Position,  mut board: Board) -> Result<Board,ChessError> {
+    fn move_to(&mut self, position: Position,  mut board: Board) -> Result<Board,ChessError> {
         let new_index = position.to_index();
         let old_index = self.position.to_index();
 

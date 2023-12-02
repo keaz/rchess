@@ -32,7 +32,7 @@ impl Board {
         squares[0].piece = Some(Box::new(pieces::rook::Rook::new(pieces::Color::White, Position::new('a', 1))));
         squares[1].piece = Some(Box::new(pieces::knight::Knight::new(pieces::Color::White, Position::new('b', 1))));
         squares[2].piece = Some(Box::new(pieces::bishop::Bishop::new(pieces::Color::White, Position::new('c', 1))));
-        squares[3].piece = Some(Box::new(pieces::Queen::new(pieces::Color::White, Position::new('d', 1))));
+        squares[3].piece = Some(Box::new(pieces::queen::Queen::new(pieces::Color::White, Position::new('d', 1))));
         squares[4].piece = Some(Box::new(pieces::King::new(pieces::Color::White, Position::new('e', 1))));
         squares[5].piece = Some(Box::new(pieces::bishop::Bishop::new(pieces::Color::White, Position::new('f', 1))));
         squares[6].piece = Some(Box::new(pieces::knight::Knight::new(pieces::Color::White, Position::new('g', 1))));
@@ -48,7 +48,7 @@ impl Board {
         squares[56].piece = Some(Box::new(pieces::rook::Rook::new(pieces::Color::Black, Position::new('a', 8))));
         squares[57].piece = Some(Box::new(pieces::knight::Knight::new(pieces::Color::Black, Position::new('b', 8))));
         squares[58].piece = Some(Box::new(pieces::bishop::Bishop::new(pieces::Color::Black, Position::new('c', 8))));
-        squares[59].piece = Some(Box::new(pieces::Queen::new(pieces::Color::Black, Position::new('d', 8))));
+        squares[59].piece = Some(Box::new(pieces::queen::Queen::new(pieces::Color::Black, Position::new('d', 8))));
         squares[60].piece = Some(Box::new(pieces::King::new(pieces::Color::Black, Position::new('e', 8))));
         squares[61].piece = Some(Box::new(pieces::bishop::Bishop::new(pieces::Color::Black, Position::new('f', 8))));
         squares[62].piece = Some(Box::new(pieces::knight::Knight::new(pieces::Color::Black, Position::new('g', 8))));
@@ -58,6 +58,23 @@ impl Board {
         }
 
         squares
+    }
+
+    pub fn empty() -> Self {
+        let mut squares = Vec::new();
+        for y in 0..8 {
+            for x in 0..8 {
+                squares.push(Square {
+                    piece: None,
+                    x,
+                    y,
+                });
+            }
+        }
+
+        Board {
+            squares,
+        }
     }
 
     pub fn move_piece(mut self, from: Position, to: Position) -> Result<Board, ChessError> {

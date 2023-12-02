@@ -27,7 +27,7 @@ impl Pawn {
 
 impl Piece for Pawn {
 
-    fn move_to(&self, position: Position, mut board: Board) -> Result<Board,ChessError> {
+    fn move_to(&mut self, position: Position, mut board: Board) -> Result<Board,ChessError> {
         
         let new_index = position.to_index();
         let old_index = self.position.to_index();
@@ -71,12 +71,9 @@ impl Piece for Pawn {
                 return Err(ChessError::InvalidMove);
             }
         }
-        board.squares[self.position.to_index() as usize].piece = None;
-        board.borrow_mut().squares[new_index as usize].piece = Some(Box::new(Pawn {
-            color: self.color,
-            position,
-            is_first_move: false,
-        }));
+        
+        self.position = position.clone();
+        board.borrow_mut().squares[new_index as usize].piece = board.squares[old_index as usize].piece.take();
 
         //TODO: Pawn promotion
         Ok(board)
@@ -91,7 +88,7 @@ impl Piece for Pawn {
 
 #[cfg(test)]
 mod test {
-    use crate::{Board, Position, pieces::{ChessError, Color}};
+    use crate::{Board, Position, pieces::{ChessError, Color, pawn::Pawn, Piece}};
 
     fn init() {
         let _ = env_logger::builder().is_test(true).try_init();
@@ -100,14 +97,16 @@ mod test {
     #[test]
     fn test_pawn_first_two_moves() {
         init();
-        let board = Board::new();
-        let pawn = board.get_piece(Position::new('a', 2)).unwrap().as_ref();
-        
+        let mut board = Board::new();
+        let mut pawn = Pawn::new(Color::White, Position::new('a', 2));
+
+        board.squares[Position::new('a', 2).to_index() as usize].piece = Some(Box::new(pawn));
         let new_board = pawn.move_to(Position::new('a', 4), board.clone());
         assert!(new_board.is_ok());
 
-        let board = new_board.unwrap();
-        let pawn = board.get_piece(Position::new('a', 4)).unwrap().as_ref();
+        let mut board = new_board.unwrap();
+        let mut pawn = Pawn::new(Color::Black, Position::new('a', 4));
+        board.squares[Position::new('a', 4).to_index() as usize].piece = Some(Box::new(pawn));
         let new_board = pawn.move_to(Position::new('a', 6), board.clone()).err().unwrap();
         assert_eq!(new_board, ChessError::InvalidMove);
     }
@@ -115,8 +114,9 @@ mod test {
     #[test]
     fn test_pawn_first_one_move() {
         init();
-        let board = Board::new();
-        let pawn = board.get_piece(Position::new('a', 2)).unwrap().as_ref();
+        let mut board = Board::new();
+        let mut pawn = Pawn::new(Color::White, Position::new('a', 2));
+        board.squares[Position::new('a', 2).to_index() as usize].piece = Some(Box::new(pawn));
         
         let new_board = pawn.move_to(Position::new('a', 3), board.clone());
         assert!(new_board.is_ok());
@@ -125,14 +125,18 @@ mod test {
     #[test]
     fn test_white_pawn_invalid_moves() {
         init();
-        let board = Board::new();
-        let pawn = board.get_piece(Position::new('b', 2)).unwrap().as_ref();
+        let mut board = Board::new();
+        let mut pawn = Pawn::new(Color::White, Position::new('b', 2));
+        board.squares[Position::new('b', 2).to_index() as usize].piece = Some(Box::new(pawn));
         
-        let new_board = pawn.move_to(Position::new('b', 4), board.clone()).unwrap();
-        let black_pawn = new_board.get_piece(Position::new('b', 7)).unwrap().as_ref();
-        let new_board = black_pawn.move_to(Position::new('b', 5), new_board.clone()).unwrap();
-        let pawn = new_board.get_piece(Position::new('b', 4)).unwrap().as_ref();
-
+        let mut new_board = pawn.move_to(Position::new('b', 4), board.clone()).unwrap();
+        let mut black_pawn = Pawn::new(Color::Black, Position::new('b', 7));
+        new_board.squares[Position::new('b', 7).to_index() as usize].piece = Some(Box::new(black_pawn));
+        
+        let mut new_board = black_pawn.move_to(Position::new('b', 5), new_board.clone()).unwrap();
+        let mut pawn = Pawn::new(Color::White, Position::new('b', 4));
+        new_board.squares[Position::new('b', 4).to_index() as usize].piece = Some(Box::new(pawn));
+        
         let same_position = pawn.move_to(Position::new('b', 4), new_board.clone()).err().unwrap();
         assert_eq!(same_position, ChessError::InvalidMove);
 
@@ -153,22 +157,22 @@ mod test {
     #[test]
     fn test_black_pawn_invalid_moves() {
         init();
-        let board = Board::new();
-        let pawn = board.get_piece(Position::new('c', 7)).unwrap().as_ref();
+        let mut board = Board::new();
+        let mut pawn = Pawn::new(Color::Black, Position::new('c', 5));
+        pawn.is_first_move = false;
+        board.squares[Position::new('c', 7).to_index() as usize].piece = None;
+        board.squares[Position::new('c', 5).to_index() as usize].piece = Some(Box::new(pawn));
         
-        let new_board = pawn.move_to(Position::new('c', 5), board.clone()).unwrap();
-        let pawn = new_board.get_piece(Position::new('c', 5)).unwrap().as_ref();
-
-        let same_position = pawn.move_to(Position::new('c', 5), new_board.clone()).err().unwrap();
+        let same_position = pawn.move_to(Position::new('c', 5), board.clone()).err().unwrap();
         assert_eq!(same_position, ChessError::InvalidMove);
 
-        let wrong_right_side_move = pawn.move_to(Position::new('d', 5), new_board.clone()).err().unwrap();
+        let wrong_right_side_move = pawn.move_to(Position::new('d', 5), board.clone()).err().unwrap();
         assert_eq!(wrong_right_side_move, ChessError::InvalidMove);
 
-        let wrong_left_side_move = pawn.move_to(Position::new('b', 5), new_board.clone()).err().unwrap();
+        let wrong_left_side_move = pawn.move_to(Position::new('b', 5), board.clone()).err().unwrap();
         assert_eq!(wrong_left_side_move, ChessError::InvalidMove);
 
-        let wrong_back_move = pawn.move_to(Position::new('c', 6), new_board.clone()).err().unwrap();
+        let wrong_back_move = pawn.move_to(Position::new('c', 6), board.clone()).err().unwrap();
         assert_eq!(wrong_back_move, ChessError::InvalidMove);
 
     }
@@ -176,8 +180,9 @@ mod test {
     #[test]
     fn test_white_pawn_no_to_piece_capture() {
         init();
-        let board = Board::new();
-        let white_pawn = board.get_piece(Position::new('b', 2)).unwrap().as_ref();
+        let mut board = Board::new();
+        let mut white_pawn = Pawn::new(Color::White, Position::new('b', 2));
+        board.squares[Position::new('b', 2).to_index() as usize].piece = Some(Box::new(white_pawn));
         
         let new_board = white_pawn.move_to(Position::new('c', 3), board.clone());
         assert_eq!(new_board.err().unwrap(), ChessError::InvalidMove,"No piece to capture on right side of the white pawn");
@@ -190,9 +195,10 @@ mod test {
     #[test]
     fn test_black_pawn_no_to_piece_capture() {
         init();
-        let board = Board::new();
-        let black_pawn = board.get_piece(Position::new('b', 7)).unwrap().as_ref();
-        
+        let mut board = Board::new();
+        let mut black_pawn = Pawn::new(Color::Black, Position::new('b', 7));
+        board.squares[Position::new('b', 7).to_index() as usize].piece = Some(Box::new(black_pawn));
+                
         let new_board = black_pawn.move_to(Position::new('c', 6), board.clone());
         assert_eq!(new_board.err().unwrap(), ChessError::InvalidMove,"No piece to capture on right side of the black pawn");
 
@@ -203,10 +209,13 @@ mod test {
     #[test]
     fn test_white_pawn_invalid_capture() {
         init();
-        let board = Board::new();
-        let white_pawn = board.get_piece(Position::new('b', 2)).unwrap().as_ref();
+        let mut board = Board::new();
+        let mut white_pawn = Pawn::new(Color::White, Position::new('b', 2));
+        board.squares[Position::new('b', 2).to_index() as usize].piece = Some(Box::new(white_pawn));
+                
+        let mut other_white_pawn = Pawn::new(Color::White, Position::new('c', 2));
+        board.squares[Position::new('c', 2).to_index() as usize].piece = Some(Box::new(other_white_pawn));
         
-        let other_white_pawn = board.get_piece(Position::new('c', 2)).unwrap().as_ref();
         let new_board = other_white_pawn.move_to(Position::new('c', 3), board.clone()).unwrap();
 
         let failed_board = white_pawn.move_to(Position::new('c', 3), new_board.clone());
@@ -216,10 +225,13 @@ mod test {
     #[test]
     fn test_black_pawn_invalid_capture() {
         init();
-        let board = Board::new();
-        let black_pawn = board.get_piece(Position::new('b', 7)).unwrap().as_ref();
+        let mut board = Board::new();
+        let mut black_pawn = Pawn::new(Color::Black, Position::new('b', 7));
+        board.squares[Position::new('b', 7).to_index() as usize].piece = Some(Box::new(black_pawn));
         
-        let other_black_pawn = board.get_piece(Position::new('c', 7)).unwrap().as_ref();
+        let mut other_black_pawn = Pawn::new(Color::Black, Position::new('c', 7));
+        board.squares[Position::new('c', 7).to_index() as usize].piece = Some(Box::new(other_black_pawn));
+
         let new_board = other_black_pawn.move_to(Position::new('c', 6), board.clone()).unwrap();
 
         let failed_board = black_pawn.move_to(Position::new('c', 6), new_board.clone());
@@ -230,15 +242,17 @@ mod test {
     #[test]
     fn test_white_pawn_capture() {
         init();
-        let board = Board::new();
-        let black_pawn = board.get_piece(Position::new('c', 7)).unwrap().as_ref();
-        let new_board = black_pawn.move_to(Position::new('c', 5), board.clone()).unwrap();
+        let mut board = Board::new();
+        let black_pawn = Pawn::new(Color::Black, Position::new('c', 5));
+        board.squares[Position::new('c', 7).to_index() as usize].piece = None;
+        board.squares[Position::new('c', 5).to_index() as usize].piece = Some(Box::new(black_pawn));
         
-        let white_pawn = new_board.get_piece(Position::new('b', 2)).unwrap().as_ref();
-        let new_board = white_pawn.move_to(Position::new('b', 4), new_board.clone()).unwrap();
+        let mut white_pawn = Pawn::new(Color::White, Position::new('b', 4));
+        white_pawn.is_first_move = false;
+        board.squares[Position::new('b', 2).to_index() as usize].piece = None;
+        board.squares[Position::new('b', 4).to_index() as usize].piece = Some(Box::new(white_pawn));
 
-        let white_pawn = new_board.get_piece(Position::new('b', 4)).unwrap().as_ref();
-        let new_board = white_pawn.move_to(Position::new('c', 5), new_board.clone());
+        let new_board = white_pawn.move_to(Position::new('c', 5), board.clone());
         assert!(new_board.is_ok(), "White pawn should capture black pawn");
 
         let new_board = new_board.unwrap();
@@ -249,15 +263,17 @@ mod test {
     #[test]
     fn test_black_pawn_capture() {
         init();
-        let board = Board::new();
-        let black_pawn = board.get_piece(Position::new('c', 7)).unwrap().as_ref();
-        let new_board = black_pawn.move_to(Position::new('c', 5), board.clone()).unwrap();
+        let mut board = Board::new();
+        let mut black_pawn = Pawn::new(Color::Black, Position::new('c', 5));
+        black_pawn.is_first_move = false;
+        board.squares[Position::new('c', 7).to_index() as usize].piece = None;
+        board.squares[Position::new('c', 5).to_index() as usize].piece = Some(Box::new(black_pawn));
         
-        let white_pawn = new_board.get_piece(Position::new('b', 2)).unwrap().as_ref();
-        let new_board = white_pawn.move_to(Position::new('b', 4), new_board.clone()).unwrap();
-
-        let black_pawn = new_board.get_piece(Position::new('c', 5)).unwrap().as_ref();
-        let new_board = black_pawn.move_to(Position::new('b', 4), new_board.clone());
+        let white_pawn = Pawn::new(Color::White, Position::new('b', 4));
+        board.squares[Position::new('b', 2).to_index() as usize].piece = None;
+        board.squares[Position::new('b', 4).to_index() as usize].piece = Some(Box::new(white_pawn));
+        
+        let new_board = black_pawn.move_to(Position::new('b', 4), board.clone());
         assert!(new_board.is_ok(), "Black pawn should capture black pawn");
 
         let new_board = new_board.unwrap();
