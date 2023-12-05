@@ -1,6 +1,6 @@
 use std::{fmt::Display, ops::Range};
 
-use pieces::{king, knight, ChessError, Color, Piece, PieceType};
+use pieces::{king, ChessError, Color, Piece, PieceType};
 
 pub mod pieces;
 

@@ -160,7 +160,7 @@ mod test {
 
         let board = bishop.move_to(Position::new('f', 4), board);
         assert!(board.is_ok(), "c1 Beshop should be able to move to f4");
-        let (board, capture) = board.unwrap();
+        let (board, _capture) = board.unwrap();
         assert!(
             board.squares[Position::new('f', 4).to_index() as usize]
                 .piece
@@ -206,7 +206,7 @@ mod test {
             board.is_ok(),
             "e3 Beshop should be able to capture black pawn at a7"
         );
-        let (board, capture) = board.unwrap();
+        let (board, _capture) = board.unwrap();
 
         assert!(
             board.squares[Position::new('a', 7).to_index() as usize]

@@ -244,37 +244,37 @@ mod test {
         let result = king.move_to(Position::new('e', 5), board.clone());
         assert_eq!(result.is_ok(), true, "e4 King can move to e5");
 
-        let (mut board, capture) = result.unwrap();
+        let (board, _capture) = result.unwrap();
         let mut king = *board.get_piece(Position::new('e', 5)).unwrap();
         let result = king.move_to(Position::new('f', 6), board.clone());
         assert!(result.is_ok(), "e5 King can move to f6");
 
-        let (mut board, capture) = result.unwrap();
+        let (board, _capture) = result.unwrap();
         let mut king = *board.get_piece(Position::new('f', 6)).unwrap();
         let result = king.move_to(Position::new('g', 6), board.clone());
         assert_eq!(result.is_ok(), true, "f6 King can move to g6");
 
-        let (mut board, capture) = result.unwrap();
+        let (board, _capture) = result.unwrap();
         let mut king = *board.get_piece(Position::new('g', 6)).unwrap();
         let result = king.move_to(Position::new('h', 5), board.clone());
         assert_eq!(result.is_ok(), true, "g6 King can move to h5");
 
-        let (mut board, capture) = result.unwrap();
+        let (board, _capture) = result.unwrap();
         let mut king = *board.get_piece(Position::new('h', 5)).unwrap();
         let result = king.move_to(Position::new('h', 4), board.clone());
         assert_eq!(result.is_ok(), true, "h5 King can move to h4");
 
-        let (mut board, capture) = result.unwrap();
+        let (board, _capture) = result.unwrap();
         let mut king = *board.get_piece(Position::new('h', 4)).unwrap();
         let result = king.move_to(Position::new('g', 4), board.clone());
         assert_eq!(result.is_ok(), true, "h4 King can move to g4");
 
-        let (mut board, capture) = result.unwrap();
+        let (board, _capture) = result.unwrap();
         let mut king = *board.get_piece(Position::new('g', 4)).unwrap();
         let result = king.move_to(Position::new('f', 4), board.clone());
         assert_eq!(result.is_ok(), true, "g4 King can move to f4");
 
-        let (mut board, capture) = result.unwrap();
+        let (board, _capture) = result.unwrap();
         let mut king = *board.get_piece(Position::new('f', 4)).unwrap();
         let result = king.move_to(Position::new('e', 3), board.clone());
         assert_eq!(result.is_ok(), true, "f4 King can move to e3");
@@ -338,7 +338,7 @@ mod test {
         let mut king = PieceType::King(Color::White, Position::new('e', 6), u8::MAX);
         board.squares[Position::new('e', 6).to_index() as usize].piece = Some(king);
         board.squares[Position::new('e', 1).to_index() as usize].piece = None;
-        let black_pawn = PieceType::Pawn(Color::Black, Position::new('e', 7), 1, false);
+        let _black_pawn = PieceType::Pawn(Color::Black, Position::new('e', 7), 1, false);
 
         let result = king.move_to(Position::new('d', 7), board.clone());
         assert_eq!(
@@ -346,8 +346,8 @@ mod test {
             true,
             "e6 White King can capture Black d7 Pawn"
         );
-        let (mut new_board, capture) = result.unwrap();
-        let piece = new_board.get_piece(Position::new('d', 7)).unwrap();
+        let (new_board, _capture) = result.unwrap();
+        let _piece = new_board.get_piece(Position::new('d', 7)).unwrap();
     }
 
     #[test]

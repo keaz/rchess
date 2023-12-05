@@ -97,7 +97,7 @@ mod test {
             "d4 Knight should be able to move to e6"
         );
 
-        let (mut board, capture) = result.unwrap();
+        let (mut board, _capture) = result.unwrap();
         board.squares[Position::new('e', 6).to_index() as usize].piece = None;
         let mut knight = PieceType::Knight(Color::White, Position::new('d', 4), 3);
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(knight);
@@ -108,7 +108,7 @@ mod test {
             "d4 Knight should be able to move to f5"
         );
 
-        let (mut board, capture) = result.unwrap();
+        let (mut board, _capture) = result.unwrap();
         board.squares[Position::new('f', 5).to_index() as usize].piece = None;
         let mut knight = PieceType::Knight(Color::White, Position::new('d', 4), 3);
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(knight);
@@ -119,7 +119,7 @@ mod test {
             "d4 Knight should be able to move to f3"
         );
 
-        let (mut board, capture) = result.unwrap();
+        let (mut board, _capture) = result.unwrap();
         board.squares[Position::new('f', 3).to_index() as usize].piece = None;
         let mut knight = PieceType::Knight(Color::White, Position::new('d', 4), 3);
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(knight);
@@ -130,7 +130,7 @@ mod test {
             "d4 Knight should be able to move to e2"
         );
 
-        let (mut board, capture) = result.unwrap();
+        let (mut board, _capture) = result.unwrap();
         board.squares[Position::new('e', 2).to_index() as usize].piece = None;
         let mut knight = PieceType::Knight(Color::White, Position::new('d', 4), 3);
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(knight);
@@ -141,7 +141,7 @@ mod test {
             "d4 Knight should be able to move to c2"
         );
 
-        let (mut board, capture) = result.unwrap();
+        let (mut board, _capture) = result.unwrap();
         board.squares[Position::new('c', 2).to_index() as usize].piece = None;
         let mut knight = PieceType::Knight(Color::White, Position::new('d', 4), 3);
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(knight);
@@ -152,7 +152,7 @@ mod test {
             "d4 Knight should be able to move to b3"
         );
 
-        let (mut board, capture) = result.unwrap();
+        let (mut board, _capture) = result.unwrap();
         board.squares[Position::new('b', 3).to_index() as usize].piece = None;
         let mut knight = PieceType::Knight(Color::White, Position::new('d', 4), 3);
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(knight);

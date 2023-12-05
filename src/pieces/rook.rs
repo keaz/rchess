@@ -253,7 +253,7 @@ mod test {
             "White left rook should be able to capture black pawn in a7"
         );
 
-        let (mut new_board, capture) = new_board.unwrap();
+        let (mut new_board, _capture) = new_board.unwrap();
         let left_rook = new_board.get_piece(Position::new('a', 7)).unwrap();
         assert_eq!(left_rook.color(), Color::White, "White left rook is in a7");
 
