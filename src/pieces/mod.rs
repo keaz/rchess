@@ -1,4 +1,4 @@
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
 
 use crate::{Board, Position};
 
@@ -12,7 +12,11 @@ pub mod queen;
 pub mod rook;
 
 pub trait Piece: Debug + CloneAsPiece + 'static {
-    fn move_to(&mut self, position: Position, board: Board) -> Result<Board, ChessError>;
+    fn move_to(
+        &mut self,
+        position: Position,
+        board: Board,
+    ) -> Result<(Board, Option<PieceType>), ChessError>;
 
     fn can_move_to(&self, position: Position, board: &Board) -> Result<(), ChessError>;
 
@@ -32,7 +36,11 @@ pub enum PieceType {
 }
 
 impl Piece for PieceType {
-    fn move_to(&mut self, position: Position, board: Board) -> Result<Board, ChessError> {
+    fn move_to(
+        &mut self,
+        position: Position,
+        board: Board,
+    ) -> Result<(Board, Option<PieceType>), ChessError> {
         match self {
             PieceType::Pawn(_, _, _, _) => pawn_move_to(self, position, board),
             PieceType::Rook(_, _, _) => rook::move_to(self, position, board),
@@ -45,12 +53,24 @@ impl Piece for PieceType {
 
     fn can_move_to(&self, position: Position, board: &Board) -> Result<(), ChessError> {
         match self {
-            PieceType::Pawn(color,current_position,_, is_first_move ) => pawn::can_move_to(current_position, color, is_first_move, position, board),
-            PieceType::Rook(color, current_position,_) => rook::can_move_to(current_position,color, position, board),
-            PieceType::Bishop(color, current_position,_) => bishop::can_move_to(current_position,color, position, board),
-            PieceType::Knight(color, current_position,_) => knight::can_move_to(current_position,color, position, board),
-            PieceType::Queen(color, current_position,_) => queen::can_move_to(current_position,color, position, board),
-            PieceType::King(color, current_position,_) => king::can_move_to(current_position,color, position, board),
+            PieceType::Pawn(color, current_position, _, is_first_move) => {
+                pawn::can_move_to(current_position, color, is_first_move, position, board)
+            }
+            PieceType::Rook(color, current_position, _) => {
+                rook::can_move_to(current_position, color, position, board)
+            }
+            PieceType::Bishop(color, current_position, _) => {
+                bishop::can_move_to(current_position, color, position, board)
+            }
+            PieceType::Knight(color, current_position, _) => {
+                knight::can_move_to(current_position, color, position, board)
+            }
+            PieceType::Queen(color, current_position, _) => {
+                queen::can_move_to(current_position, color, position, board)
+            }
+            PieceType::King(color, current_position, _) => {
+                king::can_move_to(current_position, color, position, board)
+            }
         }
     }
 
@@ -62,6 +82,32 @@ impl Piece for PieceType {
             PieceType::Knight(color, _, _) => color,
             PieceType::Queen(color, _, _) => color,
             PieceType::King(color, _, _) => color,
+        }
+    }
+}
+
+impl Display for PieceType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PieceType::Pawn(color, _, _, _) => write!(f, "{} Pawn", color),
+            PieceType::Rook(color, _, _) => write!(f, "{} Rook", color),
+            PieceType::Bishop(color, _, _) => write!(f, "{} Bishop", color),
+            PieceType::Knight(color, _, _) => write!(f, "{} Knight", color),
+            PieceType::Queen(color, _, _) => write!(f, "{} Queen", color),
+            PieceType::King(color, _, _) => write!(f, "{} King", color),
+        }
+    }
+}
+
+impl PieceType {
+    pub fn value(&self) -> u8 {
+        match self {
+            PieceType::Pawn(_, _, value, _) => *value,
+            PieceType::Rook(_, _, value) => *value,
+            PieceType::Bishop(_, _, value) => *value,
+            PieceType::Knight(_, _, value) => *value,
+            PieceType::Queen(_, _, value) => *value,
+            PieceType::King(_, _, value) => *value,
         }
     }
 }
@@ -80,6 +126,15 @@ impl<T: Piece + Clone> CloneAsPiece for T {
 pub enum Color {
     Black,
     White,
+}
+
+impl Display for Color {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Color::Black => write!(f, "Black"),
+            Color::White => write!(f, "White"),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]

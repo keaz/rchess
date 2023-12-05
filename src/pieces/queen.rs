@@ -9,7 +9,7 @@ pub fn move_to(
     queen: &PieceType,
     position: Position,
     mut board: Board,
-) -> Result<Board, ChessError> {
+) -> Result<(Board, Option<PieceType>), ChessError> {
     match queen {
         PieceType::Queen(color, current_position, value) => {
             let new_index = position.to_index();
@@ -17,16 +17,17 @@ pub fn move_to(
 
             can_move_to(&current_position, &color, position, &board)?;
 
+            let captured_piece = board.squares[new_index as usize].piece;
             board.squares[old_index as usize].piece = None;
             board.squares[new_index as usize].piece =
                 Some(PieceType::Queen(*color, position, *value));
+
+            Ok((board, captured_piece))
         }
         _ => {
             return Err(ChessError::InvalidPiece);
         }
     }
-
-    Ok(board)
 }
 
 pub fn can_move_to(
@@ -43,15 +44,13 @@ pub fn can_move_to(
         return Err(ChessError::InvalidMove);
     }
 
-    if jump.abs() < 8 && position.y != current_position.y {
+    if jump.abs() < 7 && position.y != current_position.y {
         return Err(ChessError::InvalidMove);
     }
 
-    if jump % 8 == 0 || jump / 8 == 0 {
+    if jump % 8 == 0 || (jump / 8 == 0 && position.y == current_position.y) {
         rook_move(&board, old_index, new_index, jump)?;
-    }
-
-    if jump % 7 == 0 || jump % 9 == 0 {
+    } else if jump % 7 == 0 || jump % 9 == 0 {
         bishop_move(&board, old_index, new_index, jump)?;
     }
 
@@ -68,7 +67,7 @@ pub fn can_move_to(
 #[cfg(test)]
 mod test {
     use crate::{
-        pieces::{ChessError, Color, Piece, PieceType},
+        pieces::{queen::can_move_to, ChessError, Color, Piece, PieceType},
         Board, Position,
     };
 
@@ -107,6 +106,118 @@ mod test {
             result.err().unwrap(),
             ChessError::InvalidMove,
             "d4 White Queen should not be able to move to h1"
+        );
+    }
+
+    #[test]
+    fn test_queen_valid_move() {
+        init();
+
+        let mut board = Board::empty();
+        let queen = PieceType::Queen(Color::White, Position::new('d', 4), 9);
+        board.squares[Position::new('d', 4).to_index() as usize].piece = Some(queen);
+
+        let result = can_move_to(
+            &Position::new('d', 4),
+            &Color::White,
+            Position::new('d', 2),
+            &board,
+        );
+        assert!(
+            result.is_ok(),
+            "d4 White Queen should be able to move to d2"
+        );
+        let result = can_move_to(
+            &Position::new('d', 4),
+            &Color::White,
+            Position::new('d', 3),
+            &board,
+        );
+        assert!(
+            result.is_ok(),
+            "d4 White Queen should be able to move to d7"
+        );
+        let result = can_move_to(
+            &Position::new('d', 4),
+            &Color::White,
+            Position::new('d', 5),
+            &board,
+        );
+        assert!(
+            result.is_ok(),
+            "d4 White Queen should be able to move to d5"
+        );
+        let result = can_move_to(
+            &Position::new('d', 4),
+            &Color::White,
+            Position::new('d', 6),
+            &board,
+        );
+        assert!(
+            result.is_ok(),
+            "d4 White Queen should be able to move to d6"
+        );
+        let result = can_move_to(
+            &Position::new('d', 4),
+            &Color::White,
+            Position::new('e', 5),
+            &board,
+        );
+        assert!(
+            result.is_ok(),
+            "d4 White Queen should be able to move to e5"
+        );
+        let result = can_move_to(
+            &Position::new('d', 4),
+            &Color::White,
+            Position::new('e', 4),
+            &board,
+        );
+        assert!(
+            result.is_ok(),
+            "d4 White Queen should be able to move to e4"
+        );
+        let result = can_move_to(
+            &Position::new('d', 4),
+            &Color::White,
+            Position::new('e', 3),
+            &board,
+        );
+        assert!(
+            result.is_ok(),
+            "d4 White Queen should be able to move to e3"
+        );
+
+        let result = can_move_to(
+            &Position::new('d', 4),
+            &Color::White,
+            Position::new('c', 3),
+            &board,
+        );
+        assert!(
+            result.is_ok(),
+            "d4 White Queen should be able to move to c3"
+        );
+        let result = can_move_to(
+            &Position::new('d', 4),
+            &Color::White,
+            Position::new('c', 4),
+            &board,
+        );
+        assert!(
+            result.is_ok(),
+            "d4 White Queen should be able to move to c4"
+        );
+
+        let result = can_move_to(
+            &Position::new('d', 4),
+            &Color::White,
+            Position::new('c', 5),
+            &board,
+        );
+        assert!(
+            result.is_ok(),
+            "d4 White Queen should be able to move to c5"
         );
     }
 

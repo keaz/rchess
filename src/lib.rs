@@ -1,4 +1,6 @@
-use pieces::{ChessError, Piece, PieceType};
+use std::{fmt::Display, ops::Range};
+
+use pieces::{king, knight, ChessError, Color, Piece, PieceType};
 
 pub mod pieces;
 
@@ -10,9 +12,14 @@ pub struct Board {
 impl Board {
     pub fn new() -> Self {
         let mut squares = Vec::new();
-        for y in 0..8 {
-            for x in 0..8 {
-                squares.push(Square { piece: None, x, y });
+        for y in 1..9 {
+            let range: Range<u8> = 97..105;
+            for x in range {
+                squares.push(Square {
+                    piece: None,
+                    x: x as char,
+                    y,
+                });
             }
         }
 
@@ -130,22 +137,30 @@ impl Board {
     pub fn empty() -> Self {
         let mut squares = Vec::new();
         for y in 0..8 {
-            for x in 0..8 {
-                squares.push(Square { piece: None, x, y });
+            let range: Range<u8> = 97..105;
+            for x in range {
+                squares.push(Square {
+                    piece: None,
+                    x: x as char,
+                    y,
+                });
             }
         }
 
         Board { squares }
     }
 
-    pub fn move_piece(mut self, from: Position, to: Position) -> Result<Board, ChessError> {
+    pub fn move_piece(
+        mut self,
+        from: Position,
+        to: Position,
+    ) -> Result<(Board, Option<PieceType>), ChessError> {
         let from_index = from.to_index();
-        let to_index = to.to_index();
         let piece = self.squares[from_index as usize].piece.take();
         if piece.is_none() {
             return Err(ChessError::InvalidMove);
         }
-        let board = piece.unwrap().move_to(to, self)?; // Todo
+        let board = piece.unwrap().move_to(to, self)?;
         Ok(board)
     }
 
@@ -158,7 +173,9 @@ impl Board {
         let mut pieces = Vec::new();
         for square in &self.squares {
             if let Some(piece) = &square.piece {
-                pieces.push(piece);
+                if piece.color() == Color::White {
+                    pieces.push(piece);
+                }
             }
         }
 
@@ -169,19 +186,186 @@ impl Board {
         let mut pieces = Vec::new();
         for square in &self.squares {
             if let Some(piece) = &square.piece {
-                pieces.push(piece);
+                if piece.color() == Color::Black {
+                    pieces.push(piece);
+                }
             }
         }
 
         pieces
+    }
+
+    pub fn is_king_check(&self, color: &Color) -> bool {
+        let pieces = match color {
+            Color::White => self.get_all_white_pieces(),
+            Color::Black => self.get_all_black_pieces(),
+        };
+
+        pieces.iter().any(|piece| {
+            if let PieceType::King(_, _, _) = piece {
+                return king::is_check(**piece, &self);
+            }
+            false
+        })
+    }
+
+    pub fn can_king_move_safe_position(&self, color: &Color) -> bool {
+        let pieces = match color {
+            Color::White => self.get_all_white_pieces(),
+            Color::Black => self.get_all_black_pieces(),
+        };
+
+        pieces.iter().any(|piece| {
+            if let PieceType::King(_, _, _) = piece {
+                return king::can_king_move_safe_position(**piece, self);
+            }
+            false
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct Game {
+    pub board: Board,
+    pub white: Player,
+    pub black: Player,
+}
+
+impl Game {
+    pub fn new() -> Self {
+        let board = Board::new();
+        let white = Player {
+            color: Color::White,
+            moves: Vec::new(),
+            captured_pieces: Vec::new(),
+        };
+        let black = Player {
+            color: Color::Black,
+            moves: Vec::new(),
+            captured_pieces: Vec::new(),
+        };
+
+        Game {
+            board,
+            white,
+            black,
+        }
+    }
+
+    pub fn play(&mut self) {
+        let game = self;
+        let mut turn = Color::White;
+        loop {
+            let player = match turn {
+                Color::White => &mut game.white,
+                Color::Black => &mut game.black,
+            };
+
+            // print!("{}[2J", 27 as char);// Clear the terminal
+
+            let captured = &player.captured_pieces;
+            if !captured.is_empty() {
+                println!("{} captured pieces: ", turn);
+                captured.iter().for_each(|p| {
+                    print!("{}, ", p);
+                });
+                println!("");
+            }
+
+            player.moves.iter().for_each(|m| {
+                print!("{}, ", m);
+            });
+            println!("");
+            if game.board.is_king_check(&turn) {
+                if game.board.can_king_move_safe_position(&turn) {
+                    println!("{} king is in checkmate", turn);
+                    break;
+                }
+                println!("{:?} king is in check", turn);
+            }
+
+            let mut input = String::new();
+            println!("{} turn", player.color);
+            println!("Enter move: ");
+            std::io::stdin().read_line(&mut input).unwrap();
+            let input = input.trim();
+            let from = Position::new(
+                input.chars().nth(0).unwrap(),
+                input.chars().nth(1).unwrap().to_digit(10).unwrap() as i8,
+            );
+            let to = Position::new(
+                input.chars().nth(2).unwrap(),
+                input.chars().nth(3).unwrap().to_digit(10).unwrap() as i8,
+            );
+            let result = game.board.clone().move_piece(from, to);
+            if result.is_err() {
+                println!("Invalid move");
+                continue;
+            }
+
+            let (tmp_board, captured) = result.unwrap();
+            match turn {
+                Color::Black => {
+                    if tmp_board.is_king_check(&Color::Black) {
+                        println!("Invalid move, Black king is in check");
+                        continue;
+                    }
+                }
+                Color::White => {
+                    if tmp_board.is_king_check(&Color::White) {
+                        println!("Invalid move, White king is in check");
+                        continue;
+                    }
+                }
+            }
+
+            game.board = tmp_board;
+            player.moves.push(Move { from, to });
+            if let Some(captured) = captured {
+                player.captured_pieces.push(captured);
+            }
+
+            turn = match turn {
+                Color::White => Color::Black,
+                Color::Black => Color::White,
+            };
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Player {
+    pub color: Color,
+    pub moves: Vec<Move>,
+    pub captured_pieces: Vec<PieceType>,
+}
+
+impl Player {
+    pub fn get_total_value(&self) -> u8 {
+        self.captured_pieces
+            .iter()
+            .fold(0, |acc, piece| acc + piece.value())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Move {
+    pub from: Position,
+    pub to: Position,
+}
+
+impl Display for Move {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}{}", self.from.x, self.from.y)?;
+        write!(f, "{}{}", self.to.x, self.to.y)
     }
 }
 
 #[derive(Debug)]
 pub struct Square {
     pub piece: Option<PieceType>,
-    pub x: i32,
-    pub y: i32,
+    pub x: char,
+    pub y: i8,
 }
 
 impl Clone for Square {
@@ -220,7 +404,10 @@ impl Position {
 #[cfg(test)]
 mod test {
 
-    use crate::Position;
+    use crate::{
+        pieces::{Color, PieceType},
+        Board, Position,
+    };
 
     #[test]
     fn test_position_to_index() {
@@ -232,5 +419,29 @@ mod test {
         assert_eq!(position.to_index(), 28);
         let position = Position::new('c', 6);
         assert_eq!(position.to_index(), 42);
+    }
+
+    #[test]
+    fn test_black_king_check() {
+        let mut board = Board::empty();
+        let black_king = PieceType::King(Color::Black, Position::new('e', 8), u8::MAX);
+        let white_queen = PieceType::Queen(Color::White, Position::new('f', 7), 9);
+        board.squares[Position::new('e', 8).to_index() as usize].piece = Some(black_king);
+        board.squares[Position::new('f', 7).to_index() as usize].piece = Some(white_queen);
+
+        let is_check = board.is_king_check(&Color::Black);
+        assert_eq!(is_check, true);
+    }
+
+    #[test]
+    fn test_king_not_check() {
+        let mut board = Board::empty();
+        let king = PieceType::King(Color::White, Position::new('e', 6), u8::MAX);
+        let black_queen = PieceType::Queen(Color::Black, Position::new('f', 8), 9);
+        board.squares[Position::new('e', 6).to_index() as usize].piece = Some(king);
+        board.squares[Position::new('f', 8).to_index() as usize].piece = Some(black_queen);
+
+        let is_check = board.is_king_check(&Color::White);
+        assert_eq!(is_check, false);
     }
 }

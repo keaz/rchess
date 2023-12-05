@@ -6,7 +6,7 @@ pub fn move_to(
     bishop: &PieceType,
     position: Position,
     mut board: Board,
-) -> Result<Board, ChessError> {
+) -> Result<(Board, Option<PieceType>), ChessError> {
     match bishop {
         PieceType::Bishop(color, current_position, value) => {
             let new_index = position.to_index();
@@ -14,18 +14,17 @@ pub fn move_to(
 
             can_move_to(&current_position, &color, position, &board)?;
 
+            let captured_piece = board.squares[new_index as usize].piece;
             board.squares[old_index as usize].piece = None;
             board.squares[new_index as usize].piece =
                 Some(PieceType::Bishop(*color, position, *value));
 
-            println!("{:?} Bishop move_to {:?}", color, position);
+            Ok((board, captured_piece))
         }
         _ => {
             return Err(ChessError::InvalidPiece);
         }
     }
-
-    Ok(board)
 }
 
 pub fn can_move_to(
@@ -161,7 +160,7 @@ mod test {
 
         let board = bishop.move_to(Position::new('f', 4), board);
         assert!(board.is_ok(), "c1 Beshop should be able to move to f4");
-        let board: Board = board.unwrap();
+        let (board, capture) = board.unwrap();
         assert!(
             board.squares[Position::new('f', 4).to_index() as usize]
                 .piece
@@ -207,7 +206,7 @@ mod test {
             board.is_ok(),
             "e3 Beshop should be able to capture black pawn at a7"
         );
-        let board: Board = board.unwrap();
+        let (board, capture) = board.unwrap();
 
         assert!(
             board.squares[Position::new('a', 7).to_index() as usize]

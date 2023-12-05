@@ -8,7 +8,7 @@ pub fn move_to(
     rook: &PieceType,
     position: Position,
     mut board: Board,
-) -> Result<Board, ChessError> {
+) -> Result<(Board, Option<PieceType>), ChessError> {
     match rook {
         PieceType::Rook(color, current_position, value) => {
             let new_index = position.to_index();
@@ -16,16 +16,17 @@ pub fn move_to(
 
             can_move_to(&current_position, &color, position, &board)?;
 
+            let captured_piece = board.squares[new_index as usize].piece;
             board.squares[old_index as usize].piece = None;
             board.borrow_mut().squares[new_index as usize].piece =
                 Some(PieceType::Rook(*color, position, *value));
+
+            Ok((board, captured_piece))
         }
         _ => {
             return Err(ChessError::InvalidPiece);
         }
     }
-
-    Ok(board)
 }
 
 pub fn can_move_to(
@@ -252,7 +253,7 @@ mod test {
             "White left rook should be able to capture black pawn in a7"
         );
 
-        let mut new_board = new_board.unwrap();
+        let (mut new_board, capture) = new_board.unwrap();
         let left_rook = new_board.get_piece(Position::new('a', 7)).unwrap();
         assert_eq!(left_rook.color(), Color::White, "White left rook is in a7");
 
@@ -267,6 +268,7 @@ mod test {
         assert!(
             new_board
                 .unwrap()
+                .0
                 .get_piece(Position::new('b', 7))
                 .is_some(),
             "White left rook should be in b7"
