@@ -1,4 +1,6 @@
-use crate::{pieces::Color, Board, Position};
+use std::ops::ControlFlow;
+
+use crate::{pieces::Color, Board, Position, BOARD_SQUARES};
 
 use super::{ChessError, Piece, PieceType};
 
@@ -8,7 +10,7 @@ pub fn move_to(
     mut board: Board,
 ) -> Result<(Board, Option<PieceType>), ChessError> {
     match bishop {
-        PieceType::Bishop(color, current_position, value) => {
+        PieceType::Bishop(color, current_position) => {
             let new_index = position.to_index();
             let old_index = current_position.to_index();
 
@@ -16,8 +18,7 @@ pub fn move_to(
 
             let captured_piece = board.squares[new_index as usize].piece;
             board.squares[old_index as usize].piece = None;
-            board.squares[new_index as usize].piece =
-                Some(PieceType::Bishop(*color, position, *value));
+            board.squares[new_index as usize].piece = Some(PieceType::Bishop(*color, position));
 
             Ok((board, captured_piece))
         }
@@ -106,6 +107,60 @@ pub fn bishop_move(
     Ok(())
 }
 
+pub fn possible_moves(current_position: &Position, color: &Color, board: &Board) -> Vec<Position> {
+    let current_index = current_position.to_index();
+    let mut next_inndex = current_index + 7;
+    let mut positions = vec![];
+    while next_inndex <= BOARD_SQUARES {
+        if let ControlFlow::Break(_) = valide_move(color, board, next_inndex, &mut positions) {
+            break;
+        }
+        next_inndex += 7;
+    }
+
+    let mut next_inndex = current_index + 9;
+    while next_inndex <= BOARD_SQUARES {
+        if let ControlFlow::Break(_) = valide_move(color, board, next_inndex, &mut positions) {
+            break;
+        }
+        next_inndex += 9;
+    }
+
+    let mut next_inndex = current_index - 7;
+    while next_inndex >= 0 {
+        if let ControlFlow::Break(_) = valide_move(color, board, next_inndex, &mut positions) {
+            break;
+        }
+        next_inndex -= 7;
+    }
+
+    let mut next_inndex = current_index - 9;
+    while next_inndex >= 0 {
+        if let ControlFlow::Break(_) = valide_move(color, board, next_inndex, &mut positions) {
+            break;
+        }
+        next_inndex -= 9;
+    }
+    positions
+}
+
+fn valide_move(
+    color: &Color,
+    board: &Board,
+    next_inndex: i32,
+    positions: &mut Vec<Position>,
+) -> ControlFlow<()> {
+    let square = &board.squares[next_inndex as usize];
+    if square.piece.is_some() {
+        if square.piece.as_ref().unwrap().color() != color {
+            positions.push(Position::new(square.x, square.y));
+        }
+        return ControlFlow::Break(());
+    }
+    positions.push(Position::new(square.x, square.y));
+    ControlFlow::Continue(())
+}
+
 #[cfg(test)]
 mod test {
 
@@ -123,7 +178,7 @@ mod test {
         init();
 
         let mut board = Board::empty();
-        let mut bishop = PieceType::Bishop(Color::White, Position::new('c', 1), 3);
+        let mut bishop = PieceType::Bishop(Color::White, Position::new('c', 1));
         board.squares[Position::new('c', 1).to_index() as usize].piece = Some(bishop);
 
         let board = bishop.move_to(Position::new('c', 5), board);
@@ -139,7 +194,7 @@ mod test {
         init();
 
         let mut board = Board::new();
-        let mut bishop = PieceType::Bishop(Color::White, Position::new('c', 1), 3);
+        let mut bishop = PieceType::Bishop(Color::White, Position::new('c', 1));
         board.squares[Position::new('c', 1).to_index() as usize].piece = Some(bishop);
 
         let board = bishop.move_to(Position::new('f', 4), board);
@@ -155,7 +210,7 @@ mod test {
         init();
 
         let mut board = Board::empty();
-        let mut bishop = PieceType::Bishop(Color::White, Position::new('d', 2), 3);
+        let mut bishop = PieceType::Bishop(Color::White, Position::new('d', 2));
         board.squares[Position::new('d', 2).to_index() as usize].piece = Some(bishop);
 
         let board = bishop.move_to(Position::new('f', 4), board);
@@ -181,7 +236,7 @@ mod test {
 
         let mut board = Board::new();
         board.squares[Position::new('c', 2).to_index() as usize].piece = None;
-        let mut bishop = PieceType::Bishop(Color::White, Position::new('e', 3), 3);
+        let mut bishop = PieceType::Bishop(Color::White, Position::new('e', 3));
         board.squares[Position::new('e', 3).to_index() as usize].piece = Some(bishop);
 
         let board = bishop.move_to(Position::new('f', 2), board);
@@ -198,7 +253,7 @@ mod test {
 
         let mut board = Board::new();
         board.squares[Position::new('c', 2).to_index() as usize].piece = None;
-        let mut bishop = PieceType::Bishop(Color::White, Position::new('e', 3), 3);
+        let mut bishop = PieceType::Bishop(Color::White, Position::new('e', 3));
         board.squares[Position::new('e', 3).to_index() as usize].piece = Some(bishop);
 
         let board = bishop.move_to(Position::new('a', 7), board);

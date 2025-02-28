@@ -1,4 +1,6 @@
-use crate::{Board, Position};
+use std::ops::ControlFlow;
+
+use crate::{Board, Position, BOARD_SQUARES};
 
 use super::{ChessError, Color, Piece, PieceType};
 
@@ -8,7 +10,7 @@ pub fn move_to(
     mut board: Board,
 ) -> Result<(Board, Option<PieceType>), ChessError> {
     match knight {
-        PieceType::Knight(color, current_position, value) => {
+        PieceType::Knight(color, current_position) => {
             let new_index = position.to_index();
             let old_index = current_position.to_index();
 
@@ -16,8 +18,7 @@ pub fn move_to(
 
             let captured_piece = board.squares[new_index as usize].piece;
             board.squares[old_index as usize].piece = None;
-            board.squares[new_index as usize].piece =
-                Some(PieceType::Knight(*color, position, *value));
+            board.squares[new_index as usize].piece = Some(PieceType::Knight(*color, position));
 
             Ok((board, captured_piece))
         }
@@ -34,6 +35,9 @@ pub fn can_move_to(
     board: &Board,
 ) -> Result<(), ChessError> {
     let new_index = position.to_index();
+    if new_index < 0 || new_index >= BOARD_SQUARES {
+        return Err(ChessError::InvalidMove);
+    }
     let old_index = current_position.to_index();
 
     let jump = new_index - old_index;
@@ -52,6 +56,35 @@ pub fn can_move_to(
     Ok(())
 }
 
+pub fn possible_moves(current_position: &Position, color: &Color, board: &Board) -> Vec<Position> {
+    let mut positions = vec![];
+    let moves = [6, 10, 15, 17, -6, -10, -15, -17];
+    for m in moves.iter() {
+        let next_position = Position::from_index(current_position.to_index() + *m);
+        if can_move_to(current_position, color, next_position, board) == Ok(()) {
+            positions.push(next_position);
+        }
+    }
+    positions
+}
+
+fn valide_move(
+    color: &Color,
+    board: &Board,
+    next_inndex: i32,
+    positions: &mut Vec<Position>,
+) -> ControlFlow<()> {
+    let square = &board.squares[next_inndex as usize];
+    if square.piece.is_some() {
+        if square.piece.as_ref().unwrap().color() != color {
+            positions.push(Position::new(square.x, square.y));
+        }
+        return ControlFlow::Break(());
+    }
+    positions.push(Position::new(square.x, square.y));
+    ControlFlow::Continue(())
+}
+
 #[cfg(test)]
 mod test {
     use crate::{
@@ -67,7 +100,7 @@ mod test {
     fn test_knight_invalid_move() {
         init();
         let mut board = Board::empty();
-        let mut knight = PieceType::Knight(Color::White, Position::new('d', 4), 3);
+        let mut knight = PieceType::Knight(Color::White, Position::new('d', 4));
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(knight);
         let result = knight.move_to(Position::new('c', 1), board.clone());
         assert_eq!(
@@ -88,7 +121,7 @@ mod test {
     fn test_knight_valid_move() {
         init();
         let mut board = Board::empty();
-        let mut knight = PieceType::Knight(Color::White, Position::new('d', 4), 3);
+        let mut knight = PieceType::Knight(Color::White, Position::new('d', 4));
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(knight);
         let result = knight.move_to(Position::new('e', 6), board);
         assert_eq!(
@@ -99,7 +132,7 @@ mod test {
 
         let (mut board, _capture) = result.unwrap();
         board.squares[Position::new('e', 6).to_index() as usize].piece = None;
-        let mut knight = PieceType::Knight(Color::White, Position::new('d', 4), 3);
+        let mut knight = PieceType::Knight(Color::White, Position::new('d', 4));
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(knight);
         let result = knight.move_to(Position::new('f', 5), board);
         assert_eq!(
@@ -110,7 +143,7 @@ mod test {
 
         let (mut board, _capture) = result.unwrap();
         board.squares[Position::new('f', 5).to_index() as usize].piece = None;
-        let mut knight = PieceType::Knight(Color::White, Position::new('d', 4), 3);
+        let mut knight = PieceType::Knight(Color::White, Position::new('d', 4));
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(knight);
         let result = knight.move_to(Position::new('f', 3), board);
         assert_eq!(
@@ -121,7 +154,7 @@ mod test {
 
         let (mut board, _capture) = result.unwrap();
         board.squares[Position::new('f', 3).to_index() as usize].piece = None;
-        let mut knight = PieceType::Knight(Color::White, Position::new('d', 4), 3);
+        let mut knight = PieceType::Knight(Color::White, Position::new('d', 4));
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(knight);
         let result = knight.move_to(Position::new('e', 2), board);
         assert_eq!(
@@ -132,7 +165,7 @@ mod test {
 
         let (mut board, _capture) = result.unwrap();
         board.squares[Position::new('e', 2).to_index() as usize].piece = None;
-        let mut knight = PieceType::Knight(Color::White, Position::new('d', 4), 3);
+        let mut knight = PieceType::Knight(Color::White, Position::new('d', 4));
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(knight);
         let result = knight.move_to(Position::new('c', 2), board);
         assert_eq!(
@@ -143,7 +176,7 @@ mod test {
 
         let (mut board, _capture) = result.unwrap();
         board.squares[Position::new('c', 2).to_index() as usize].piece = None;
-        let mut knight = PieceType::Knight(Color::White, Position::new('d', 4), 3);
+        let mut knight = PieceType::Knight(Color::White, Position::new('d', 4));
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(knight);
         let result = knight.move_to(Position::new('b', 3), board);
         assert_eq!(
@@ -154,7 +187,7 @@ mod test {
 
         let (mut board, _capture) = result.unwrap();
         board.squares[Position::new('b', 3).to_index() as usize].piece = None;
-        let mut knight = PieceType::Knight(Color::White, Position::new('d', 4), 3);
+        let mut knight = PieceType::Knight(Color::White, Position::new('d', 4));
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(knight);
         let result = knight.move_to(Position::new('b', 5), board);
         assert_eq!(
@@ -169,7 +202,7 @@ mod test {
         init();
         let mut board = Board::new();
         board.squares[1].piece = None;
-        let mut knight = PieceType::Knight(Color::White, Position::new('d', 4), 3);
+        let mut knight = PieceType::Knight(Color::White, Position::new('d', 4));
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(knight);
         let result = knight.move_to(Position::new('e', 2), board);
         assert_eq!(
@@ -185,7 +218,7 @@ mod test {
         let mut board = Board::new();
         board.squares[1].piece = None;
         board.squares[Position::new('e', 2).to_index() as usize].piece = None;
-        let mut knight = PieceType::Knight(Color::White, Position::new('d', 5), 3);
+        let mut knight = PieceType::Knight(Color::White, Position::new('d', 5));
         board.squares[Position::new('d', 5).to_index() as usize].piece = Some(knight);
         let result = knight.move_to(Position::new('e', 7), board);
         assert_eq!(

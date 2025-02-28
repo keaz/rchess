@@ -1,6 +1,6 @@
-use std::borrow::BorrowMut;
+use std::{borrow::BorrowMut, ops::ControlFlow};
 
-use crate::{Board, Position};
+use crate::{Board, Position, BOARD_SQUARES};
 
 use super::{ChessError, Color, Piece, PieceType};
 
@@ -10,7 +10,7 @@ pub fn move_to(
     mut board: Board,
 ) -> Result<(Board, Option<PieceType>), ChessError> {
     match rook {
-        PieceType::Rook(color, current_position, value) => {
+        PieceType::Rook(color, current_position) => {
             let new_index = position.to_index();
             let old_index = current_position.to_index();
 
@@ -19,7 +19,7 @@ pub fn move_to(
             let captured_piece = board.squares[new_index as usize].piece;
             board.squares[old_index as usize].piece = None;
             board.borrow_mut().squares[new_index as usize].piece =
-                Some(PieceType::Rook(*color, position, *value));
+                Some(PieceType::Rook(*color, position));
 
             Ok((board, captured_piece))
         }
@@ -112,6 +112,60 @@ pub fn rook_move(
     Ok(())
 }
 
+pub fn possible_moves(current_position: &Position, color: &Color, board: &Board) -> Vec<Position> {
+    let current_index = current_position.to_index();
+    let mut next_inndex = current_index + 8;
+    let mut positions = vec![];
+    while next_inndex <= BOARD_SQUARES {
+        if let ControlFlow::Break(_) = valide_move(color, board, next_inndex, &mut positions) {
+            break;
+        }
+        next_inndex += 8;
+    }
+
+    let mut next_inndex = current_index + 1;
+    while next_inndex % 8 == 0 {
+        if let ControlFlow::Break(_) = valide_move(color, board, next_inndex, &mut positions) {
+            break;
+        }
+        next_inndex += 1;
+    }
+
+    let mut next_inndex = current_index - 8;
+    while next_inndex >= 0 {
+        if let ControlFlow::Break(_) = valide_move(color, board, next_inndex, &mut positions) {
+            break;
+        }
+        next_inndex -= 8;
+    }
+
+    let mut next_inndex = current_index - 1;
+    while next_inndex % 8 == 0 {
+        if let ControlFlow::Break(_) = valide_move(color, board, next_inndex, &mut positions) {
+            break;
+        }
+        next_inndex -= 1;
+    }
+    positions
+}
+
+fn valide_move(
+    color: &Color,
+    board: &Board,
+    next_inndex: i32,
+    positions: &mut Vec<Position>,
+) -> ControlFlow<()> {
+    let square = &board.squares[next_inndex as usize];
+    if square.piece.is_some() {
+        if square.piece.as_ref().unwrap().color() != color {
+            positions.push(Position::new(square.x, square.y));
+        }
+        return ControlFlow::Break(());
+    }
+    positions.push(Position::new(square.x, square.y));
+    ControlFlow::Continue(())
+}
+
 #[cfg(test)]
 mod test {
 
@@ -128,7 +182,7 @@ mod test {
     fn test_white_rook_invalid_move() {
         init();
         let mut board = Board::empty();
-        let mut rook = PieceType::Rook(Color::White, Position::new('d', 4), 5);
+        let mut rook = PieceType::Rook(Color::White, Position::new('d', 4));
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(rook);
 
         let new_board = rook.move_to(Position::new('e', 5), board.clone());
@@ -164,7 +218,7 @@ mod test {
     fn test_black_rook_invalid_initial_move() {
         init();
         let mut board = Board::new();
-        let mut left_rook = PieceType::Rook(Color::Black, Position::new('a', 8), 5);
+        let mut left_rook = PieceType::Rook(Color::Black, Position::new('a', 8));
         board.squares[Position::new('a', 8).to_index() as usize].piece = Some(left_rook);
 
         let new_board = left_rook.move_to(Position::new('a', 7), board.clone());
@@ -181,7 +235,7 @@ mod test {
             "Black left Rook can't move to b7"
         );
 
-        let mut right_rook = PieceType::Rook(Color::Black, Position::new('h', 8), 5);
+        let mut right_rook = PieceType::Rook(Color::Black, Position::new('h', 8));
         board.squares[Position::new('h', 8).to_index() as usize].piece = Some(right_rook);
 
         let new_board = right_rook.move_to(Position::new('h', 7), board.clone());
@@ -216,7 +270,7 @@ mod test {
             index += 1;
             board.squares[index as usize].piece = None;
         }
-        let mut left_rook = PieceType::Rook(Color::White, Position::new('a', 1), 5);
+        let mut left_rook = PieceType::Rook(Color::White, Position::new('a', 1));
         board.squares[Position::new('a', 1).to_index() as usize].piece = Some(left_rook);
 
         let new_board = left_rook.move_to(Position::new('a', 8), board.clone());
@@ -244,7 +298,7 @@ mod test {
             index += 1;
             board.squares[index as usize].piece = None;
         }
-        let mut left_rook = PieceType::Rook(Color::White, Position::new('a', 1), 5);
+        let mut left_rook = PieceType::Rook(Color::White, Position::new('a', 1));
         board.squares[Position::new('a', 1).to_index() as usize].piece = Some(left_rook);
 
         let new_board = left_rook.move_to(Position::new('a', 7), board.clone());
@@ -257,7 +311,7 @@ mod test {
         let left_rook = new_board.get_piece(Position::new('a', 7)).unwrap();
         assert_eq!(left_rook.color(), Color::White, "White left rook is in a7");
 
-        let mut left_rook = PieceType::Rook(Color::White, Position::new('a', 7), 5);
+        let mut left_rook = PieceType::Rook(Color::White, Position::new('a', 7));
         new_board.squares[Position::new('a', 7).to_index() as usize].piece = Some(left_rook);
         let new_board = left_rook.move_to(Position::new('b', 7), new_board.clone());
 

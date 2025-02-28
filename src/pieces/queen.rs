@@ -1,9 +1,11 @@
+use std::ops::ControlFlow;
+
 use crate::{
     pieces::{bishop::bishop_move, rook::rook_move},
-    Board, Position,
+    Board, Position, BOARD_SQUARES,
 };
 
-use super::{ChessError, Color, Piece, PieceType};
+use super::{bishop, rook, ChessError, Color, Piece, PieceType};
 
 pub fn move_to(
     queen: &PieceType,
@@ -11,7 +13,7 @@ pub fn move_to(
     mut board: Board,
 ) -> Result<(Board, Option<PieceType>), ChessError> {
     match queen {
-        PieceType::Queen(color, current_position, value) => {
+        PieceType::Queen(color, current_position) => {
             let new_index = position.to_index();
             let old_index = current_position.to_index();
 
@@ -19,8 +21,7 @@ pub fn move_to(
 
             let captured_piece = board.squares[new_index as usize].piece;
             board.squares[old_index as usize].piece = None;
-            board.squares[new_index as usize].piece =
-                Some(PieceType::Queen(*color, position, *value));
+            board.squares[new_index as usize].piece = Some(PieceType::Queen(*color, position));
 
             Ok((board, captured_piece))
         }
@@ -64,6 +65,13 @@ pub fn can_move_to(
     Ok(())
 }
 
+pub fn possible_moves(current_position: &Position, color: &Color, board: &Board) -> Vec<Position> {
+    let mut bishop_positions = bishop::possible_moves(current_position, color, board);
+    let rook_positions = rook::possible_moves(current_position, color, board);
+    bishop_positions.extend(rook_positions);
+    bishop_positions
+}
+
 #[cfg(test)]
 mod test {
     use crate::{
@@ -80,7 +88,7 @@ mod test {
         init();
 
         let mut board = Board::empty();
-        let mut queen = PieceType::Queen(Color::White, Position::new('d', 4), 9);
+        let mut queen = PieceType::Queen(Color::White, Position::new('d', 4));
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(queen);
 
         let result = queen.move_to(Position::new('c', 2), board.clone());
@@ -114,7 +122,7 @@ mod test {
         init();
 
         let mut board = Board::empty();
-        let queen = PieceType::Queen(Color::White, Position::new('d', 4), 9);
+        let queen = PieceType::Queen(Color::White, Position::new('d', 4));
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(queen);
 
         let result = can_move_to(
@@ -226,7 +234,7 @@ mod test {
         init();
 
         let mut board = Board::new();
-        let mut queen = PieceType::Queen(Color::White, Position::new('d', 4), 9);
+        let mut queen = PieceType::Queen(Color::White, Position::new('d', 4));
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(queen);
         board.squares[Position::new('d', 1).to_index() as usize].piece = None;
 
@@ -261,7 +269,7 @@ mod test {
         init();
 
         let mut board = Board::new();
-        let mut queen = PieceType::Queen(Color::White, Position::new('d', 4), 9);
+        let mut queen = PieceType::Queen(Color::White, Position::new('d', 4));
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(queen);
         board.squares[Position::new('d', 1).to_index() as usize].piece = None;
 
@@ -278,7 +286,7 @@ mod test {
         init();
 
         let mut board = Board::new();
-        let mut queen = PieceType::Queen(Color::Black, Position::new('d', 4), 9);
+        let mut queen = PieceType::Queen(Color::Black, Position::new('d', 4));
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(queen);
         board.squares[Position::new('d', 8).to_index() as usize].piece = None;
 
@@ -295,7 +303,7 @@ mod test {
         init();
 
         let mut board = Board::new();
-        let mut queen = PieceType::Queen(Color::White, Position::new('d', 4), 9);
+        let mut queen = PieceType::Queen(Color::White, Position::new('d', 4));
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(queen);
         board.squares[Position::new('d', 1).to_index() as usize].piece = None;
 
@@ -311,7 +319,7 @@ mod test {
         init();
 
         let mut board = Board::new();
-        let mut queen = PieceType::Queen(Color::Black, Position::new('d', 4), 9);
+        let mut queen = PieceType::Queen(Color::Black, Position::new('d', 4));
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(queen);
         board.squares[Position::new('d', 8).to_index() as usize].piece = None;
 

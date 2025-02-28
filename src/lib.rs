@@ -2,7 +2,11 @@ use std::{fmt::Display, ops::Range};
 
 use pieces::{king, ChessError, Color, Piece, PieceType};
 
+pub mod ai;
 pub mod pieces;
+
+pub const BOARD_SIZE: i32 = 8;
+pub const BOARD_SQUARES: i32 = BOARD_SIZE * BOARD_SIZE;
 
 #[derive(Debug, Clone)]
 pub struct Board {
@@ -32,48 +36,39 @@ impl Board {
         squares[0].piece = Some(pieces::PieceType::Rook(
             pieces::Color::White,
             Position::new('a', 1),
-            5,
         ));
         squares[1].piece = Some(pieces::PieceType::Knight(
             pieces::Color::White,
             Position::new('b', 1),
-            3,
         ));
         squares[2].piece = Some(pieces::PieceType::Bishop(
             pieces::Color::White,
             Position::new('c', 1),
-            3,
         ));
         squares[3].piece = Some(pieces::PieceType::Queen(
             pieces::Color::White,
             Position::new('d', 1),
-            9,
         ));
         squares[4].piece = Some(pieces::PieceType::King(
             pieces::Color::White,
             Position::new('e', 1),
-            u8::MAX,
         ));
         squares[5].piece = Some(pieces::PieceType::Bishop(
             pieces::Color::White,
             Position::new('f', 1),
-            3,
         ));
         squares[6].piece = Some(pieces::PieceType::Knight(
             pieces::Color::White,
             Position::new('g', 1),
-            3,
         ));
         squares[7].piece = Some(pieces::PieceType::Rook(
             pieces::Color::White,
             Position::new('h', 1),
-            5,
         ));
         for i in 8..16 {
             squares[i].piece = Some(pieces::PieceType::Pawn(
                 pieces::Color::White,
                 Position::new((i as i8 - 8 + 97) as u8 as char, 2),
-                1,
                 true,
             ));
         }
@@ -85,48 +80,39 @@ impl Board {
         squares[56].piece = Some(pieces::PieceType::Rook(
             pieces::Color::Black,
             Position::new('a', 8),
-            5,
         ));
         squares[57].piece = Some(pieces::PieceType::Knight(
             pieces::Color::Black,
             Position::new('b', 8),
-            3,
         ));
         squares[58].piece = Some(pieces::PieceType::Bishop(
             pieces::Color::Black,
             Position::new('c', 8),
-            3,
         ));
         squares[59].piece = Some(pieces::PieceType::Queen(
             pieces::Color::Black,
             Position::new('d', 8),
-            9,
         ));
         squares[60].piece = Some(pieces::PieceType::King(
             pieces::Color::Black,
             Position::new('e', 8),
-            u8::MAX,
         ));
         squares[61].piece = Some(pieces::PieceType::Bishop(
             pieces::Color::Black,
             Position::new('f', 8),
-            3,
         ));
         squares[62].piece = Some(pieces::PieceType::Knight(
             pieces::Color::Black,
             Position::new('g', 8),
-            3,
         ));
         squares[63].piece = Some(pieces::PieceType::Rook(
             pieces::Color::Black,
             Position::new('h', 8),
-            5,
         ));
         for i in 48..56 {
             squares[i].piece = Some(pieces::PieceType::Pawn(
                 pieces::Color::Black,
                 Position::new((i as i8 - 48 + 97) as u8 as char, 7),
-                1,
                 true,
             ));
         }
@@ -202,7 +188,7 @@ impl Board {
         };
 
         pieces.iter().any(|piece| {
-            if let PieceType::King(_, _, _) = piece {
+            if let PieceType::King(_, _) = piece {
                 return king::is_check(**piece, &self);
             }
             false
@@ -216,7 +202,7 @@ impl Board {
         };
 
         pieces.iter().any(|piece| {
-            if let PieceType::King(_, _, _) = piece {
+            if let PieceType::King(_, _) = piece {
                 return king::can_king_move_safe_position(**piece, self);
             }
             false
@@ -260,8 +246,6 @@ impl Game {
                 Color::White => &mut game.white,
                 Color::Black => &mut game.black,
             };
-
-            // print!("{}[2J", 27 as char);// Clear the terminal
 
             let captured = &player.captured_pieces;
             if !captured.is_empty() {
@@ -399,6 +383,15 @@ impl Position {
         let y = self.y - 1;
         x + (y * 8) as i32
     }
+
+    pub fn from_index(index: i32) -> Self {
+        let x = (index % 8) + 97;
+        let y = (index / 8) + 1;
+        Position {
+            x: x as u8 as char,
+            y: y as i8,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -424,8 +417,8 @@ mod test {
     #[test]
     fn test_black_king_check() {
         let mut board = Board::empty();
-        let black_king = PieceType::King(Color::Black, Position::new('e', 8), u8::MAX);
-        let white_queen = PieceType::Queen(Color::White, Position::new('f', 7), 9);
+        let black_king = PieceType::King(Color::Black, Position::new('e', 8));
+        let white_queen = PieceType::Queen(Color::White, Position::new('f', 7));
         board.squares[Position::new('e', 8).to_index() as usize].piece = Some(black_king);
         board.squares[Position::new('f', 7).to_index() as usize].piece = Some(white_queen);
 
@@ -436,8 +429,8 @@ mod test {
     #[test]
     fn test_king_not_check() {
         let mut board = Board::empty();
-        let king = PieceType::King(Color::White, Position::new('e', 6), u8::MAX);
-        let black_queen = PieceType::Queen(Color::Black, Position::new('f', 8), 9);
+        let king = PieceType::King(Color::White, Position::new('e', 6));
+        let black_queen = PieceType::Queen(Color::Black, Position::new('f', 8));
         board.squares[Position::new('e', 6).to_index() as usize].piece = Some(king);
         board.squares[Position::new('f', 8).to_index() as usize].piece = Some(black_queen);
 
