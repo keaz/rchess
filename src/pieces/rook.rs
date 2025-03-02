@@ -1,14 +1,14 @@
 use std::{borrow::BorrowMut, ops::ControlFlow};
 
-use crate::{Board, Position, BOARD_SQUARES};
+use crate::{board::BOARD_SQUARES, Board, Position};
 
 use super::{ChessError, Color, Piece, PieceType};
 
 pub fn move_to(
     rook: &PieceType,
     position: Position,
-    mut board: Board,
-) -> Result<(Board, Option<PieceType>), ChessError> {
+    board: &mut Board,
+) -> Result<Option<PieceType>, ChessError> {
     match rook {
         PieceType::Rook(color, current_position) => {
             let new_index = position.to_index();
@@ -21,7 +21,7 @@ pub fn move_to(
             board.borrow_mut().squares[new_index as usize].piece =
                 Some(PieceType::Rook(*color, position));
 
-            Ok((board, captured_piece))
+            Ok(captured_piece)
         }
         _ => {
             return Err(ChessError::InvalidPiece);
@@ -185,28 +185,28 @@ mod test {
         let mut rook = PieceType::Rook(Color::White, Position::new('d', 4));
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(rook);
 
-        let new_board = rook.move_to(Position::new('e', 5), board.clone());
+        let new_board = rook.move_to(Position::new('e', 5), &mut board);
         assert_eq!(
             new_board.err().unwrap(),
             ChessError::InvalidMove,
             "White left Rook can't move to e5"
         );
 
-        let new_board = rook.move_to(Position::new('e', 3), board.clone());
+        let new_board = rook.move_to(Position::new('e', 3), &mut board);
         assert_eq!(
             new_board.err().unwrap(),
             ChessError::InvalidMove,
             "White left Rook can't move to e3"
         );
 
-        let new_board = rook.move_to(Position::new('c', 5), board.clone());
+        let new_board = rook.move_to(Position::new('c', 5), &mut board);
         assert_eq!(
             new_board.err().unwrap(),
             ChessError::InvalidMove,
             "White right Rook can't move to c4"
         );
 
-        let new_board = rook.move_to(Position::new('c', 3), board.clone());
+        let new_board = rook.move_to(Position::new('c', 3), &mut board);
         assert_eq!(
             new_board.err().unwrap(),
             ChessError::InvalidMove,
@@ -221,14 +221,14 @@ mod test {
         let mut left_rook = PieceType::Rook(Color::Black, Position::new('a', 8));
         board.squares[Position::new('a', 8).to_index() as usize].piece = Some(left_rook);
 
-        let new_board = left_rook.move_to(Position::new('a', 7), board.clone());
+        let new_board = left_rook.move_to(Position::new('a', 7), &mut board);
         assert_eq!(
             new_board.err().unwrap(),
             ChessError::InvalidCapture,
             "Black left rook can't move to a7"
         );
 
-        let new_board = left_rook.move_to(Position::new('b', 7), board.clone());
+        let new_board = left_rook.move_to(Position::new('b', 7), &mut board);
         assert_eq!(
             new_board.err().unwrap(),
             ChessError::InvalidMove,
@@ -238,21 +238,21 @@ mod test {
         let mut right_rook = PieceType::Rook(Color::Black, Position::new('h', 8));
         board.squares[Position::new('h', 8).to_index() as usize].piece = Some(right_rook);
 
-        let new_board = right_rook.move_to(Position::new('h', 7), board.clone());
+        let new_board = right_rook.move_to(Position::new('h', 7), &mut board);
         assert_eq!(
             new_board.err().unwrap(),
             ChessError::InvalidCapture,
             "Black right Rook can't move to h7"
         );
 
-        let new_board = right_rook.move_to(Position::new('g', 8), board.clone());
+        let new_board = right_rook.move_to(Position::new('g', 8), &mut board);
         assert_eq!(
             new_board.err().unwrap(),
             ChessError::InvalidCapture,
             "Black right Rook can't move to g8"
         );
 
-        let new_board = right_rook.move_to(Position::new('g', 7), board.clone());
+        let new_board = right_rook.move_to(Position::new('g', 7), &mut board);
         assert_eq!(
             new_board.err().unwrap(),
             ChessError::InvalidMove,
@@ -273,14 +273,14 @@ mod test {
         let mut left_rook = PieceType::Rook(Color::White, Position::new('a', 1));
         board.squares[Position::new('a', 1).to_index() as usize].piece = Some(left_rook);
 
-        let new_board = left_rook.move_to(Position::new('a', 8), board.clone());
+        let new_board = left_rook.move_to(Position::new('a', 8), &mut board);
         assert_eq!(
             new_board.err().unwrap(),
             ChessError::BlockedMove,
             "White left rook can't move to a8, blocked by black pawn"
         );
 
-        let new_board = left_rook.move_to(Position::new('g', 1), board.clone());
+        let new_board = left_rook.move_to(Position::new('g', 1), &mut board);
         assert_eq!(
             new_board.err().unwrap(),
             ChessError::BlockedMove,
@@ -301,30 +301,26 @@ mod test {
         let mut left_rook = PieceType::Rook(Color::White, Position::new('a', 1));
         board.squares[Position::new('a', 1).to_index() as usize].piece = Some(left_rook);
 
-        let new_board = left_rook.move_to(Position::new('a', 7), board.clone());
+        let new_piece = left_rook.move_to(Position::new('a', 7), &mut board);
         assert!(
-            new_board.is_ok(),
+            new_piece.is_ok(),
             "White left rook should be able to capture black pawn in a7"
         );
 
-        let (mut new_board, _capture) = new_board.unwrap();
-        let left_rook = new_board.get_piece(Position::new('a', 7)).unwrap();
+        let _ = new_piece.unwrap();
+        let left_rook = board.get_piece(Position::new('a', 7)).unwrap();
         assert_eq!(left_rook.color(), Color::White, "White left rook is in a7");
 
         let mut left_rook = PieceType::Rook(Color::White, Position::new('a', 7));
-        new_board.squares[Position::new('a', 7).to_index() as usize].piece = Some(left_rook);
-        let new_board = left_rook.move_to(Position::new('b', 7), new_board.clone());
+        board.squares[Position::new('a', 7).to_index() as usize].piece = Some(left_rook);
+        let new_piece = left_rook.move_to(Position::new('b', 7), &mut board);
 
         assert!(
-            new_board.is_ok(),
+            new_piece.is_ok(),
             "White left rook should be able to capture black pawn in b7"
         );
         assert!(
-            new_board
-                .unwrap()
-                .0
-                .get_piece(Position::new('b', 7))
-                .is_some(),
+            board.get_piece(Position::new('b', 7)).is_some(),
             "White left rook should be in b7"
         );
     }

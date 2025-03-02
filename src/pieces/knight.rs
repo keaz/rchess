@@ -1,14 +1,14 @@
 use std::ops::ControlFlow;
 
-use crate::{Board, Position, BOARD_SQUARES};
+use crate::{board::BOARD_SQUARES, Board, Position};
 
 use super::{ChessError, Color, Piece, PieceType};
 
 pub fn move_to(
     knight: &PieceType,
     position: Position,
-    mut board: Board,
-) -> Result<(Board, Option<PieceType>), ChessError> {
+    board: &mut Board,
+) -> Result<Option<PieceType>, ChessError> {
     match knight {
         PieceType::Knight(color, current_position) => {
             let new_index = position.to_index();
@@ -20,7 +20,7 @@ pub fn move_to(
             board.squares[old_index as usize].piece = None;
             board.squares[new_index as usize].piece = Some(PieceType::Knight(*color, position));
 
-            Ok((board, captured_piece))
+            Ok(captured_piece)
         }
         _ => {
             return Err(ChessError::InvalidPiece);
@@ -102,14 +102,14 @@ mod test {
         let mut board = Board::empty();
         let mut knight = PieceType::Knight(Color::White, Position::new('d', 4));
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(knight);
-        let result = knight.move_to(Position::new('c', 1), board.clone());
+        let result = knight.move_to(Position::new('c', 1), &mut board);
         assert_eq!(
             result.err().unwrap(),
             ChessError::InvalidMove,
             "d4 Knight should not be able to move to c1"
         );
 
-        let result = knight.move_to(Position::new('h', 6), board.clone());
+        let result = knight.move_to(Position::new('h', 6), &mut board);
         assert_eq!(
             result.err().unwrap(),
             ChessError::InvalidMove,
@@ -123,73 +123,73 @@ mod test {
         let mut board = Board::empty();
         let mut knight = PieceType::Knight(Color::White, Position::new('d', 4));
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(knight);
-        let result = knight.move_to(Position::new('e', 6), board);
+        let result = knight.move_to(Position::new('e', 6), &mut board);
         assert_eq!(
             result.is_ok(),
             true,
             "d4 Knight should be able to move to e6"
         );
 
-        let (mut board, _capture) = result.unwrap();
+        let _ = result.unwrap();
         board.squares[Position::new('e', 6).to_index() as usize].piece = None;
         let mut knight = PieceType::Knight(Color::White, Position::new('d', 4));
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(knight);
-        let result = knight.move_to(Position::new('f', 5), board);
+        let result = knight.move_to(Position::new('f', 5), &mut board);
         assert_eq!(
             result.is_ok(),
             true,
             "d4 Knight should be able to move to f5"
         );
 
-        let (mut board, _capture) = result.unwrap();
+        let _ = result.unwrap();
         board.squares[Position::new('f', 5).to_index() as usize].piece = None;
         let mut knight = PieceType::Knight(Color::White, Position::new('d', 4));
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(knight);
-        let result = knight.move_to(Position::new('f', 3), board);
+        let result = knight.move_to(Position::new('f', 3), &mut board);
         assert_eq!(
             result.is_ok(),
             true,
             "d4 Knight should be able to move to f3"
         );
 
-        let (mut board, _capture) = result.unwrap();
+        let _ = result.unwrap();
         board.squares[Position::new('f', 3).to_index() as usize].piece = None;
         let mut knight = PieceType::Knight(Color::White, Position::new('d', 4));
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(knight);
-        let result = knight.move_to(Position::new('e', 2), board);
+        let result = knight.move_to(Position::new('e', 2), &mut board);
         assert_eq!(
             result.is_ok(),
             true,
             "d4 Knight should be able to move to e2"
         );
 
-        let (mut board, _capture) = result.unwrap();
+        let _ = result.unwrap();
         board.squares[Position::new('e', 2).to_index() as usize].piece = None;
         let mut knight = PieceType::Knight(Color::White, Position::new('d', 4));
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(knight);
-        let result = knight.move_to(Position::new('c', 2), board);
+        let result = knight.move_to(Position::new('c', 2), &mut board);
         assert_eq!(
             result.is_ok(),
             true,
             "d4 Knight should be able to move to c2"
         );
 
-        let (mut board, _capture) = result.unwrap();
+        let _ = result.unwrap();
         board.squares[Position::new('c', 2).to_index() as usize].piece = None;
         let mut knight = PieceType::Knight(Color::White, Position::new('d', 4));
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(knight);
-        let result = knight.move_to(Position::new('b', 3), board);
+        let result = knight.move_to(Position::new('b', 3), &mut board);
         assert_eq!(
             result.is_ok(),
             true,
             "d4 Knight should be able to move to b3"
         );
 
-        let (mut board, _capture) = result.unwrap();
+        let _ = result.unwrap();
         board.squares[Position::new('b', 3).to_index() as usize].piece = None;
         let mut knight = PieceType::Knight(Color::White, Position::new('d', 4));
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(knight);
-        let result = knight.move_to(Position::new('b', 5), board);
+        let result = knight.move_to(Position::new('b', 5), &mut board);
         assert_eq!(
             result.is_ok(),
             true,
@@ -204,7 +204,7 @@ mod test {
         board.squares[1].piece = None;
         let mut knight = PieceType::Knight(Color::White, Position::new('d', 4));
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(knight);
-        let result = knight.move_to(Position::new('e', 2), board);
+        let result = knight.move_to(Position::new('e', 2), &mut board);
         assert_eq!(
             result.err().unwrap(),
             ChessError::InvalidCapture,
@@ -220,7 +220,7 @@ mod test {
         board.squares[Position::new('e', 2).to_index() as usize].piece = None;
         let mut knight = PieceType::Knight(Color::White, Position::new('d', 5));
         board.squares[Position::new('d', 5).to_index() as usize].piece = Some(knight);
-        let result = knight.move_to(Position::new('e', 7), board);
+        let result = knight.move_to(Position::new('e', 7), &mut board);
         assert_eq!(
             result.is_ok(),
             true,

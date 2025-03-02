@@ -5,8 +5,8 @@ use super::{Color, Piece, PieceType};
 pub fn move_to(
     king: &PieceType,
     position: Position,
-    mut board: Board,
-) -> Result<(Board, Option<PieceType>), ChessError> {
+    board: &mut Board,
+) -> Result<Option<PieceType>, ChessError> {
     match king {
         PieceType::King(color, current_position) => {
             let new_index = position.to_index();
@@ -18,7 +18,7 @@ pub fn move_to(
             board.squares[old_index as usize].piece = None;
             board.squares[new_index as usize].piece = Some(PieceType::King(*color, position));
 
-            Ok((board, captured_piece))
+            Ok(captured_piece)
         }
         _ => {
             return Err(ChessError::InvalidPiece);
@@ -214,28 +214,28 @@ mod test {
         let mut king = PieceType::King(Color::White, Position::new('e', 4));
         board.squares[Position::new('e', 4).to_index() as usize].piece = Some(king);
 
-        let result = king.move_to(Position::new('e', 6), board.clone());
+        let result = king.move_to(Position::new('e', 6), &mut board);
         assert_eq!(
             result.err().unwrap(),
             ChessError::InvalidMove,
             "King can't move more than one squares in vertical"
         );
 
-        let result = king.move_to(Position::new('g', 6), board.clone());
+        let result = king.move_to(Position::new('g', 6), &mut board);
         assert_eq!(
             result.err().unwrap(),
             ChessError::InvalidMove,
             "King can't move more than one squares in diagonal"
         );
 
-        let result = king.move_to(Position::new('e', 4), board.clone());
+        let result = king.move_to(Position::new('e', 4), &mut board);
         assert_eq!(
             result.err().unwrap(),
             ChessError::InvalidMove,
             "King can't move more than one squares in horizontal"
         );
 
-        let result = king.move_to(Position::new('a', 5), board.clone());
+        let result = king.move_to(Position::new('a', 5), &mut board);
         assert_eq!(
             result.err().unwrap(),
             ChessError::InvalidMove,
@@ -250,42 +250,42 @@ mod test {
         let mut king = PieceType::King(Color::White, Position::new('e', 4));
         board.squares[Position::new('e', 4).to_index() as usize].piece = Some(king);
 
-        let result = king.move_to(Position::new('e', 5), board.clone());
+        let result = king.move_to(Position::new('e', 5), &mut board);
         assert_eq!(result.is_ok(), true, "e4 King can move to e5");
 
-        let (board, _capture) = result.unwrap();
+        let _ = result.unwrap();
         let mut king = *board.get_piece(Position::new('e', 5)).unwrap();
-        let result = king.move_to(Position::new('f', 6), board.clone());
+        let result = king.move_to(Position::new('f', 6), &mut board);
         assert!(result.is_ok(), "e5 King can move to f6");
 
-        let (board, _capture) = result.unwrap();
+        let _ = result.unwrap();
         let mut king = *board.get_piece(Position::new('f', 6)).unwrap();
-        let result = king.move_to(Position::new('g', 6), board.clone());
+        let result = king.move_to(Position::new('g', 6), &mut board);
         assert_eq!(result.is_ok(), true, "f6 King can move to g6");
 
-        let (board, _capture) = result.unwrap();
+        let _ = result.unwrap();
         let mut king = *board.get_piece(Position::new('g', 6)).unwrap();
-        let result = king.move_to(Position::new('h', 5), board.clone());
+        let result = king.move_to(Position::new('h', 5), &mut board);
         assert_eq!(result.is_ok(), true, "g6 King can move to h5");
 
-        let (board, _capture) = result.unwrap();
+        let _ = result.unwrap();
         let mut king = *board.get_piece(Position::new('h', 5)).unwrap();
-        let result = king.move_to(Position::new('h', 4), board.clone());
+        let result = king.move_to(Position::new('h', 4), &mut board);
         assert_eq!(result.is_ok(), true, "h5 King can move to h4");
 
-        let (board, _capture) = result.unwrap();
+        let _ = result.unwrap();
         let mut king = *board.get_piece(Position::new('h', 4)).unwrap();
-        let result = king.move_to(Position::new('g', 4), board.clone());
+        let result = king.move_to(Position::new('g', 4), &mut board);
         assert_eq!(result.is_ok(), true, "h4 King can move to g4");
 
-        let (board, _capture) = result.unwrap();
+        let _ = result.unwrap();
         let mut king = *board.get_piece(Position::new('g', 4)).unwrap();
-        let result = king.move_to(Position::new('f', 4), board.clone());
+        let result = king.move_to(Position::new('f', 4), &mut board);
         assert_eq!(result.is_ok(), true, "g4 King can move to f4");
 
-        let (board, _capture) = result.unwrap();
+        let _ = result.unwrap();
         let mut king = *board.get_piece(Position::new('f', 4)).unwrap();
-        let result = king.move_to(Position::new('e', 3), board.clone());
+        let result = king.move_to(Position::new('e', 3), &mut board);
         assert_eq!(result.is_ok(), true, "f4 King can move to e3");
     }
 
@@ -299,7 +299,7 @@ mod test {
         let black_queen = PieceType::Queen(Color::Black, Position::new('f', 7));
         board.squares[Position::new('f', 7).to_index() as usize].piece = Some(black_queen);
 
-        let result = king.move_to(Position::new('f', 4), board.clone());
+        let result = king.move_to(Position::new('f', 4), &mut board);
         assert_eq!(
             result.err().unwrap(),
             ChessError::UnSafeKing,
@@ -308,7 +308,7 @@ mod test {
 
         let black_pawn = PieceType::Pawn(Color::Black, Position::new('d', 6), false);
         board.squares[Position::new('d', 6).to_index() as usize].piece = Some(black_pawn);
-        let result = king.move_to(Position::new('e', 5), board.clone());
+        let result = king.move_to(Position::new('e', 5), &mut board);
         assert_eq!(
             result.err().unwrap(),
             ChessError::UnSafeKing,
@@ -317,7 +317,7 @@ mod test {
 
         let black_king = PieceType::King(Color::Black, Position::new('d', 2));
         board.squares[Position::new('d', 2).to_index() as usize].piece = Some(black_king);
-        let result = king.move_to(Position::new('e', 5), board.clone());
+        let result = king.move_to(Position::new('e', 5), &mut board);
         assert_eq!(
             result.err().unwrap(),
             ChessError::UnSafeKing,
@@ -332,7 +332,7 @@ mod test {
         let mut king = PieceType::King(Color::White, Position::new('e', 1));
         board.squares[Position::new('e', 1).to_index() as usize].piece = Some(king);
 
-        let result = king.move_to(Position::new('e', 2), board.clone());
+        let result = king.move_to(Position::new('e', 2), &mut board);
         assert_eq!(
             result.err().unwrap(),
             ChessError::InvalidCapture,
@@ -349,14 +349,14 @@ mod test {
         board.squares[Position::new('e', 1).to_index() as usize].piece = None;
         let _black_pawn = PieceType::Pawn(Color::Black, Position::new('e', 7), false);
 
-        let result = king.move_to(Position::new('d', 7), board.clone());
+        let result = king.move_to(Position::new('d', 7), &mut board);
         assert_eq!(
             result.is_ok(),
             true,
             "e6 White King can capture Black d7 Pawn"
         );
-        let (new_board, _capture) = result.unwrap();
-        let _piece = new_board.get_piece(Position::new('d', 7)).unwrap();
+        let _ = result.unwrap();
+        let piece = board.get_piece(Position::new('d', 7)).unwrap();
     }
 
     #[test]

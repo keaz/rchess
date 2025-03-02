@@ -1,6 +1,6 @@
 use std::fmt::{Debug, Display};
 
-use crate::{Board, Position};
+use crate::{board::Board, Position};
 
 use self::pawn::pawn_move_to;
 
@@ -17,8 +17,8 @@ pub trait Piece: Debug + CloneAsPiece + 'static {
     fn move_to(
         &mut self,
         position: Position,
-        board: Board,
-    ) -> Result<(Board, Option<PieceType>), ChessError>;
+        board: &mut Board,
+    ) -> Result<Option<PieceType>, ChessError>;
 
     fn can_move_to(&self, position: Position, board: &Board) -> Result<(), ChessError>;
 
@@ -48,14 +48,25 @@ impl PieceType {
             PieceType::King(_, _) => u8::MAX,
         }
     }
+
+    pub fn position(&self) -> &Position {
+        match self {
+            PieceType::Pawn(_, position, _) => position,
+            PieceType::Rook(_, position) => position,
+            PieceType::Bishop(_, position) => position,
+            PieceType::Knight(_, position) => position,
+            PieceType::Queen(_, position) => position,
+            PieceType::King(_, position) => position,
+        }
+    }
 }
 
 impl Piece for PieceType {
     fn move_to(
         &mut self,
         position: Position,
-        board: Board,
-    ) -> Result<(Board, Option<PieceType>), ChessError> {
+        board: &mut Board,
+    ) -> Result<Option<PieceType>, ChessError> {
         match self {
             PieceType::Pawn(_, _, _) => pawn_move_to(self, position, board),
             PieceType::Rook(_, _) => rook::move_to(self, position, board),

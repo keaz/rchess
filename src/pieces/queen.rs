@@ -2,7 +2,7 @@ use std::ops::ControlFlow;
 
 use crate::{
     pieces::{bishop::bishop_move, rook::rook_move},
-    Board, Position, BOARD_SQUARES,
+    Board, Position,
 };
 
 use super::{bishop, rook, ChessError, Color, Piece, PieceType};
@@ -10,8 +10,8 @@ use super::{bishop, rook, ChessError, Color, Piece, PieceType};
 pub fn move_to(
     queen: &PieceType,
     position: Position,
-    mut board: Board,
-) -> Result<(Board, Option<PieceType>), ChessError> {
+    board: &mut Board,
+) -> Result<Option<PieceType>, ChessError> {
     match queen {
         PieceType::Queen(color, current_position) => {
             let new_index = position.to_index();
@@ -23,7 +23,7 @@ pub fn move_to(
             board.squares[old_index as usize].piece = None;
             board.squares[new_index as usize].piece = Some(PieceType::Queen(*color, position));
 
-            Ok((board, captured_piece))
+            Ok(captured_piece)
         }
         _ => {
             return Err(ChessError::InvalidPiece);
@@ -91,25 +91,25 @@ mod test {
         let mut queen = PieceType::Queen(Color::White, Position::new('d', 4));
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(queen);
 
-        let result = queen.move_to(Position::new('c', 2), board.clone());
+        let result = queen.move_to(Position::new('c', 2), &mut board);
         assert_eq!(
             result.err().unwrap(),
             ChessError::InvalidMove,
             "d4 White Queen should not be able to move to c2"
         );
-        let result = queen.move_to(Position::new('5', 6), board.clone());
+        let result = queen.move_to(Position::new('5', 6), &mut board);
         assert_eq!(
             result.err().unwrap(),
             ChessError::InvalidMove,
             "d4 White Queen should not be able to move to 5e"
         );
-        let result = queen.move_to(Position::new('a', 8), board.clone());
+        let result = queen.move_to(Position::new('a', 8), &mut board);
         assert_eq!(
             result.err().unwrap(),
             ChessError::InvalidMove,
             "d4 White Queen should not be able to move to a8"
         );
-        let result = queen.move_to(Position::new('h', 1), board.clone());
+        let result = queen.move_to(Position::new('h', 1), &mut board);
         assert_eq!(
             result.err().unwrap(),
             ChessError::InvalidMove,
@@ -238,25 +238,25 @@ mod test {
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(queen);
         board.squares[Position::new('d', 1).to_index() as usize].piece = None;
 
-        let result = queen.move_to(Position::new('d', 8), board.clone());
+        let result = queen.move_to(Position::new('d', 8), &mut board);
         assert_eq!(
             result.err().unwrap(),
             ChessError::BlockedMove,
             "d4 White Queen should not be able to move to d8"
         );
-        let result = queen.move_to(Position::new('d', 1), board.clone());
+        let result = queen.move_to(Position::new('d', 1), &mut board);
         assert_eq!(
             result.err().unwrap(),
             ChessError::BlockedMove,
             "d4 White Queen should not be able to move to d1"
         );
-        let result = queen.move_to(Position::new('a', 1), board.clone());
+        let result = queen.move_to(Position::new('a', 1), &mut board);
         assert_eq!(
             result.err().unwrap(),
             ChessError::BlockedMove,
             "d4 White Queen should not be able to move to a1"
         );
-        let result = queen.move_to(Position::new('h', 8), board.clone());
+        let result = queen.move_to(Position::new('h', 8), &mut board);
         assert_eq!(
             result.err().unwrap(),
             ChessError::BlockedMove,
@@ -273,7 +273,7 @@ mod test {
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(queen);
         board.squares[Position::new('d', 1).to_index() as usize].piece = None;
 
-        let result = queen.move_to(Position::new('d', 2), board.clone());
+        let result = queen.move_to(Position::new('d', 2), &mut board);
         assert_eq!(
             result.err().unwrap(),
             ChessError::InvalidCapture,
@@ -290,7 +290,7 @@ mod test {
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(queen);
         board.squares[Position::new('d', 8).to_index() as usize].piece = None;
 
-        let result = queen.move_to(Position::new('d', 7), board.clone());
+        let result = queen.move_to(Position::new('d', 7), &mut board);
         assert_eq!(
             result.err().unwrap(),
             ChessError::InvalidCapture,
@@ -307,7 +307,7 @@ mod test {
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(queen);
         board.squares[Position::new('d', 1).to_index() as usize].piece = None;
 
-        let result = queen.move_to(Position::new('d', 7), board.clone());
+        let result = queen.move_to(Position::new('d', 7), &mut board);
         assert!(
             result.is_ok(),
             "d4 White Queen should be able to move to capture d7 black pawn"
@@ -323,7 +323,7 @@ mod test {
         board.squares[Position::new('d', 4).to_index() as usize].piece = Some(queen);
         board.squares[Position::new('d', 8).to_index() as usize].piece = None;
 
-        let result = queen.move_to(Position::new('d', 2), board.clone());
+        let result = queen.move_to(Position::new('d', 2), &mut board);
         assert!(
             result.is_ok(),
             "d4 Black Queen should not be able to capture d2 white pawn"
