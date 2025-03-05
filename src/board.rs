@@ -1,5 +1,7 @@
 use std::ops::Range;
 
+use mockall::automock;
+
 use crate::{
     pieces::{self, king, ChessError, Color, Piece, PieceType},
     Position, Square,
@@ -209,11 +211,11 @@ impl Board {
         })
     }
 
-    pub fn evaluate(&self, color: &Color) -> u8 {
+    pub fn evaluate(&self, color: &Color) -> i16 {
         let mut score = 0;
         for square in &self.squares {
             if let Some(piece) = &square.piece {
-                let value = piece.value();
+                let value = piece.value() as i16;
                 if piece.color() == *color {
                     score += value;
                 } else {
@@ -223,5 +225,43 @@ impl Board {
         }
 
         score
+    }
+}
+
+#[cfg(test)]
+mod test {
+
+    use super::*;
+
+    #[test]
+    fn test_new_board_evealuate() {
+        let board = Board::new();
+        let white_score = board.evaluate(&Color::White);
+
+        assert_eq!(white_score, 0);
+    }
+
+    #[test]
+    fn test_white_both_knight_missing() {
+        let mut board = Board::new();
+        board.squares[1].piece = None;
+        board.squares[6].piece = None;
+
+        let white_score = board.evaluate(&Color::White);
+
+        assert_eq!(white_score, -6);
+    }
+
+    #[test]
+    fn test_only_king_remains() {
+        let mut board = Board::new();
+        for i in 0..16 {
+            if i == 4 {
+                continue;
+            }
+            board.squares[i].piece = None;
+        }
+
+        assert_eq!(board.evaluate(&Color::White), -39);
     }
 }
