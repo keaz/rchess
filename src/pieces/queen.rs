@@ -1,27 +1,22 @@
-use std::ops::ControlFlow;
-
 use crate::{
+    BoardTrait, Position,
     pieces::{bishop::bishop_move, rook::rook_move},
-    Board, Position,
 };
 
-use super::{bishop, rook, ChessError, Color, Piece, PieceType};
+use super::{ChessError, Color, Piece, PieceType, bishop, rook};
 
 pub fn move_to(
     queen: &PieceType,
     position: Position,
-    board: &mut Board,
+    board: &mut dyn BoardTrait,
 ) -> Result<Option<PieceType>, ChessError> {
     match queen {
         PieceType::Queen(color, current_position) => {
-            let new_index = position.to_index();
-            let old_index = current_position.to_index();
+            can_move_to(&current_position, &color, position, board)?;
 
-            can_move_to(&current_position, &color, position, &board)?;
-
-            let captured_piece = board.squares[new_index as usize].piece;
-            board.squares[old_index as usize].piece = None;
-            board.squares[new_index as usize].piece = Some(PieceType::Queen(*color, position));
+            let captured_piece = board.square_mut(&position).piece;
+            board.square_mut(&current_position).piece = None;
+            board.square_mut(&position).piece = Some(PieceType::Queen(*color, position));
 
             Ok(captured_piece)
         }
@@ -35,7 +30,7 @@ pub fn can_move_to(
     current_position: &Position,
     color: &Color,
     position: Position,
-    board: &Board,
+    board: &dyn BoardTrait,
 ) -> Result<(), ChessError> {
     let new_index = position.to_index();
     let old_index = current_position.to_index();
@@ -50,12 +45,12 @@ pub fn can_move_to(
     }
 
     if jump % 8 == 0 || (jump / 8 == 0 && position.y == current_position.y) {
-        rook_move(&board, old_index, new_index, jump)?;
+        rook_move(board, old_index, new_index, jump)?;
     } else if jump % 7 == 0 || jump % 9 == 0 {
-        bishop_move(&board, old_index, new_index, jump)?;
+        bishop_move(board, old_index, new_index, jump)?;
     }
 
-    let square = &board.squares[new_index as usize];
+    let square = &board.square(&position);
     if let Some(piece) = &square.piece {
         if piece.color() == color {
             return Err(ChessError::InvalidCapture);
@@ -65,7 +60,11 @@ pub fn can_move_to(
     Ok(())
 }
 
-pub fn possible_moves(current_position: &Position, color: &Color, board: &Board) -> Vec<Position> {
+pub fn possible_moves(
+    current_position: &Position,
+    color: &Color,
+    board: &dyn BoardTrait,
+) -> Vec<Position> {
     let mut bishop_positions = bishop::possible_moves(current_position, color, board);
     let rook_positions = rook::possible_moves(current_position, color, board);
     bishop_positions.extend(rook_positions);
@@ -75,8 +74,8 @@ pub fn possible_moves(current_position: &Position, color: &Color, board: &Board)
 #[cfg(test)]
 mod test {
     use crate::{
-        pieces::{queen::can_move_to, ChessError, Color, Piece, PieceType},
-        Board, Position,
+        BoardTrait, Position, board,
+        pieces::{ChessError, Color, Piece, PieceType, queen::can_move_to},
     };
 
     fn init() {
@@ -87,9 +86,9 @@ mod test {
     fn test_queen_invalid_move() {
         init();
 
-        let mut board = Board::empty();
+        let mut board = board::empty_board();
         let mut queen = PieceType::Queen(Color::White, Position::new('d', 4));
-        board.squares[Position::new('d', 4).to_index() as usize].piece = Some(queen);
+        board.square_mut(&Position::new('d', 4)).piece = Some(queen);
 
         let result = queen.move_to(Position::new('c', 2), &mut board);
         assert_eq!(
@@ -97,11 +96,11 @@ mod test {
             ChessError::InvalidMove,
             "d4 White Queen should not be able to move to c2"
         );
-        let result = queen.move_to(Position::new('5', 6), &mut board);
+        let result = queen.move_to(Position::new('e', 7), &mut board);
         assert_eq!(
             result.err().unwrap(),
             ChessError::InvalidMove,
-            "d4 White Queen should not be able to move to 5e"
+            "d4 White Queen should not be able to move to e7"
         );
         let result = queen.move_to(Position::new('a', 8), &mut board);
         assert_eq!(
@@ -121,9 +120,9 @@ mod test {
     fn test_queen_valid_move() {
         init();
 
-        let mut board = Board::empty();
+        let mut board = board::empty_board();
         let queen = PieceType::Queen(Color::White, Position::new('d', 4));
-        board.squares[Position::new('d', 4).to_index() as usize].piece = Some(queen);
+        board.square_mut(&Position::new('d', 4)).piece = Some(queen);
 
         let result = can_move_to(
             &Position::new('d', 4),
@@ -233,10 +232,10 @@ mod test {
     fn test_queen_blocked_move() {
         init();
 
-        let mut board = Board::new();
+        let mut board = board::new_board();
         let mut queen = PieceType::Queen(Color::White, Position::new('d', 4));
-        board.squares[Position::new('d', 4).to_index() as usize].piece = Some(queen);
-        board.squares[Position::new('d', 1).to_index() as usize].piece = None;
+        board.square_mut(&Position::new('d', 4)).piece = Some(queen);
+        board.square_mut(&Position::new('d', 1)).piece = None;
 
         let result = queen.move_to(Position::new('d', 8), &mut board);
         assert_eq!(
@@ -268,10 +267,10 @@ mod test {
     fn test_white_queen_invalid_capture() {
         init();
 
-        let mut board = Board::new();
+        let mut board = board::new_board();
         let mut queen = PieceType::Queen(Color::White, Position::new('d', 4));
-        board.squares[Position::new('d', 4).to_index() as usize].piece = Some(queen);
-        board.squares[Position::new('d', 1).to_index() as usize].piece = None;
+        board.square_mut(&Position::new('d', 4)).piece = Some(queen);
+        board.square_mut(&Position::new('d', 1)).piece = None;
 
         let result = queen.move_to(Position::new('d', 2), &mut board);
         assert_eq!(
@@ -285,10 +284,10 @@ mod test {
     fn test_black_queen_invalid_capture() {
         init();
 
-        let mut board = Board::new();
+        let mut board = board::new_board();
         let mut queen = PieceType::Queen(Color::Black, Position::new('d', 4));
-        board.squares[Position::new('d', 4).to_index() as usize].piece = Some(queen);
-        board.squares[Position::new('d', 8).to_index() as usize].piece = None;
+        board.square_mut(&Position::new('d', 4)).piece = Some(queen);
+        board.square_mut(&Position::new('d', 8)).piece = None;
 
         let result = queen.move_to(Position::new('d', 7), &mut board);
         assert_eq!(
@@ -302,10 +301,10 @@ mod test {
     fn test_white_queen_valid_capture() {
         init();
 
-        let mut board = Board::new();
+        let mut board = board::new_board();
         let mut queen = PieceType::Queen(Color::White, Position::new('d', 4));
-        board.squares[Position::new('d', 4).to_index() as usize].piece = Some(queen);
-        board.squares[Position::new('d', 1).to_index() as usize].piece = None;
+        board.square_mut(&Position::new('d', 4)).piece = Some(queen);
+        board.square_mut(&Position::new('d', 1)).piece = None;
 
         let result = queen.move_to(Position::new('d', 7), &mut board);
         assert!(
@@ -318,10 +317,10 @@ mod test {
     fn test_black_queen_valid_capture() {
         init();
 
-        let mut board = Board::new();
+        let mut board = board::new_board();
         let mut queen = PieceType::Queen(Color::Black, Position::new('d', 4));
-        board.squares[Position::new('d', 4).to_index() as usize].piece = Some(queen);
-        board.squares[Position::new('d', 8).to_index() as usize].piece = None;
+        board.square_mut(&Position::new('d', 4)).piece = Some(queen);
+        board.square_mut(&Position::new('d', 8)).piece = None;
 
         let result = queen.move_to(Position::new('d', 2), &mut board);
         assert!(

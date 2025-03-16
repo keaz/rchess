@@ -1,7 +1,7 @@
-use std::{fmt::Display, ops::Range};
+use std::fmt::Display;
 
-use board::Board;
-use pieces::{king, ChessError, Color, Piece, PieceType};
+use board::BoardTrait;
+use pieces::{Color, PieceType};
 
 pub mod ai;
 pub mod board;
@@ -9,14 +9,14 @@ pub mod pieces;
 
 #[derive(Debug)]
 pub struct Game {
-    pub board: Board,
+    pub board: Box<dyn BoardTrait>,
     pub white: Player,
     pub black: Player,
 }
 
 impl Game {
     pub fn new() -> Self {
-        let board = Board::new();
+        let board = board::new_board();
         let white = Player {
             color: Color::White,
             moves: Vec::new(),
@@ -29,7 +29,7 @@ impl Game {
         };
 
         Game {
-            board,
+            board: Box::new(board),
             white,
             black,
         }
@@ -78,7 +78,7 @@ impl Game {
                 input.chars().nth(2).unwrap(),
                 input.chars().nth(3).unwrap().to_digit(10).unwrap() as i8,
             );
-            let result = game.board.clone().move_piece(from, to);
+            let result = game.board.clone_as_a().move_piece(from, to);
             if result.is_err() {
                 println!("Invalid move");
                 continue;
@@ -171,6 +171,9 @@ pub struct Position {
 
 impl Position {
     pub fn new(x: char, y: i8) -> Self {
+        if x < 'a' || x > 'h' || y < 1 || y > 8 {
+            panic!("Invalid position");
+        }
         Position { x, y }
     }
 
@@ -194,8 +197,9 @@ impl Position {
 mod test {
 
     use crate::{
+        board,
         pieces::{Color, PieceType},
-        Board, Position,
+        BoardTrait, Position,
     };
 
     #[test]
@@ -212,11 +216,11 @@ mod test {
 
     #[test]
     fn test_black_king_check() {
-        let mut board = Board::empty();
+        let mut board = board::empty_board();
         let black_king = PieceType::King(Color::Black, Position::new('e', 8));
         let white_queen = PieceType::Queen(Color::White, Position::new('f', 7));
-        board.squares[Position::new('e', 8).to_index() as usize].piece = Some(black_king);
-        board.squares[Position::new('f', 7).to_index() as usize].piece = Some(white_queen);
+        board.square_mut(&Position::new('e', 8)).piece = Some(black_king);
+        board.square_mut(&Position::new('f', 7)).piece = Some(white_queen);
 
         let is_check = board.is_king_check(&Color::Black);
         assert_eq!(is_check, true);
@@ -224,11 +228,11 @@ mod test {
 
     #[test]
     fn test_king_not_check() {
-        let mut board = Board::empty();
+        let mut board = board::empty_board();
         let king = PieceType::King(Color::White, Position::new('e', 6));
         let black_queen = PieceType::Queen(Color::Black, Position::new('f', 8));
-        board.squares[Position::new('e', 6).to_index() as usize].piece = Some(king);
-        board.squares[Position::new('f', 8).to_index() as usize].piece = Some(black_queen);
+        board.square_mut(&Position::new('e', 6)).piece = Some(king);
+        board.square_mut(&Position::new('f', 8)).piece = Some(black_queen);
 
         let is_check = board.is_king_check(&Color::White);
         assert_eq!(is_check, false);

@@ -1,24 +1,25 @@
 use std::ops::ControlFlow;
 
-use crate::{board::BOARD_SQUARES, pieces::Color, Board, Position};
+use crate::{
+    Position,
+    board::{BOARD_SQUARES, BoardTrait},
+    pieces::Color,
+};
 
 use super::{ChessError, Piece, PieceType};
 
 pub fn move_to(
     bishop: &PieceType,
     position: Position,
-    board: &mut Board,
+    board: &mut dyn BoardTrait,
 ) -> Result<Option<PieceType>, ChessError> {
     match bishop {
         PieceType::Bishop(color, current_position) => {
-            let new_index = position.to_index();
-            let old_index = current_position.to_index();
+            can_move_to(&current_position, &color, position, board)?;
 
-            can_move_to(&current_position, &color, position, &board)?;
-
-            let captured_piece = board.squares[new_index as usize].piece;
-            board.squares[old_index as usize].piece = None;
-            board.squares[new_index as usize].piece = Some(PieceType::Bishop(*color, position));
+            let captured_piece = board.square(&position).piece;
+            board.square_mut(&current_position).piece = None;
+            board.square_mut(&position).piece = Some(PieceType::Bishop(*color, position));
 
             Ok(captured_piece)
         }
@@ -32,7 +33,7 @@ pub fn can_move_to(
     current_position: &Position,
     color: &Color,
     position: Position,
-    board: &Board,
+    board: &dyn BoardTrait,
 ) -> Result<(), ChessError> {
     let new_index = position.to_index();
     let old_index = current_position.to_index();
@@ -42,9 +43,9 @@ pub fn can_move_to(
         return Err(ChessError::InvalidMove);
     }
 
-    bishop_move(&board, old_index, new_index, jump)?;
+    bishop_move(board, old_index, new_index, jump)?;
 
-    let square = &board.squares[new_index as usize];
+    let square = board.square(&position);
     if let Some(piece) = &square.piece {
         if piece.color() == color {
             return Err(ChessError::InvalidCapture);
@@ -55,7 +56,7 @@ pub fn can_move_to(
 }
 
 pub fn bishop_move(
-    board: &Board,
+    board: &dyn BoardTrait,
     old_index: i32,
     new_index: i32,
     jump: i32,
@@ -65,7 +66,7 @@ pub fn bishop_move(
         if new_index > old_index {
             index += 7;
             while index != new_index {
-                let square = &board.squares[index as usize];
+                let square = board.square(&Position::from_index(index));
                 if square.piece.is_some() {
                     return Err(ChessError::BlockedMove);
                 }
@@ -74,7 +75,7 @@ pub fn bishop_move(
         } else {
             index -= 7;
             while index != new_index {
-                let square = &board.squares[index.abs() as usize];
+                let square = board.square(&Position::from_index(index.abs()));
                 if square.piece.is_some() {
                     return Err(ChessError::BlockedMove);
                 }
@@ -86,7 +87,7 @@ pub fn bishop_move(
         if new_index > old_index {
             index += 9;
             while index != new_index {
-                let square = &board.squares[index as usize];
+                let square = board.square(&Position::from_index(index));
                 if square.piece.is_some() {
                     return Err(ChessError::BlockedMove);
                 }
@@ -95,7 +96,7 @@ pub fn bishop_move(
         } else {
             index -= 9;
             while index != new_index {
-                let square = &board.squares[index.abs() as usize];
+                let square = board.square(&Position::from_index(index.abs()));
                 if square.piece.is_some() {
                     return Err(ChessError::BlockedMove);
                 }
@@ -107,7 +108,11 @@ pub fn bishop_move(
     Ok(())
 }
 
-pub fn possible_moves(current_position: &Position, color: &Color, board: &Board) -> Vec<Position> {
+pub fn possible_moves(
+    current_position: &Position,
+    color: &Color,
+    board: &dyn BoardTrait,
+) -> Vec<Position> {
     let current_index = current_position.to_index();
     let mut next_inndex = current_index + 7;
     let mut positions = vec![];
@@ -146,11 +151,11 @@ pub fn possible_moves(current_position: &Position, color: &Color, board: &Board)
 
 fn valide_move(
     color: &Color,
-    board: &Board,
+    board: &dyn BoardTrait,
     next_inndex: i32,
     positions: &mut Vec<Position>,
 ) -> ControlFlow<()> {
-    let square = &board.squares[next_inndex as usize];
+    let square = board.square(&Position::from_index(next_inndex));
     if square.piece.is_some() {
         if square.piece.as_ref().unwrap().color() != color {
             positions.push(Position::new(square.x, square.y));
@@ -165,8 +170,8 @@ fn valide_move(
 mod test {
 
     use crate::{
+        BoardTrait, Position, board,
         pieces::{ChessError, Color, Piece, PieceType},
-        Board, Position,
     };
 
     fn init() {
@@ -177,9 +182,9 @@ mod test {
     fn test_bishop_invalid_move() {
         init();
 
-        let mut board = Board::empty();
+        let mut board = board::empty_board();
         let mut bishop = PieceType::Bishop(Color::White, Position::new('c', 1));
-        board.squares[Position::new('c', 1).to_index() as usize].piece = Some(bishop);
+        board.square_mut(&Position::new('c', 1)).piece = Some(bishop);
 
         let board = bishop.move_to(Position::new('c', 5), &mut board);
         assert_eq!(
@@ -193,9 +198,9 @@ mod test {
     fn test_bishop_blocked_move() {
         init();
 
-        let mut board = Board::new();
+        let mut board = board::new_board();
         let mut bishop = PieceType::Bishop(Color::White, Position::new('c', 1));
-        board.squares[Position::new('c', 1).to_index() as usize].piece = Some(bishop);
+        board.square_mut(&Position::new('c', 1)).piece = Some(bishop);
 
         let board = bishop.move_to(Position::new('f', 4), &mut board);
         assert_eq!(
@@ -209,22 +214,18 @@ mod test {
     fn test_bishop_valid_move() {
         init();
 
-        let mut board = Board::empty();
+        let mut board = board::empty_board();
         let mut bishop = PieceType::Bishop(Color::White, Position::new('d', 2));
-        board.squares[Position::new('d', 2).to_index() as usize].piece = Some(bishop);
+        board.square_mut(&Position::new('d', 2)).piece = Some(bishop);
 
         let piece_type = bishop.move_to(Position::new('f', 4), &mut board);
         assert!(piece_type.is_ok(), "c1 Beshop should be able to move to f4");
         assert!(
-            board.squares[Position::new('f', 4).to_index() as usize]
-                .piece
-                .is_some(),
+            board.square(&Position::new('f', 4)).piece.is_some(),
             "c1 Beshop should be able to move to f4"
         );
         assert!(
-            board.squares[Position::new('d', 2).to_index() as usize]
-                .piece
-                .is_none(),
+            board.square(&Position::new('d', 2)).piece.is_none(),
             "d2 should be empty after c1 Beshop move to f4"
         );
     }
@@ -233,10 +234,10 @@ mod test {
     fn test_bishop_invalid_capture() {
         init();
 
-        let mut board = Board::new();
-        board.squares[Position::new('c', 2).to_index() as usize].piece = None;
+        let mut board = board::new_board();
+        board.square_mut(&Position::new('c', 2)).piece = None;
         let mut bishop = PieceType::Bishop(Color::White, Position::new('e', 3));
-        board.squares[Position::new('e', 3).to_index() as usize].piece = Some(bishop);
+        board.square_mut(&Position::new('e', 3)).piece = Some(bishop);
 
         let piece_type = bishop.move_to(Position::new('f', 2), &mut board);
         assert_eq!(
@@ -250,10 +251,10 @@ mod test {
     fn test_bishop_valid_capture() {
         init();
 
-        let mut board = Board::new();
-        board.squares[Position::new('c', 2).to_index() as usize].piece = None;
+        let mut board = board::new_board();
+        board.square_mut(&Position::new('c', 2)).piece = None;
         let mut bishop = PieceType::Bishop(Color::White, Position::new('e', 3));
-        board.squares[Position::new('e', 3).to_index() as usize].piece = Some(bishop);
+        board.square_mut(&Position::new('e', 3)).piece = Some(bishop);
 
         let piece_type = bishop.move_to(Position::new('a', 7), &mut board);
         assert!(
@@ -262,15 +263,11 @@ mod test {
         );
 
         assert!(
-            board.squares[Position::new('a', 7).to_index() as usize]
-                .piece
-                .is_some(),
+            board.square(&Position::new('a', 7)).piece.is_some(),
             "e3 Beshop should be able to capture black pawn at a7"
         );
         assert!(
-            board.squares[Position::new('e', 3).to_index() as usize]
-                .piece
-                .is_none(),
+            board.square(&Position::new('e', 3)).piece.is_none(),
             "e3 should be empty after e3 Beshop capture black pawn at a7"
         );
     }

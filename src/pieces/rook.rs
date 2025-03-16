@@ -1,24 +1,21 @@
 use std::{borrow::BorrowMut, ops::ControlFlow};
 
-use crate::{board::BOARD_SQUARES, Board, Position};
+use crate::{board::BOARD_SQUARES, BoardTrait, Position};
 
 use super::{ChessError, Color, Piece, PieceType};
 
 pub fn move_to(
     rook: &PieceType,
     position: Position,
-    board: &mut Board,
+    board: &mut dyn BoardTrait,
 ) -> Result<Option<PieceType>, ChessError> {
     match rook {
         PieceType::Rook(color, current_position) => {
-            let new_index = position.to_index();
-            let old_index = current_position.to_index();
+            can_move_to(&current_position, &color, position, board)?;
 
-            can_move_to(&current_position, &color, position, &board)?;
-
-            let captured_piece = board.squares[new_index as usize].piece;
-            board.squares[old_index as usize].piece = None;
-            board.borrow_mut().squares[new_index as usize].piece =
+            let captured_piece = board.square_mut(&position).piece;
+            board.square_mut(&current_position).piece = None;
+            board.borrow_mut().square_mut(&position).piece =
                 Some(PieceType::Rook(*color, position));
 
             Ok(captured_piece)
@@ -33,7 +30,7 @@ pub fn can_move_to(
     current_position: &Position,
     color: &Color,
     position: Position,
-    board: &Board,
+    board: &dyn BoardTrait,
 ) -> Result<(), ChessError> {
     let new_index = position.to_index();
     let old_index = current_position.to_index();
@@ -50,7 +47,7 @@ pub fn can_move_to(
 
     rook_move(board, old_index, new_index, jump)?;
 
-    let square = &board.squares[new_index as usize];
+    let square = &board.square(&position);
     if square.piece.is_some() {
         if square.piece.as_ref().unwrap().color() == color {
             return Err(ChessError::InvalidCapture);
@@ -61,7 +58,7 @@ pub fn can_move_to(
 }
 
 pub fn rook_move(
-    board: &Board,
+    board: &dyn BoardTrait,
     old_index: i32,
     new_index: i32,
     jump: i32,
@@ -71,7 +68,7 @@ pub fn rook_move(
         if new_index > old_index {
             index += 8;
             while index != new_index {
-                let square = &board.squares[index as usize];
+                let square = &board.square(&Position::from_index(index));
                 if square.piece.is_some() {
                     return Err(ChessError::BlockedMove);
                 }
@@ -80,7 +77,7 @@ pub fn rook_move(
         } else {
             index -= 8;
             while index != new_index {
-                let square = &board.squares[index as usize];
+                let square = &board.square(&Position::from_index(index));
                 if square.piece.is_some() {
                     return Err(ChessError::BlockedMove);
                 }
@@ -92,7 +89,7 @@ pub fn rook_move(
         if new_index > old_index {
             index += 1;
             while index != new_index {
-                let square = &board.squares[index as usize];
+                let square = &board.square(&Position::from_index(index));
                 if square.piece.is_some() {
                     return Err(ChessError::BlockedMove);
                 }
@@ -101,7 +98,7 @@ pub fn rook_move(
         } else {
             index -= 1;
             while index != new_index {
-                let square = &board.squares[index as usize];
+                let square = &board.square(&Position::from_index(index));
                 if square.piece.is_some() {
                     return Err(ChessError::BlockedMove);
                 }
@@ -112,7 +109,11 @@ pub fn rook_move(
     Ok(())
 }
 
-pub fn possible_moves(current_position: &Position, color: &Color, board: &Board) -> Vec<Position> {
+pub fn possible_moves(
+    current_position: &Position,
+    color: &Color,
+    board: &dyn BoardTrait,
+) -> Vec<Position> {
     let current_index = current_position.to_index();
     let mut next_inndex = current_index + 8;
     let mut positions = vec![];
@@ -151,11 +152,11 @@ pub fn possible_moves(current_position: &Position, color: &Color, board: &Board)
 
 fn valide_move(
     color: &Color,
-    board: &Board,
+    board: &dyn BoardTrait,
     next_inndex: i32,
     positions: &mut Vec<Position>,
 ) -> ControlFlow<()> {
-    let square = &board.squares[next_inndex as usize];
+    let square = &board.square(&Position::from_index(next_inndex));
     if square.piece.is_some() {
         if square.piece.as_ref().unwrap().color() != color {
             positions.push(Position::new(square.x, square.y));
@@ -170,8 +171,9 @@ fn valide_move(
 mod test {
 
     use crate::{
+        board,
         pieces::{ChessError, Color, Piece, PieceType},
-        Board, Position,
+        BoardTrait, Position,
     };
 
     fn init() {
@@ -181,9 +183,9 @@ mod test {
     #[test]
     fn test_white_rook_invalid_move() {
         init();
-        let mut board = Board::empty();
+        let mut board = board::empty_board();
         let mut rook = PieceType::Rook(Color::White, Position::new('d', 4));
-        board.squares[Position::new('d', 4).to_index() as usize].piece = Some(rook);
+        board.square_mut(&Position::new('d', 4)).piece = Some(rook);
 
         let new_board = rook.move_to(Position::new('e', 5), &mut board);
         assert_eq!(
@@ -217,9 +219,9 @@ mod test {
     #[test]
     fn test_black_rook_invalid_initial_move() {
         init();
-        let mut board = Board::new();
+        let mut board = board::new_board();
         let mut left_rook = PieceType::Rook(Color::Black, Position::new('a', 8));
-        board.squares[Position::new('a', 8).to_index() as usize].piece = Some(left_rook);
+        board.square_mut(&Position::new('a', 8)).piece = Some(left_rook);
 
         let new_board = left_rook.move_to(Position::new('a', 7), &mut board);
         assert_eq!(
@@ -236,7 +238,7 @@ mod test {
         );
 
         let mut right_rook = PieceType::Rook(Color::Black, Position::new('h', 8));
-        board.squares[Position::new('h', 8).to_index() as usize].piece = Some(right_rook);
+        board.square_mut(&Position::new('h', 8)).piece = Some(right_rook);
 
         let new_board = right_rook.move_to(Position::new('h', 7), &mut board);
         assert_eq!(
@@ -263,15 +265,15 @@ mod test {
     #[test]
     fn test_rook_blocked_move() {
         init();
-        let mut board = Board::new();
-        board.squares[Position::new('a', 2).to_index() as usize].piece = None;
+        let mut board = board::new_board();
+        board.square_mut(&Position::new('a', 2)).piece = None;
         let mut index = 2;
         while index < 7 {
             index += 1;
-            board.squares[index as usize].piece = None;
+            board.square_mut(&Position::from_index(index)).piece = None;
         }
         let mut left_rook = PieceType::Rook(Color::White, Position::new('a', 1));
-        board.squares[Position::new('a', 1).to_index() as usize].piece = Some(left_rook);
+        board.square_mut(&Position::new('a', 1)).piece = Some(left_rook);
 
         let new_board = left_rook.move_to(Position::new('a', 8), &mut board);
         assert_eq!(
@@ -291,15 +293,15 @@ mod test {
     #[test]
     fn test_rook_capture() {
         init();
-        let mut board = Board::new();
-        board.squares[Position::new('a', 2).to_index() as usize].piece = None;
+        let mut board = board::new_board();
+        board.square_mut(&Position::new('a', 2)).piece = None;
         let mut index = 2;
         while index < 7 {
             index += 1;
-            board.squares[index as usize].piece = None;
+            board.square_mut(&Position::from_index(index)).piece = None;
         }
         let mut left_rook = PieceType::Rook(Color::White, Position::new('a', 1));
-        board.squares[Position::new('a', 1).to_index() as usize].piece = Some(left_rook);
+        board.square_mut(&Position::new('a', 1)).piece = Some(left_rook);
 
         let new_piece = left_rook.move_to(Position::new('a', 7), &mut board);
         assert!(
@@ -312,7 +314,7 @@ mod test {
         assert_eq!(left_rook.color(), Color::White, "White left rook is in a7");
 
         let mut left_rook = PieceType::Rook(Color::White, Position::new('a', 7));
-        board.squares[Position::new('a', 7).to_index() as usize].piece = Some(left_rook);
+        board.square_mut(&Position::new('a', 7)).piece = Some(left_rook);
         let new_piece = left_rook.move_to(Position::new('b', 7), &mut board);
 
         assert!(

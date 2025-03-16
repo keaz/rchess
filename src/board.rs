@@ -1,39 +1,42 @@
-use std::ops::Range;
-
-use mockall::automock;
+use std::{fmt::Debug, ops::Range};
 
 use crate::{
-    pieces::{self, king, ChessError, Color, Piece, PieceType},
     Position, Square,
+    pieces::{self, ChessError, Color, Piece, PieceType, king},
 };
 
 pub const BOARD_SIZE: i32 = 8;
 pub const BOARD_SQUARES: i32 = BOARD_SIZE * BOARD_SIZE;
 
+pub trait BoardTrait: Debug + CloneAsBoard + 'static {
+    fn move_piece(&mut self, from: Position, to: Position)
+    -> Result<Option<PieceType>, ChessError>;
+    fn get_piece(&self, position: Position) -> Option<&PieceType>;
+    fn get_all_white_pieces(&self) -> Vec<&PieceType>;
+    fn get_all_black_pieces(&self) -> Vec<&PieceType>;
+    fn is_king_check(&self, color: &Color) -> bool;
+    fn can_king_move_safe_position(&self, color: &Color) -> bool;
+    fn evaluate(&self, color: &Color) -> i16;
+    fn square(&self, position: &Position) -> &Square;
+    fn square_mut(&mut self, position: &Position) -> &mut Square;
+}
+
+pub trait CloneAsBoard {
+    fn clone_as_a(&self) -> Box<dyn BoardTrait>;
+}
+
+impl<T: 'static + BoardTrait + Clone> CloneAsBoard for T {
+    fn clone_as_a(&self) -> Box<dyn BoardTrait> {
+        Box::new(self.clone())
+    }
+}
+
 #[derive(Debug, Clone)]
-pub struct Board {
+struct Board {
     pub squares: Vec<Square>,
 }
 
 impl Board {
-    pub fn new() -> Self {
-        let mut squares = Vec::new();
-        for y in 1..9 {
-            let range: Range<u8> = 97..105;
-            for x in range {
-                squares.push(Square {
-                    piece: None,
-                    x: x as char,
-                    y,
-                });
-            }
-        }
-
-        let squares = Board::fill_white(squares);
-        let squares = Board::fill_black(squares);
-        Board { squares }
-    }
-
     fn fill_white(mut squares: Vec<Square>) -> Vec<Square> {
         squares[0].piece = Some(pieces::PieceType::Rook(
             pieces::Color::White,
@@ -122,7 +125,25 @@ impl Board {
         squares
     }
 
-    pub fn empty() -> Self {
+    fn new_inner() -> Board {
+        let mut squares = Vec::new();
+        for y in 1..9 {
+            let range: Range<u8> = 97..105;
+            for x in range {
+                squares.push(Square {
+                    piece: None,
+                    x: x as char,
+                    y,
+                });
+            }
+        }
+
+        let squares = Board::fill_white(squares);
+        let squares = Board::fill_black(squares);
+        Board { squares }
+    }
+
+    fn empty_inner() -> Board {
         let mut squares = Vec::new();
         for y in 0..8 {
             let range: Range<u8> = 97..105;
@@ -137,8 +158,10 @@ impl Board {
 
         Board { squares }
     }
+}
 
-    pub fn move_piece(
+impl BoardTrait for Board {
+    fn move_piece(
         &mut self,
         from: Position,
         to: Position,
@@ -152,12 +175,12 @@ impl Board {
         Ok(board)
     }
 
-    pub fn get_piece(&self, position: Position) -> Option<&PieceType> {
+    fn get_piece(&self, position: Position) -> Option<&PieceType> {
         let index = position.to_index();
         self.squares[index as usize].piece.as_ref()
     }
 
-    pub fn get_all_white_pieces(&self) -> Vec<&PieceType> {
+    fn get_all_white_pieces(&self) -> Vec<&PieceType> {
         let mut pieces = Vec::new();
         for square in &self.squares {
             if let Some(piece) = &square.piece {
@@ -170,7 +193,7 @@ impl Board {
         pieces
     }
 
-    pub fn get_all_black_pieces(&self) -> Vec<&PieceType> {
+    fn get_all_black_pieces(&self) -> Vec<&PieceType> {
         let mut pieces = Vec::new();
         for square in &self.squares {
             if let Some(piece) = &square.piece {
@@ -183,7 +206,7 @@ impl Board {
         pieces
     }
 
-    pub fn is_king_check(&self, color: &Color) -> bool {
+    fn is_king_check(&self, color: &Color) -> bool {
         let pieces = match color {
             Color::White => self.get_all_white_pieces(),
             Color::Black => self.get_all_black_pieces(),
@@ -191,13 +214,13 @@ impl Board {
 
         pieces.iter().any(|piece| {
             if let PieceType::King(_, _) = piece {
-                return king::is_check(**piece, &self);
+                return king::is_check(**piece, self);
             }
             false
         })
     }
 
-    pub fn can_king_move_safe_position(&self, color: &Color) -> bool {
+    fn can_king_move_safe_position(&self, color: &Color) -> bool {
         let pieces = match color {
             Color::White => self.get_all_white_pieces(),
             Color::Black => self.get_all_black_pieces(),
@@ -211,7 +234,7 @@ impl Board {
         })
     }
 
-    pub fn evaluate(&self, color: &Color) -> i16 {
+    fn evaluate(&self, color: &Color) -> i16 {
         let mut score = 0;
         for square in &self.squares {
             if let Some(piece) = &square.piece {
@@ -226,6 +249,24 @@ impl Board {
 
         score
     }
+
+    fn square_mut(&mut self, position: &Position) -> &mut Square {
+        let index = position.to_index();
+        &mut self.squares[index as usize]
+    }
+
+    fn square(&self, position: &Position) -> &Square {
+        let index = position.to_index();
+        &self.squares[index as usize]
+    }
+}
+
+pub fn new_board() -> impl BoardTrait {
+    Board::new_inner()
+}
+
+pub fn empty_board() -> impl BoardTrait {
+    Board::empty_inner()
 }
 
 #[cfg(test)]
@@ -235,7 +276,7 @@ mod test {
 
     #[test]
     fn test_new_board_evealuate() {
-        let board = Board::new();
+        let board = Board::new_inner();
         let white_score = board.evaluate(&Color::White);
 
         assert_eq!(white_score, 0);
@@ -243,7 +284,7 @@ mod test {
 
     #[test]
     fn test_white_both_knight_missing() {
-        let mut board = Board::new();
+        let mut board = Board::new_inner();
         board.squares[1].piece = None;
         board.squares[6].piece = None;
 
@@ -254,7 +295,7 @@ mod test {
 
     #[test]
     fn test_only_king_remains() {
-        let mut board = Board::new();
+        let mut board = Board::new_inner();
         for i in 0..16 {
             if i == 4 {
                 continue;

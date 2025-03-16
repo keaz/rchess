@@ -1,6 +1,6 @@
 use std::fmt::{Debug, Display};
 
-use crate::{board::Board, Position};
+use crate::{Position, board::BoardTrait};
 
 use self::pawn::pawn_move_to;
 
@@ -17,14 +17,14 @@ pub trait Piece: Debug + CloneAsPiece + 'static {
     fn move_to(
         &mut self,
         position: Position,
-        board: &mut Board,
+        board: &mut dyn BoardTrait,
     ) -> Result<Option<PieceType>, ChessError>;
 
-    fn can_move_to(&self, position: Position, board: &Board) -> Result<(), ChessError>;
+    fn can_move_to(&self, position: Position, board: &dyn BoardTrait) -> Result<(), ChessError>;
 
     fn color(&self) -> &Color;
 
-    fn possible_moves(&self, board: &Board) -> Vec<Position>;
+    fn possible_moves(&self, board: &dyn BoardTrait) -> Vec<Position>;
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -65,7 +65,7 @@ impl Piece for PieceType {
     fn move_to(
         &mut self,
         position: Position,
-        board: &mut Board,
+        board: &mut dyn BoardTrait,
     ) -> Result<Option<PieceType>, ChessError> {
         match self {
             PieceType::Pawn(_, _, _) => pawn_move_to(self, position, board),
@@ -77,7 +77,7 @@ impl Piece for PieceType {
         }
     }
 
-    fn can_move_to(&self, position: Position, board: &Board) -> Result<(), ChessError> {
+    fn can_move_to(&self, position: Position, board: &dyn BoardTrait) -> Result<(), ChessError> {
         match self {
             PieceType::Pawn(color, current_position, is_first_move) => {
                 pawn::can_move_to(current_position, color, *is_first_move, position, board)
@@ -111,7 +111,7 @@ impl Piece for PieceType {
         }
     }
 
-    fn possible_moves(&self, board: &Board) -> Vec<Position> {
+    fn possible_moves(&self, board: &dyn BoardTrait) -> Vec<Position> {
         match self {
             PieceType::Pawn(color, position, is_first_move) => {
                 pawn::possible_moves(position, color, *is_first_move, board)
