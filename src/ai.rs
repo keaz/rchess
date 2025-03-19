@@ -39,33 +39,51 @@ pub fn generate_move(color: Color, board: &dyn BoardTrait) -> Option<(&PieceType
 #[cfg(test)]
 mod test {
 
+    use std::ops::Range;
+
     use crate::{
         Position, Square,
         ai::generate_move,
-        board::BoardTrait,
+        board::{self, BoardTrait},
         pieces::{self, Color, PieceType},
     };
 
     #[test]
     fn test_generate_move() {
-        let mut board = MockBoard::new();
+        let mut board = board::new_board();
         let best_move = generate_move(Color::White, &mut board);
         assert_eq!(best_move.is_some(), true);
     }
 
     #[derive(Debug, Clone)]
     struct MockBoard {
-        pub squares: Vec<Square>,
+        pub white: Vec<Square>,
+        pub black: Vec<Square>,
+        pub is_king_check: bool,
     }
 
     impl MockBoard {
         pub fn new() -> Self {
-            let mut squares = Vec::with_capacity(64);
-            let mut squares = MockBoard::fill_white(squares);
-            let mut squares = MockBoard::fill_black(squares);
-            MockBoard { squares }
+            let white = MockBoard::fill_white();
+            let black = MockBoard::fill_black();
+            MockBoard {
+                white,
+                black,
+                is_king_check: false,
+            }
         }
-        fn fill_white(mut squares: Vec<Square>) -> Vec<Square> {
+        fn fill_white() -> Vec<Square> {
+            let mut squares = Vec::new();
+            for y in 1..3 {
+                let range: Range<u8> = 97..105;
+                for x in range {
+                    squares.push(Square {
+                        piece: None,
+                        x: x as char,
+                        y,
+                    });
+                }
+            }
             squares[0].piece = Some(pieces::PieceType::Rook(
                 pieces::Color::White,
                 Position::new('a', 1),
@@ -109,43 +127,54 @@ mod test {
             squares
         }
 
-        fn fill_black(mut squares: Vec<Square>) -> Vec<Square> {
-            squares[56].piece = Some(pieces::PieceType::Rook(
+        fn fill_black() -> Vec<Square> {
+            let mut squares = Vec::new();
+            for y in 7..9 {
+                let range: Range<u8> = 97..105;
+                for x in range {
+                    squares.push(Square {
+                        piece: None,
+                        x: x as char,
+                        y,
+                    });
+                }
+            }
+            squares[8].piece = Some(pieces::PieceType::Rook(
                 pieces::Color::Black,
                 Position::new('a', 8),
             ));
-            squares[57].piece = Some(pieces::PieceType::Knight(
+            squares[9].piece = Some(pieces::PieceType::Knight(
                 pieces::Color::Black,
                 Position::new('b', 8),
             ));
-            squares[58].piece = Some(pieces::PieceType::Bishop(
+            squares[10].piece = Some(pieces::PieceType::Bishop(
                 pieces::Color::Black,
                 Position::new('c', 8),
             ));
-            squares[59].piece = Some(pieces::PieceType::Queen(
+            squares[11].piece = Some(pieces::PieceType::Queen(
                 pieces::Color::Black,
                 Position::new('d', 8),
             ));
-            squares[60].piece = Some(pieces::PieceType::King(
+            squares[12].piece = Some(pieces::PieceType::King(
                 pieces::Color::Black,
                 Position::new('e', 8),
             ));
-            squares[61].piece = Some(pieces::PieceType::Bishop(
+            squares[13].piece = Some(pieces::PieceType::Bishop(
                 pieces::Color::Black,
                 Position::new('f', 8),
             ));
-            squares[62].piece = Some(pieces::PieceType::Knight(
+            squares[14].piece = Some(pieces::PieceType::Knight(
                 pieces::Color::Black,
                 Position::new('g', 8),
             ));
-            squares[63].piece = Some(pieces::PieceType::Rook(
+            squares[15].piece = Some(pieces::PieceType::Rook(
                 pieces::Color::Black,
                 Position::new('h', 8),
             ));
-            for i in 48..56 {
+            for i in 0..8 {
                 squares[i].piece = Some(pieces::PieceType::Pawn(
                     pieces::Color::Black,
-                    Position::new((i as i8 - 48 + 97) as u8 as char, 7),
+                    Position::new((i as i8 + 97) as u8 as char, 7),
                     true,
                 ));
             }
@@ -168,15 +197,21 @@ mod test {
         }
 
         fn get_all_white_pieces(&self) -> Vec<&PieceType> {
-            todo!()
+            self.white
+                .iter()
+                .filter_map(|square| square.piece.as_ref())
+                .collect()
         }
 
         fn get_all_black_pieces(&self) -> Vec<&PieceType> {
-            todo!()
+            self.black
+                .iter()
+                .filter_map(|square| square.piece.as_ref())
+                .collect()
         }
 
         fn is_king_check(&self, color: &Color) -> bool {
-            todo!()
+            self.is_king_check
         }
 
         fn can_king_move_safe_position(&self, color: &Color) -> bool {

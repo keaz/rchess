@@ -1,6 +1,6 @@
 use std::{borrow::BorrowMut, ops::ControlFlow};
 
-use crate::{board::BOARD_SQUARES, BoardTrait, Position};
+use crate::{BoardTrait, Position, board::BOARD_SQUARES};
 
 use super::{ChessError, Color, Piece, PieceType};
 
@@ -171,9 +171,8 @@ fn valide_move(
 mod test {
 
     use crate::{
-        board,
-        pieces::{ChessError, Color, Piece, PieceType},
-        BoardTrait, Position,
+        BoardTrait, Position, board,
+        pieces::{ChessError, Color, Piece, PieceType, rook::possible_moves},
     };
 
     fn init() {
@@ -324,6 +323,19 @@ mod test {
         assert!(
             board.get_piece(Position::new('b', 7)).is_some(),
             "White left rook should be in b7"
+        );
+    }
+
+    #[test]
+    fn test_white_rook_possible_moves() {
+        init();
+        let board = board::empty_board();
+
+        let possible_moves = possible_moves(&Position::new('d', 4), &Color::White, &board);
+        assert_eq!(
+            possible_moves.len(),
+            8,
+            "White Rook should have 8 possible moves"
         );
     }
 }

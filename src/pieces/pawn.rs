@@ -90,9 +90,11 @@ pub fn possible_moves(
     board: &dyn BoardTrait,
 ) -> Vec<Position> {
     let mut positions = vec![];
-    let moves = match color {
-        Color::Black => [-8, -7, -9],
-        Color::White => [8, 7, 9],
+    let moves = match (color, is_first_move) {
+        (Color::Black, true) => [-8, -16, -7, -9].to_vec(),
+        (Color::Black, false) => [-8, -7, -9].to_vec(),
+        (Color::White, true) => [8, 16, 7, 9].to_vec(),
+        (Color::White, false) => [8, 7, 9].to_vec(),
     };
 
     for m in moves.iter() {
@@ -109,7 +111,7 @@ pub fn possible_moves(
 mod test {
     use crate::{
         BoardTrait, Position, board,
-        pieces::{ChessError, Color, Piece, PieceType},
+        pieces::{ChessError, Color, Piece, PieceType, pawn::possible_moves},
     };
 
     fn init() {
@@ -364,5 +366,37 @@ mod test {
             Color::Black,
             "Black pawn should be in b4"
         );
+    }
+
+    #[test]
+    fn test_possible_first_white_moves() {
+        init();
+        let board = board::new_board();
+        let possible_moves = possible_moves(&Position::new('d', 2), &Color::White, true, &board);
+        assert_eq!(possible_moves.len(), 2);
+    }
+
+    #[test]
+    fn test_possible_second_white_moves() {
+        init();
+        let board = board::new_board();
+        let possible_moves = possible_moves(&Position::new('d', 2), &Color::White, false, &board);
+        assert_eq!(possible_moves.len(), 1);
+    }
+
+    #[test]
+    fn test_possible_first_black_moves() {
+        init();
+        let board = board::new_board();
+        let possible_moves = possible_moves(&Position::new('d', 7), &Color::Black, true, &board);
+        assert_eq!(possible_moves.len(), 2);
+    }
+
+    #[test]
+    fn test_possible_second_black_moves() {
+        init();
+        let board = board::new_board();
+        let possible_moves = possible_moves(&Position::new('d', 7), &Color::Black, false, &board);
+        assert_eq!(possible_moves.len(), 1);
     }
 }

@@ -113,9 +113,10 @@ pub fn possible_moves(
     color: &Color,
     board: &dyn BoardTrait,
 ) -> Vec<Position> {
+    let mut positions = vec![];
+
     let current_index = current_position.to_index();
     let mut next_inndex = current_index + 7;
-    let mut positions = vec![];
     while next_inndex <= BOARD_SQUARES {
         if let ControlFlow::Break(_) = valide_move(color, board, next_inndex, &mut positions) {
             break;
@@ -171,7 +172,7 @@ mod test {
 
     use crate::{
         BoardTrait, Position, board,
-        pieces::{ChessError, Color, Piece, PieceType},
+        pieces::{ChessError, Color, Piece, PieceType, bishop::possible_moves},
     };
 
     fn init() {
@@ -269,6 +270,34 @@ mod test {
         assert!(
             board.square(&Position::new('e', 3)).piece.is_none(),
             "e3 should be empty after e3 Beshop capture black pawn at a7"
+        );
+    }
+
+    #[test]
+    fn test_white_bishop_possible_moves_on_full_board() {
+        init();
+
+        let board = board::new_board();
+
+        let positions = possible_moves(&Position::new('d', 4), &Color::White, &board);
+        assert_eq!(
+            positions.len(),
+            8,
+            "d4 White Bishop should have 8 possible moves"
+        );
+    }
+
+    #[test]
+    fn test_black_bishop_possible_moves_on_full_board() {
+        init();
+
+        let board = board::new_board();
+
+        let positions = possible_moves(&Position::new('d', 4), &Color::Black, &board);
+        assert_eq!(
+            positions.len(),
+            8,
+            "d4 Black Bishop should have 8 possible moves"
         );
     }
 }

@@ -195,6 +195,9 @@ pub fn possible_moves(
     let mut positions = vec![];
     let moves = [7, 8, 9, 1, -7, -8, -9, -1];
     for m in moves.iter() {
+        if current_position.to_index() + *m < 0 || current_position.to_index() + *m >= 64 {
+            continue;
+        }
         let next_position = Position::from_index(current_position.to_index() + *m);
         if can_move_to(current_position, color, next_position, board) == Ok(()) {
             positions.push(next_position);
@@ -214,6 +217,8 @@ mod test {
         BoardTrait, Position, board,
         pieces::{ChessError, Color, Piece, PieceType, king::is_check},
     };
+
+    use super::possible_moves;
 
     #[test]
     fn test_invalid_king_move() {
@@ -395,5 +400,25 @@ mod test {
             !is_check(king, &board),
             "e6 White King is not checked by Black f8 Queen"
         );
+    }
+
+    #[test]
+    fn king_test_possible_move() {
+        init();
+        let mut board = board::empty_board();
+        let position = Position::new('e', 4);
+        let king = PieceType::King(Color::White, position);
+        board.square_mut(&position).piece = Some(king);
+
+        let moves = possible_moves(&position, &Color::White, &board);
+        assert_eq!(moves.len(), 8, "King can move to 8 positions");
+    }
+
+    #[test]
+    fn king_test_0_possible_move() {
+        init();
+        let mut board = board::new_board();
+        let moves = possible_moves(&Position::new('e', 1), &Color::White, &board);
+        assert_eq!(moves.len(), 0, "King can not move");
     }
 }
