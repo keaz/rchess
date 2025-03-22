@@ -126,6 +126,20 @@ impl Board {
     }
 
     fn new_inner() -> Board {
+        let mut squares = Board::get_squares();
+
+        let squares = Board::fill_white(squares);
+        let squares = Board::fill_black(squares);
+        Board { squares }
+    }
+
+    fn empty_inner() -> Board {
+        let squares = Board::get_squares();
+
+        Board { squares }
+    }
+
+    fn get_squares() -> Vec<Square> {
         let mut squares = Vec::new();
         for y in 1..9 {
             let range: Range<u8> = 97..105;
@@ -138,25 +152,7 @@ impl Board {
             }
         }
 
-        let squares = Board::fill_white(squares);
-        let squares = Board::fill_black(squares);
-        Board { squares }
-    }
-
-    fn empty_inner() -> Board {
-        let mut squares = Vec::new();
-        for y in 0..8 {
-            let range: Range<u8> = 97..105;
-            for x in range {
-                squares.push(Square {
-                    piece: None,
-                    x: x as char,
-                    y,
-                });
-            }
-        }
-
-        Board { squares }
+        squares
     }
 }
 
@@ -304,5 +300,13 @@ mod test {
         }
 
         assert_eq!(board.evaluate(&Color::White), -39);
+    }
+
+    #[test]
+    fn test_board_to_square() {
+        let board = Board::new_inner();
+        let square = board.square(&Position::from_index(3));
+        assert_eq!(square.x, 'd');
+        assert_eq!(square.y, 1);
     }
 }

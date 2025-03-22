@@ -172,7 +172,7 @@ pub struct Position {
 impl Position {
     pub fn new(x: char, y: i8) -> Self {
         if x < 'a' || x > 'h' || y < 1 || y > 8 {
-            panic!("Invalid position");
+            panic!("Invalid position: {},{}", x, y);
         }
         Position { x, y }
     }
@@ -184,6 +184,10 @@ impl Position {
     }
 
     pub fn from_index(index: i32) -> Self {
+        if index < 0 || index > 64 {
+            panic!("Invalid index: {}", index);
+        }
+
         let x = (index % 8) + 97;
         let y = (index / 8) + 1;
         Position {
@@ -197,9 +201,8 @@ impl Position {
 mod test {
 
     use crate::{
-        board,
+        BoardTrait, Position, board,
         pieces::{Color, PieceType},
-        BoardTrait, Position,
     };
 
     #[test]
@@ -236,5 +239,40 @@ mod test {
 
         let is_check = board.is_king_check(&Color::White);
         assert_eq!(is_check, false);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_from_index_invalid_lower() {
+        let _ = Position::from_index(-1);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_from_index_invalid_upper() {
+        let _ = Position::from_index(64);
+    }
+
+    #[test]
+    fn test_from_index() {
+        let position = Position::from_index(0);
+        assert_eq!(position.x, 'a');
+        assert_eq!(position.y, 1);
+
+        let position = Position::from_index(63);
+        assert_eq!(position.x, 'h');
+        assert_eq!(position.y, 8);
+
+        let position = Position::from_index(28);
+        assert_eq!(position.x, 'e');
+        assert_eq!(position.y, 4);
+
+        let position = Position::from_index(42);
+        assert_eq!(position.x, 'c');
+        assert_eq!(position.y, 6);
+
+        let position = Position::from_index(3);
+        assert_eq!(position.x, 'd');
+        assert_eq!(position.y, 1);
     }
 }

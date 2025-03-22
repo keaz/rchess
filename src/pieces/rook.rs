@@ -117,7 +117,7 @@ pub fn possible_moves(
     let current_index = current_position.to_index();
     let mut next_inndex = current_index + 8;
     let mut positions = vec![];
-    while next_inndex <= BOARD_SQUARES {
+    while next_inndex < BOARD_SQUARES {
         if let ControlFlow::Break(_) = valide_move(color, board, next_inndex, &mut positions) {
             break;
         }
@@ -125,7 +125,7 @@ pub fn possible_moves(
     }
 
     let mut next_inndex = current_index + 1;
-    while next_inndex % 8 == 0 {
+    while next_inndex % 8 != 0 {
         if let ControlFlow::Break(_) = valide_move(color, board, next_inndex, &mut positions) {
             break;
         }
@@ -141,7 +141,7 @@ pub fn possible_moves(
     }
 
     let mut next_inndex = current_index - 1;
-    while next_inndex % 8 == 0 {
+    while next_inndex % 8 != 7 {
         if let ControlFlow::Break(_) = valide_move(color, board, next_inndex, &mut positions) {
             break;
         }
@@ -156,7 +156,7 @@ fn valide_move(
     next_inndex: i32,
     positions: &mut Vec<Position>,
 ) -> ControlFlow<()> {
-    let square = &board.square(&Position::from_index(next_inndex));
+    let square = board.square(&Position::from_index(next_inndex));
     if square.piece.is_some() {
         if square.piece.as_ref().unwrap().color() != color {
             positions.push(Position::new(square.x, square.y));
@@ -334,8 +334,8 @@ mod test {
         let possible_moves = possible_moves(&Position::new('d', 4), &Color::White, &board);
         assert_eq!(
             possible_moves.len(),
-            8,
-            "White Rook should have 8 possible moves"
+            14,
+            "White Rook should have 14 possible moves"
         );
     }
 }
