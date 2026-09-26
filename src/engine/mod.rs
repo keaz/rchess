@@ -1,9 +1,11 @@
 //! Computer player: local search and annotation feed one Jev `choice` question.
 
 mod annotate;
+mod describe;
 mod eval;
 mod search;
 mod see;
 
 pub use annotate::{Annotation, Bucket};
+pub use describe::JevState;
 pub use search::{MATE, ScoredMove, analyse};
