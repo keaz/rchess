@@ -30,6 +30,7 @@ cargo test --lib core::
   proven by an exhaustive subset test; do not regenerate them.
 - Reference performance from the prototype: full published perft suite (~594M leaf nodes)
   in 1.6 s release; criterion `startpos depth 5` about 15 ms.
+- Game::undo withdraws a pending resignation first (returns None, keeps moves); a second undo takes back the move. Deviation from the plan's code, by controller ruling.
 
 ## Open questions for user
 - None.

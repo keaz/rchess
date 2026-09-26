@@ -92,9 +92,13 @@ impl Game {
         Ok(())
     }
 
-    /// Takes back the last move (and any resignation). Returns the move undone.
+    /// Takes back the most recent action. A pending resignation is withdrawn
+    /// first (returning `None`, moves untouched); otherwise the last move is
+    /// taken back and returned (`None` when no moves remain).
     pub fn undo(&mut self) -> Option<Move> {
-        self.resigned = None;
+        if self.resigned.take().is_some() {
+            return None;
+        }
         let mv = self.moves.pop()?;
         self.positions.pop();
         Some(mv)
@@ -262,6 +266,21 @@ mod tests {
         );
         game.undo();
         assert_eq!(game.outcome(), None);
+    }
+
+    #[test]
+    fn undo_after_resignation_keeps_moves() {
+        let mut game = Game::new();
+        play_uci(&mut game, &["e2e4", "e7e5"]);
+        game.resign(Color::White);
+        assert_eq!(
+            game.undo(),
+            None,
+            "first undo withdraws the resignation only"
+        );
+        assert_eq!(game.outcome(), None);
+        assert_eq!(game.moves().len(), 2);
+        assert_eq!(game.undo().map(|m| m.to_uci()), Some("e7e5".to_string()));
     }
 
     #[test]
