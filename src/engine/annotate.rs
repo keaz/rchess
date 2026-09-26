@@ -10,7 +10,7 @@ use crate::core::{
 
 use super::eval::piece_value;
 use super::search::{MATE_BOUND, ScoredMove};
-use super::see::{capture_gain, see};
+use super::see::{capture_gain, capturers, exchange_value, see, winnable_pieces};
 
 /// The engine's verdict on a move relative to the best move found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -98,8 +98,7 @@ fn effect(pos: &Position, mv: Move, score: i32) -> String {
             .piece_at(mv.to())
             .expect("capture target holds a piece")
             .kind;
-        let recapture =
-            (child.attackers_to(mv.to(), child.occupied()) & child.occupied_by(!us)).any();
+        let recapture = capturers(&child, mv.to(), child.occupied(), !us).any();
         let exchange = see(pos, mv);
         let qualifier = if !recapture {
             "undefended"
@@ -131,7 +130,7 @@ fn effect(pos: &Position, mv: Move, score: i32) -> String {
     if let Some(fact) = rescue(pos, &child, mv) {
         facts.push(fact);
     }
-    if !checkmate && let Some(fact) = hanging(&child, us) {
+    if !checkmate && let Some(fact) = hanging(&child, us, mv) {
         facts.push(fact);
     }
     if score <= -MATE_BOUND {
@@ -158,6 +157,7 @@ fn attacks(kind: PieceKind, color: Color, sq: Square, occupied: Bitboard) -> Bit
 
 /// The most valuable enemy piece (not the king) the moved piece attacks from its new
 /// square but did not attack before, when it is worth more than the mover or undefended.
+/// A king counts as worth more than anything, so it only "attacks" undefended pieces.
 fn new_attack(pos: &Position, child: &Position, mv: Move) -> Option<String> {
     let us = pos.side_to_move();
     let before_kind = pos.piece_at(mv.from())?.kind;
@@ -170,7 +170,7 @@ fn new_attack(pos: &Position, child: &Position, mv: Move) -> Option<String> {
         let kind = child.piece_at(sq)?.kind;
         let defended = (child.attackers_to(sq, child.occupied()) & child.occupied_by(!us)).any();
         let value = piece_value(kind);
-        if (value > piece_value(mover) || !defended) && best.is_none_or(|(v, _, _)| value > v) {
+        if (value > exchange_value(mover) || !defended) && best.is_none_or(|(v, _, _)| value > v) {
             best = Some((value, sq, kind));
         }
     }
@@ -187,23 +187,14 @@ fn rescue(pos: &Position, child: &Position, mv: Move) -> Option<String> {
 }
 
 /// Our most valuable piece (not the king) that the opponent can win after the move.
-fn hanging(child: &Position, us: Color) -> Option<String> {
-    let mut best: Option<(i32, Square, PieceKind)> = None;
-    for sq in child.occupied_by(us) & !child.pieces(PieceKind::King) {
-        if capture_gain(child, sq) > 0 {
-            let kind = child.piece_at(sq)?.kind;
-            let value = piece_value(kind);
-            if best.is_none_or(|(v, _, _)| value > v) {
-                best = Some((value, sq, kind));
-            }
-        }
-    }
-    best.map(|(_, sq, kind)| {
-        format!(
-            "leaves the {} on {sq} undefended against capture",
-            piece_name(kind)
-        )
-    })
+/// After a capture the destination square is left out: the capture's exchange
+/// qualifier already says what happens there.
+fn hanging(child: &Position, us: Color, mv: Move) -> Option<String> {
+    let skipped = mv.is_capture().then(|| mv.to());
+    winnable_pieces(child, us)
+        .into_iter()
+        .find(|&(_, sq, _)| Some(sq) != skipped)
+        .map(|(_, sq, kind)| format!("leaves the {} on {sq} exposed to capture", piece_name(kind)))
 }
 
 #[cfg(test)]
@@ -287,7 +278,7 @@ mod tests {
         let king_move = find(&pos, &list, "h1h2");
         assert_eq!(
             king_move.effect,
-            "leaves the knight on f2 undefended against capture"
+            "leaves the knight on f2 exposed to capture"
         );
         assert_eq!(king_move.bucket, Bucket::Losing);
         assert_eq!(
@@ -321,6 +312,77 @@ mod tests {
             find(&pos, &list, "e5d6")
                 .effect
                 .starts_with("captures en passant")
+        );
+    }
+
+    #[test]
+    fn a_capture_does_not_call_the_capturing_piece_exposed() {
+        // Nxd5 exd5 Rxd5: the recapture is part of the exchange, not a hanging piece.
+        let (pos, list) = annotations("4k3/8/4p3/3n4/8/2N5/8/3RK3 w - - 0 1");
+        assert_eq!(
+            find(&pos, &list, "c3d5").effect,
+            "captures the knight on d5, wins material in the exchange"
+        );
+        // Scotch Game: 3...exd4 4. Nxd4 is a normal trade.
+        let (pos, list) =
+            annotations("r1bqkbnr/pppp1ppp/2n5/4p3/3PP3/5N2/PPP2PPP/RNBQKB1R b KQkq d3 0 3");
+        assert_eq!(
+            find(&pos, &list, "e5d4").effect,
+            "captures the pawn on d4, equal trade"
+        );
+    }
+
+    #[test]
+    fn a_pinned_defender_does_not_defend() {
+        // Nc6 is pinned by Bb5, so nothing can take back on e5.
+        let (pos, list) =
+            annotations("r1bqkbnr/ppp2ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 0 4");
+        assert_eq!(
+            find(&pos, &list, "f3e5").effect,
+            "captures the pawn on e5, undefended"
+        );
+    }
+
+    #[test]
+    fn a_king_only_attacks_undefended_pieces() {
+        // The pawn on c5 defends the rook on d4: the king can never take it.
+        let (pos, list) = annotations("4k3/8/8/2p5/3r4/8/4K3/8 w - - 0 1");
+        assert_eq!(find(&pos, &list, "e2e3").effect, "quiet move");
+        let (pos, list) = annotations("4k3/8/8/8/3r4/8/4K3/8 w - - 0 1");
+        assert_eq!(find(&pos, &list, "e2e3").effect, "attacks the rook on d4");
+    }
+
+    #[test]
+    fn a_defended_cheaper_piece_is_not_attacked() {
+        // Nc3 hits the pawn on d5, which e6 defends and which is worth less than the knight.
+        let (pos, list) = annotations("4k3/8/4p3/3p4/8/8/8/1N2K3 w - - 0 1");
+        assert_eq!(find(&pos, &list, "b1c3").effect, "quiet move");
+        let (pos, list) = annotations("4k3/8/8/3p4/8/8/8/1N2K3 w - - 0 1");
+        assert_eq!(find(&pos, &list, "b1c3").effect, "attacks the pawn on d5");
+    }
+
+    #[test]
+    fn checkmate_skips_the_exposed_fact() {
+        // After Re8# the knight on a4 could be taken by b5, but the game is over.
+        let (pos, list) = annotations("6k1/5ppp/8/1p6/N7/8/5PPP/4R1K1 w - - 0 1");
+        assert_eq!(find(&pos, &list, "e1e8").effect, "delivers checkmate");
+        assert_eq!(
+            find(&pos, &list, "g1f1").effect,
+            "leaves the knight on a4 exposed to capture"
+        );
+    }
+
+    #[test]
+    fn moving_to_another_attacked_square_is_not_a_rescue() {
+        // The knight on c3 is attacked by b4; on d5 it is attacked by e6 instead.
+        let (pos, list) = annotations("4k3/8/4p3/8/1p6/2N5/8/7K w - - 0 1");
+        assert_eq!(
+            find(&pos, &list, "c3d5").effect,
+            "attacks the pawn on b4; leaves the knight on d5 exposed to capture"
+        );
+        assert_eq!(
+            find(&pos, &list, "c3e2").effect,
+            "moves the attacked knight to safety"
         );
     }
 

@@ -218,10 +218,13 @@ Rules:
   capped at 8 plies. Move ordering: captures by MVV-LVA, then promotions, then quiet moves.
 - **Scores**: mate = ±(30000 − ply); stalemate = 0; draw = 0 for a repetition of any position hash in
   the game history since the last irreversible move or on the current search path, for the fifty-move
-  rule, and for insufficient material.
+  rule, and for insufficient material. Checkmate and stalemate take precedence over the fifty-move
+  rule, as in `Game::outcome`.
 - **Budget**: scoring all root moves of Kiwipete takes under 250 ms in release mode.
 - **SEE**: swap-off algorithm using `Position::attackers_to` with x-rays revealed by removing
-  attackers from the occupancy; king value treated as effectively infinite.
+  attackers from the occupancy; king value treated as effectively infinite. A piece absolutely
+  pinned to its king takes part only when the target lies on its pin line; pins are computed once
+  for the starting position (a pin created or released mid-exchange is not modelled).
 
 ### 5.4 Annotation and buckets
 
@@ -235,11 +238,12 @@ Per root move, `annotate.rs` produces plain words (joined with "; ") from facts 
 - promotes to a <piece>
 - gives check / delivers checkmate
 - attacks the <piece> on <square> — the most valuable enemy piece the moved piece newly attacks,
-  when it is worth more than the mover or undefended
+  when it is worth more than the mover or undefended (a king counts as worth more than anything)
 - moves the attacked <piece> to safety — the moved piece was losing material by SEE before and is
   not after
-- leaves the <piece> on <square> undefended against capture — our most valuable piece that the
-  opponent can win by SEE after the move
+- leaves the <piece> on <square> exposed to capture — our most valuable piece that the
+  opponent can win by SEE after the move (after a capture the destination square is left out; the
+  capture qualifier covers it)
 - allows checkmate — search shows we are mated
 
 Bucket from `d = best_score − move_score` (mate scores included):

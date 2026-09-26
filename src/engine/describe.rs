@@ -3,11 +3,11 @@
 
 use serde::Serialize;
 
-use crate::core::{Color, Game, PieceKind, Position, Square};
+use crate::core::{Color, Game, PieceKind, Position};
 
 use super::annotate::piece_name;
-use super::eval::{is_endgame, material_balance, piece_value};
-use super::see::{capture_gain, least_valuable};
+use super::eval::{is_endgame, material_balance};
+use super::see::{capturers, least_valuable, winnable_pieces};
 
 /// The `state` field of a Jev request. Field order is the JSON order.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -131,18 +131,11 @@ fn recent_moves(game: &Game) -> String {
 /// Our pieces (not the king) the opponent can win by SEE, most valuable first, at most three.
 fn threats(pos: &Position) -> Vec<String> {
     let us = pos.side_to_move();
-    let mut threatened: Vec<(i32, Square, PieceKind)> = (pos.occupied_by(us)
-        & !pos.pieces(PieceKind::King))
-    .into_iter()
-    .filter(|&sq| capture_gain(pos, sq) > 0)
-    .filter_map(|sq| pos.piece_at(sq).map(|p| (piece_value(p.kind), sq, p.kind)))
-    .collect();
-    threatened.sort_by_key(|&(value, _, _)| std::cmp::Reverse(value));
-    threatened
+    winnable_pieces(pos, us)
         .into_iter()
         .take(3)
         .filter_map(|(_, sq, kind)| {
-            let attackers = pos.attackers_to(sq, pos.occupied()) & pos.occupied_by(!us);
+            let attackers = capturers(pos, sq, pos.occupied(), !us);
             let (from, attacker) = least_valuable(pos, attackers)?;
             Some(format!(
                 "Our {} on {sq} is attacked by the {} on {from}",
@@ -253,6 +246,13 @@ mod tests {
                 "Our bishop on b2 is attacked by the queen on d4",
             ]
         );
+    }
+
+    #[test]
+    fn a_pinned_attacker_is_not_a_threat() {
+        // The knight on e5 is pinned by Re1 and cannot take the queen on c4.
+        let game = Game::from_fen("4k3/8/8/4n3/2Q5/8/8/4RK2 w - - 0 1").unwrap();
+        assert_eq!(describe(&game).threats_against_us, Vec::<String>::new());
     }
 
     #[test]
