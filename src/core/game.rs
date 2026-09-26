@@ -75,6 +75,11 @@ impl Game {
         &self.moves
     }
 
+    /// `positions()[0]` is the start; `positions()[i + 1]` follows `moves()[i]`.
+    pub fn positions(&self) -> &[Position] {
+        &self.positions
+    }
+
     /// Plays `mv` if it is legal and the game is not over.
     pub fn play(&mut self, mv: Move) -> Result<(), ChessError> {
         if let Some(outcome) = self.outcome() {
@@ -150,6 +155,11 @@ impl Game {
         let result = self.outcome().map_or("*", Outcome::result);
         let mut pgn = String::new();
         writeln!(pgn, "[Event \"rchess game\"]").unwrap();
+        writeln!(pgn, "[Site \"?\"]").unwrap();
+        writeln!(pgn, "[Date \"????.??.??\"]").unwrap();
+        writeln!(pgn, "[Round \"?\"]").unwrap();
+        writeln!(pgn, "[White \"?\"]").unwrap();
+        writeln!(pgn, "[Black \"?\"]").unwrap();
         writeln!(pgn, "[Result \"{result}\"]").unwrap();
         if *self.start_position() != Position::startpos() {
             writeln!(pgn, "[SetUp \"1\"]").unwrap();
@@ -202,6 +212,7 @@ mod tests {
     fn undo_restores_position() {
         let mut game = Game::new();
         play_uci(&mut game, &["e2e4", "e7e5"]);
+        assert_eq!(game.positions().len(), game.moves().len() + 1);
         assert_eq!(game.undo().map(|m| m.to_uci()), Some("e7e5".to_string()));
         assert_eq!(game.undo().map(|m| m.to_uci()), Some("e2e4".to_string()));
         assert_eq!(game.undo(), None);
@@ -289,7 +300,8 @@ mod tests {
         play_uci(&mut game, &["f2f3", "e7e5", "g2g4", "d8h4"]);
         assert_eq!(
             game.to_pgn(),
-            "[Event \"rchess game\"]\n[Result \"0-1\"]\n\n1. f3 e5 2. g4 Qh4# 0-1\n"
+            "[Event \"rchess game\"]\n[Site \"?\"]\n[Date \"????.??.??\"]\n[Round \"?\"]\n\
+             [White \"?\"]\n[Black \"?\"]\n[Result \"0-1\"]\n\n1. f3 e5 2. g4 Qh4# 0-1\n"
         );
 
         let mut game = Game::from_fen("4k3/8/8/8/8/8/4P3/4K3 b - - 0 12").unwrap();

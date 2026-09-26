@@ -20,7 +20,7 @@ pub use attacks::{
     between, bishop_attacks, king_attacks, knight_attacks, line, pawn_attacks, queen_attacks,
     rook_attacks,
 };
-pub use bitboard::Bitboard;
+pub use bitboard::{Bitboard, BitboardIter};
 pub use error::ChessError;
 pub use game::{Game, Outcome};
 pub use movegen::MoveList;

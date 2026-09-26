@@ -1,5 +1,7 @@
+use std::hint::black_box;
+
 use chess::core::{Position, perft};
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 
 fn perft_benches(c: &mut Criterion) {
     let start = Position::startpos();

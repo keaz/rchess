@@ -2,7 +2,7 @@
 //! position, so no generated move ever needs a make-and-test step (except en
 //! passant, which is rare enough to verify by simulating the occupancy).
 
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 
 use super::{
     Bitboard, Color, Move, PieceKind, Position, Square,
@@ -51,6 +51,31 @@ impl Deref for MoveList {
 
     fn deref(&self) -> &[Move] {
         &self.moves[..self.len]
+    }
+}
+
+/// So callers can sort the list for move ordering, e.g. `list.sort_by_key(...)`.
+impl DerefMut for MoveList {
+    fn deref_mut(&mut self) -> &mut [Move] {
+        &mut self.moves[..self.len]
+    }
+}
+
+impl<'a> IntoIterator for &'a MoveList {
+    type Item = &'a Move;
+    type IntoIter = std::slice::Iter<'a, Move>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl IntoIterator for MoveList {
+    type Item = Move;
+    type IntoIter = std::iter::Take<std::array::IntoIter<Move, CAPACITY>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.moves.into_iter().take(self.len)
     }
 }
 
@@ -267,6 +292,25 @@ mod tests {
     #[test]
     fn startpos_has_twenty_moves() {
         assert_eq!(Position::startpos().legal_moves().len(), 20);
+    }
+
+    #[test]
+    fn move_list_supports_iteration_and_sorting() {
+        let mut list = Position::startpos().legal_moves();
+        let len = list.len();
+
+        let mut count = 0;
+        for _mv in &list {
+            count += 1;
+        }
+        assert_eq!(count, len);
+
+        list.sort_by_key(|m| m.to_uci());
+        assert_eq!(list.len(), len);
+        assert!(list.windows(2).all(|w| w[0].to_uci() <= w[1].to_uci()));
+
+        let owned_count = list.into_iter().count();
+        assert_eq!(owned_count, len);
     }
 
     #[test]

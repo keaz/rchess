@@ -51,10 +51,12 @@ static PAWN: [[Bitboard; 64]; 2] = [
     leaper_table(&[(-1, -1), (1, -1)]),
 ];
 
+/// Squares a knight on `sq` attacks.
 pub fn knight_attacks(sq: Square) -> Bitboard {
     KNIGHT[sq.index()]
 }
 
+/// Squares a king on `sq` attacks.
 pub fn king_attacks(sq: Square) -> Bitboard {
     KING[sq.index()]
 }
@@ -64,16 +66,22 @@ pub fn pawn_attacks(color: Color, sq: Square) -> Bitboard {
     PAWN[color.index()][sq.index()]
 }
 
+/// Squares a bishop on `sq` attacks, given occupancy `occupied`; the ray
+/// includes the first blocker.
 pub fn bishop_attacks(sq: Square, occupied: Bitboard) -> Bitboard {
     let s = &*SLIDERS;
     s.table[s.bishop[sq.index()].index(occupied)]
 }
 
+/// Squares a rook on `sq` attacks, given occupancy `occupied`; the ray
+/// includes the first blocker.
 pub fn rook_attacks(sq: Square, occupied: Bitboard) -> Bitboard {
     let s = &*SLIDERS;
     s.table[s.rook[sq.index()].index(occupied)]
 }
 
+/// Squares a queen on `sq` attacks, given occupancy `occupied`; the ray
+/// includes the first blocker.
 pub fn queen_attacks(sq: Square, occupied: Bitboard) -> Bitboard {
     bishop_attacks(sq, occupied) | rook_attacks(sq, occupied)
 }
