@@ -4,14 +4,14 @@ Read this first. Follow the protocol in section 8 of
 `docs/superpowers/specs/2026-09-26-rchess-redesign-design.md`.
 
 ## Current
-Sub-project: engine | Plan: docs/superpowers/plans/2026-09-26-engine.md
-Branch: feat/jev-engine
-Last completed task: engine task 8 (computer player)
-Next task: engine task 9 (evaluation harness and wrap-up)
+Sub-project: tui (not started) | Plan: to be written — docs/superpowers/plans/2026-09-26-tui.md
+Branch: feat/jev-engine (complete, ready for user to merge)
+Last completed task: engine task 9 (evaluation harness and wrap-up) — engine sub-project DONE
+Next task: user merges feat/jev-engine; then brainstorm/plan the TUI from spec section 6
 State: green (except 3 pre-existing old-code test failures)
 
 ## Verify before continuing
-cargo test --lib engine::
+cargo test --lib engine:: && cargo test --lib core:: && cargo test --test core_properties
 
 ## Core API caveats (read before building on core)
 - `Position::play` / `to_san` require a move from `self.legal_moves()`; debug builds assert, release builds may corrupt the position; use `Game::play` for unvalidated input.
@@ -45,11 +45,14 @@ cargo test --lib engine::
   in 1.6 s release; criterion `startpos depth 5` about 15 ms.
 - Game::undo withdraws a pending resignation first (returns None, keeps moves); a second undo takes back the move. Deviation from the plan's code, by controller ruling.
 - Benchmark results (criterion, 10 samples): startpos depth 5 [14.654 ms 14.811 ms 15.283 ms], kiwipete depth 4 [9.9514 ms 9.9703 ms 9.9899 ms].
+- Evaluation harness run (`examples/jev_eval.rs`, 20 positions): 19 answered by Jev, agreement with search best 12/19 (63%), 0 vetoes, 0 fallbacks, mean latency 311 ms, 15900 input tokens (about $0.000668).
+- TUI integration: own a ComputerPlayer<JevClient> (ComputerPlayer::from_config(EngineConfig::from_env())) on the worker thread; show EngineConfig.warnings, ComputerMove.note, source, top and model.
 
 ## Open questions for user
 - None.
 
 ## Log (newest first)
+- 2026-09-26 engine sub-project complete; harness run recorded
 - 2026-09-26 engine task 8 done: computer player
 - 2026-09-26 engine task 7 done: Jev client
 - 2026-09-26 engine task 6 done: configuration
