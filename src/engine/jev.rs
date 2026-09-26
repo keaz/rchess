@@ -51,7 +51,9 @@ pub struct ChoiceRequest {
 }
 
 impl ChoiceRequest {
-    /// JSON body for `POST /v1/systemone`; the question id is `move`.
+    /// JSON body for `POST /v1/systemone`; the question id is `move`. serde_json sorts
+    /// object keys, so the state fields and the options (criteria) reach Jev in
+    /// alphabetical order, not in shortlist order.
     pub fn to_body(&self, model: &str) -> Value {
         let criteria: Map<String, Value> = self
             .options

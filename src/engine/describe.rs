@@ -9,7 +9,9 @@ use super::annotate::piece_name;
 use super::eval::{is_endgame, material_balance};
 use super::see::{capturers, least_valuable, winnable_pieces};
 
-/// The `state` field of a Jev request. Field order is the JSON order.
+/// The `state` field of a Jev request. The struct's field order documents the spec 5.5
+/// layout; on the wire the request JSON (see `jev.rs`) carries these keys in
+/// alphabetical order, because serde_json sorts object keys.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct JevState {
     /// `White` or `Black`.
