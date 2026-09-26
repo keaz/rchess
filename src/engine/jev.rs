@@ -1,6 +1,9 @@
 //! TypeSafe Jev client: request/response types, the retry policy and the HTTP
-//! transport (spec 5.1, 5.7). Everything except `JevClient::post_once` is pure
-//! and tested offline.
+//! transport (spec 5.1, 5.7). Everything is tested offline; the transport tests
+//! talk to a scripted HTTP server on 127.0.0.1.
+//!
+//! Never enable TRACE-level logging for `ureq` or `ureq_proto`: it prints request
+//! headers, including the `Authorization` bearer key.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -20,6 +23,8 @@ const BASE_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(2);
 /// Longest error-body excerpt kept in a `JevError`.
 const ERROR_SNIPPET_CHARS: usize = 200;
+/// Largest response body read, in bytes; a real answer is a few kilobytes.
+const MAX_BODY_BYTES: u64 = 1 << 20;
 
 /// One candidate move offered to Jev.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -109,6 +114,10 @@ pub enum JevError {
     /// A 200 response whose body is not a usable answer.
     #[error("invalid response: {0}")]
     InvalidResponse(String),
+    /// The request failed in a way retrying cannot fix: a malformed URL, a protocol
+    /// error or a response body over 1 MiB.
+    #[error("request failed: {0}")]
+    Request(String),
 }
 
 /// Something that can answer a `choice` question: `JevClient`, or a mock in tests.
@@ -193,7 +202,19 @@ pub fn retry_delay(error: &JevError, attempt: u32) -> Option<Duration> {
             Some(retry_after.map_or(backoff, |d| d.min(MAX_RETRY_AFTER)))
         }
         JevError::Timeout | JevError::Transport(_) => Some(backoff),
-        JevError::Http { .. } | JevError::InvalidResponse(_) => None,
+        JevError::Http { .. } | JevError::InvalidResponse(_) | JevError::Request(_) => None,
+    }
+}
+
+/// Classifies a `ureq` failure: timeouts and connection problems are worth
+/// retrying; anything else (a bad URL, a protocol error, an oversized body) is final.
+fn request_error(error: ureq::Error) -> JevError {
+    match error {
+        ureq::Error::Timeout(_) => JevError::Timeout,
+        e @ (ureq::Error::ConnectionFailed | ureq::Error::HostNotFound | ureq::Error::Io(_)) => {
+            JevError::Transport(e.to_string())
+        }
+        other => JevError::Request(other.to_string()),
     }
 }
 
@@ -238,10 +259,7 @@ impl JevClient {
             .post(&self.url)
             .header("Authorization", &format!("Bearer {}", self.api_key))
             .send_json(body)
-            .map_err(|e| match e {
-                ureq::Error::Timeout(_) => JevError::Timeout,
-                other => JevError::Transport(other.to_string()),
-            })?;
+            .map_err(request_error)?;
         let status = response.status().as_u16();
         let retry_after = response
             .headers()
@@ -251,12 +269,21 @@ impl JevClient {
             .map(Duration::from_secs);
         let text = response
             .body_mut()
-            .read_to_string()
-            .map_err(|e| JevError::Transport(e.to_string()))?;
+            .with_config()
+            .limit(MAX_BODY_BYTES)
+            .read_to_string();
         if status != 200 {
-            return Err(http_error(status, &text, retry_after));
+            // Keep the status and Retry-After even when the body cannot be read.
+            return Err(match text {
+                Ok(text) => http_error(status, &text, retry_after),
+                Err(_) => JevError::Http {
+                    status,
+                    message: "<unreadable body>".into(),
+                    retry_after,
+                },
+            });
         }
-        parse_answer(&text)
+        parse_answer(&text.map_err(request_error)?)
     }
 }
 
@@ -282,6 +309,10 @@ impl MoveChooser for JevClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn request() -> ChoiceRequest {
         ChoiceRequest {
@@ -424,6 +455,173 @@ mod tests {
             Some(Duration::from_secs(2)),
             "retry-after is capped"
         );
+        assert_eq!(
+            retry_delay(&JevError::Request("bad uri".into()), 1),
+            None,
+            "a malformed request fails the same way every time"
+        );
+    }
+
+    #[test]
+    fn classifies_transport_errors() {
+        assert_eq!(
+            request_error(ureq::Error::Timeout(ureq::Timeout::Global)),
+            JevError::Timeout
+        );
+        for retryable in [
+            ureq::Error::ConnectionFailed,
+            ureq::Error::HostNotFound,
+            ureq::Error::Io(std::io::Error::other("reset")),
+        ] {
+            let error = request_error(retryable);
+            assert!(matches!(error, JevError::Transport(_)), "{error:?}");
+            assert!(retry_delay(&error, 1).is_some());
+        }
+        for final_error in [
+            ureq::Error::BadUri("not a uri".into()),
+            ureq::Error::BodyExceedsLimit(1 << 20),
+            ureq::Error::RequireHttpsOnly("http://x".into()),
+        ] {
+            let error = request_error(final_error);
+            assert!(matches!(error, JevError::Request(_)), "{error:?}");
+            assert_eq!(retry_delay(&error, 1), None);
+        }
+    }
+
+    /// Serves `responses` in order, one per connection, on 127.0.0.1, then stops
+    /// listening. Returns a client pointed at it and the number of requests read.
+    fn serve(responses: Vec<String>) -> (JevClient, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        thread::spawn(move || {
+            for response in responses {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut reader = BufReader::new(stream);
+                read_request(&mut reader);
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut stream = reader.into_inner();
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+                // Dropping the stream closes the connection.
+            }
+        });
+        let config = EngineConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: format!("http://127.0.0.1:{port}"),
+            timeout: Duration::from_secs(2),
+            ..EngineConfig::default()
+        };
+        (JevClient::new(&config).unwrap(), requests)
+    }
+
+    /// Reads one request: the head, then a body of `Content-Length` bytes.
+    fn read_request(reader: &mut BufReader<TcpStream>) {
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                length = value.trim().parse().unwrap_or(0);
+            }
+        }
+        let mut body = vec![0; length];
+        let _ = reader.read_exact(&mut body);
+    }
+
+    fn response(status: &str, content_type: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[test]
+    fn transport_parses_a_successful_answer() {
+        let body = r#"{"model":"jev-1.13.0","answers":{"move":{"type":"choice","choice":"O-O",
+            "probabilities":{"Nxe5":0.25,"O-O":0.75},"confidence":0.6}},
+            "usage":{"input_tokens":321,"output_tokens":9}}"#;
+        let (client, requests) = serve(vec![response("200 OK", "application/json", body)]);
+        let answer = client.choose(&request()).unwrap();
+        assert_eq!(answer.choice, "O-O");
+        assert_eq!(
+            answer.probabilities,
+            vec![("O-O".to_string(), 0.75), ("Nxe5".to_string(), 0.25)]
+        );
+        assert_eq!(answer.model, "jev-1.13.0");
+        assert_eq!(answer.input_tokens, 321);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn transport_retries_a_bad_gateway_three_times() {
+        let page = format!(
+            "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\x1b[31m\r\n{}\r\n</body></html>",
+            "<p>upstream unavailable</p>".repeat(20)
+        );
+        let bad_gateway = response("502 Bad Gateway", "text/html", &page);
+        let (client, requests) = serve(vec![bad_gateway; 3]);
+        let error = client.choose(&request()).unwrap_err();
+        let JevError::Http {
+            status, message, ..
+        } = &error
+        else {
+            panic!("expected an HTTP error, got {error:?}");
+        };
+        assert_eq!(*status, 502);
+        assert!(message.chars().count() <= 200, "{message}");
+        assert!(!message.chars().any(char::is_control), "{message:?}");
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn transport_does_not_retry_a_rejected_key() {
+        let rejected = response(
+            "401 Unauthorized",
+            "application/json",
+            r#"{"error":"invalid api key"}"#,
+        );
+        let (client, requests) = serve(vec![rejected]);
+        let error = client.choose(&request()).unwrap_err();
+        assert!(
+            matches!(error, JevError::Http { status: 401, .. }),
+            "{error:?}"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn transport_keeps_the_status_when_the_error_body_is_unreadable() {
+        // The body is cut short: 5 bytes arrive of the 100 announced.
+        let truncated =
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort"
+                .to_string();
+        let (client, requests) = serve(vec![truncated]);
+        let error = client.choose(&request()).unwrap_err();
+        assert_eq!(
+            error,
+            JevError::Http {
+                status: 404,
+                message: "<unreadable body>".to_string(),
+                retry_after: None,
+            }
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn transport_rejects_a_body_over_one_mebibyte() {
+        let huge = response("200 OK", "application/json", &" ".repeat((1 << 20) + 1));
+        let (client, requests) = serve(vec![huge]);
+        let error = client.choose(&request()).unwrap_err();
+        assert!(matches!(error, JevError::Request(_)), "{error:?}");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
     }
 
     #[test]

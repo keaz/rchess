@@ -86,7 +86,13 @@ impl EngineConfig {
             config.model = model;
         }
         if let Some(url) = non_empty("JEV_BASE_URL") {
-            config.base_url = url.trim_end_matches('/').to_string();
+            if url.starts_with("http://") || url.starts_with("https://") {
+                config.base_url = url.trim_end_matches('/').to_string();
+            } else {
+                config.warnings.push(format!(
+                    "JEV_BASE_URL={url} is not an http(s) URL; using {DEFAULT_BASE_URL}"
+                ));
+            }
         }
         if let Some(raw) = non_empty("JEV_MAX_OPTIONS") {
             match raw.parse::<usize>() {
@@ -174,6 +180,23 @@ mod tests {
         ]);
         assert_eq!(c.model, "jev-1.13.0");
         assert_eq!(c.base_url, "http://localhost:8080");
+    }
+
+    #[test]
+    fn base_url_must_be_http() {
+        for raw in ["api.typesafe.ai", "ftp://example.com", "localhost:8080"] {
+            let c = config(&[("JEV_BASE_URL", raw)]);
+            assert_eq!(c.base_url, "https://api.typesafe.ai", "{raw}");
+            assert_eq!(
+                c.warnings,
+                vec![format!(
+                    "JEV_BASE_URL={raw} is not an http(s) URL; using https://api.typesafe.ai"
+                )]
+            );
+        }
+        let c = config(&[("JEV_BASE_URL", "https://example.com/")]);
+        assert_eq!(c.base_url, "https://example.com");
+        assert!(c.warnings.is_empty());
     }
 
     #[test]
