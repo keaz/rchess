@@ -44,11 +44,15 @@ src/
     mv.rs           Move(u16) packing; UCI and SAN parse/format
     game.rs         Game: history stack, undo, outcome detection, PGN export
     perft.rs        perft for correctness tests and benchmarks
-  engine/           sub-project 2
-    search.rs       alpha-beta (depth 3) + quiescence, material + piece-square eval
-    annotate.rs     converts per-move search facts into plain-language tags
-    jev.rs          Jev HTTP client, request building, answer parsing, retries
-    player.rs       ComputerPlayer: annotate, shortlist, ask Jev, veto, fallback
+  engine/           sub-project 2 (see section 5.2 for the full layout)
+    eval.rs         material + piece-square evaluation, game phase
+    search.rs       negamax alpha-beta (depth 3) + quiescence, mate and draw scores
+    see.rs          static exchange evaluation
+    annotate.rs     converts per-move facts into plain-language effects and a bucket
+    describe.rs     position-to-words state for Jev
+    jev.rs          Jev request/response types, HTTP client, retry policy
+    config.rs       EngineConfig from environment variables
+    player.rs       ComputerPlayer: forced moves, shortlist, ask Jev, veto, fallback
   tui/              sub-project 3
     app.rs          App state machine (Menu, Playing, GameOver, dialogs)
     board_widget.rs board rendering, highlights, flip
@@ -65,7 +69,7 @@ dependencies (except `thiserror`), no I/O, and no trait objects.
 | Purpose | Crate |
 | --- | --- |
 | TUI | `ratatui`, `crossterm` |
-| HTTP (sync, used on a worker thread) | `ureq` with JSON feature |
+| HTTP (sync, used on a worker thread) | `ureq` 3.x with the `json` feature |
 | JSON | `serde`, `serde_json` |
 | Errors | `thiserror` |
 | Tests | `proptest`, `insta` |
@@ -119,95 +123,237 @@ Removed: `drawille`, `mockall`, the invalid `[env]` manifest key.
 
 ## 5. Sub-project 2 — `engine` (Jev computer player)
 
+Revised 2026-09-26 after `core` was built: the design below re-validates the original section
+against the `core` API as merged and the current TypeSafe docs, and adds an evaluation harness.
+
 ### 5.1 Jev facts relied on
 
 - Endpoint `POST https://api.typesafe.ai/v1/systemone`, header `Authorization: Bearer <key>`,
-  model alias `jev-latest`.
-- `choice` question: up to 255 options, response includes `choice`, `probabilities` per option
-  and `confidence`.
-- Errors: 401 (bad key), 422 (validation), 429 (rate limit), 529 (overloaded). Retry 429 and
-  529 with exponential backoff.
-- Documented weaknesses (jev-1.13): arithmetic, counting, multi-hop reasoning, large state full
-  of irrelevant detail. Therefore code owns legality, tactics and numbers; Jev gets
-  plain-language facts and makes the judgment.
+  model alias `jev-latest` (currently `jev-1.13.0`; the response's `model` field names the version
+  that answered).
+- `choice` question: up to 255 options; `instructions` and each criterion may be a string or a JSON
+  object. The answer carries `choice`, `probabilities` per option, `confidence`, and `usage`
+  (input tokens).
+- Limits: 64k tokens per request (32k for `state` plus the longest question); rate limits are
+  dynamic (about 1,200 requests per minute today).
+- Errors: 401 (bad key), 422 (validation), 429 (rate limit), 529 (overloaded). Retry 429 and 529
+  with exponential backoff, honouring `retry-after` when present.
+- Documented weaknesses (jev-1.13): arithmetic, counting, multi-hop reasoning (indirection), large
+  state full of irrelevant detail. Therefore code owns legality, tactics and numbers; Jev gets
+  plain-language facts written from our side's point of view and makes the judgment.
 
-### 5.2 Turn flow
+### 5.2 Module layout and public API
 
-1. `core` produces all legal moves.
-2. `search.rs` scores every root move with alpha-beta depth 3 plus quiescence (material +
-   piece-square tables) and computes static exchange evaluation for captures.
-3. `annotate.rs` converts results into words per move, for example "captures undefended
-   knight", "gives check", "checkmates", "loses the queen for a pawn", "castles kingside",
-   "promotes to queen", "leaves bishop on e5 attacked and undefended", "equal trade", plus a
-   bucket: `winning`, `good`, `neutral`, `bad`, `losing`.
-4. Shortlist: when `JEV_FILTER_LOSING` is true, drop `losing` moves if any non-losing move
-   exists. Then keep the top `JEV_MAX_OPTIONS` moves by search score. If every move is
-   `losing`, send all of them (still capped).
-5. Send one Jev `choice` question (shape in 5.3).
-6. Veto: if Jev's chosen move scores more than 150 centipawns below the search best move, play
-   the highest-probability option within that threshold instead, and record the veto.
-7. Forced shortcuts, no API call: exactly one legal move; a mate-in-1 exists.
+```
+src/engine/
+  mod.rs        re-exports
+  eval.rs       static evaluation: material + piece-square tables (centipawns), game phase
+  search.rs     negamax alpha-beta, depth 3 + quiescence; mate scores; draws via game history
+  see.rs        static exchange evaluation for captures and hanging pieces
+  annotate.rs   per-move facts to plain words + bucket
+  describe.rs   position-to-words state for Jev (pieces, material, phase, threats, recent moves)
+  jev.rs        serde request/response types, JevClient (ureq 3), retry policy
+  config.rs     EngineConfig::from_env / from_vars
+  player.rs     ComputerPlayer: forced shortcuts, shortlist, ask Jev, veto, fallback
+examples/jev_eval.rs   evaluation harness (section 5.8)
+```
 
-### 5.3 Request shape
+```rust
+pub struct EngineConfig {
+    // api_key, model, base_url, max_options, filter_losing, timeout, veto_margin_cp, warnings
+}
+impl EngineConfig {
+    pub fn from_env() -> EngineConfig;                                  // never fails
+    pub fn from_vars(get: impl Fn(&str) -> Option<String>) -> EngineConfig;
+}
+
+pub trait MoveChooser: Send + Sync {
+    fn choose(&self, request: &ChoiceRequest) -> Result<ChoiceAnswer, JevError>;
+}
+pub struct JevClient { /* private; Debug hides the key */ }            // impl MoveChooser
+
+pub struct ComputerPlayer<C: MoveChooser> { /* private */ }
+impl<C: MoveChooser> ComputerPlayer<C> {
+    pub fn new(chooser: Option<C>, config: EngineConfig) -> Self;
+    pub fn choose_move(&self, game: &Game) -> Option<ComputerMove>;    // None only when game over
+}
+
+pub struct ComputerMove {
+    pub mv: Move,
+    pub san: String,
+    pub source: MoveSource,
+    pub top: Vec<(String, f32)>,       // up to 3 Jev options with probabilities, best first
+    pub confidence: Option<f32>,
+    pub model: Option<String>,         // versioned model ID that answered
+    pub latency: Duration,             // whole choose_move call
+    pub input_tokens: Option<u32>,
+    pub note: Option<String>,          // why a fallback or veto happened
+}
+pub enum MoveSource { Jev, OnlyMove, MateInOne, Vetoed { jev_pick: String }, Fallback }
+```
+
+Rules:
+- `engine` depends on `core` only; `core` never depends on `engine`.
+- The player never returns an error: every failure degrades to `Fallback` with a `note`.
+- Generics rather than trait objects, and all public types are `Send`, so the TUI worker thread can
+  own a `ComputerPlayer<JevClient>`.
+- The API key is read once, never logged, and never printed (`JevClient`'s `Debug` hides it).
+
+### 5.3 Evaluation, search and SEE
+
+- **Eval** (centipawns, from the side to move): material P 100, N 320, B 330, R 500, Q 900 plus
+  Tomasz Michniewski's "Simplified Evaluation Function" piece-square tables. The king uses the
+  endgame table when both sides lack queens, or when every side that has a queen has no rook and at
+  most one minor piece.
+- **Search**: every root move is searched with a full window (so each gets an exact score), then two
+  more plies (depth 3 in total), then quiescence. Quiescence uses stand-pat plus captures and queen
+  promotions in MVV-LVA order; when in check it searches all evasions and never stands pat; it is
+  capped at 8 plies. Move ordering: captures by MVV-LVA, then promotions, then quiet moves.
+- **Scores**: mate = ±(30000 − ply); stalemate = 0; draw = 0 for a repetition of any position hash in
+  the game history since the last irreversible move or on the current search path, for the fifty-move
+  rule, and for insufficient material.
+- **Budget**: scoring all root moves of Kiwipete takes under 250 ms in release mode.
+- **SEE**: swap-off algorithm using `Position::attackers_to` with x-rays revealed by removing
+  attackers from the occupancy; king value treated as effectively infinite.
+
+### 5.4 Annotation and buckets
+
+Per root move, `annotate.rs` produces plain words (joined with "; ") from facts code computes:
+
+- castles kingside / castles queenside
+- captures the <piece> on <square> — plus exactly one of "undefended", "equal trade", "loses
+  material in the exchange" (from SEE)
+- captures en passant
+- promotes to a <piece>
+- gives check / delivers checkmate
+- attacks the <piece> on <square> — the most valuable enemy piece the moved piece newly attacks,
+  when it is worth more than the mover or undefended
+- moves the attacked <piece> to safety — the moved piece was losing material by SEE before and is
+  not after
+- leaves the <piece> on <square> undefended against capture — our most valuable piece that the
+  opponent can win by SEE after the move
+- allows checkmate — search shows we are mated
+
+Bucket from `d = best_score − move_score` (mate scores included):
+
+| Bucket | Rule |
+| --- | --- |
+| `winning` | move score ≥ +300 or a mate for us, and d ≤ 50 |
+| `good` | d ≤ 50 |
+| `neutral` | 50 < d ≤ 150 |
+| `bad` | 150 < d ≤ 300 |
+| `losing` | d > 300, or the move allows checkmate |
+
+Numbers never reach Jev; only the words and the bucket do.
+
+### 5.5 Request shape
+
+State is written from our side's point of view:
 
 ```json
 {
   "model": "jev-latest",
   "state": {
     "side_to_move": "Black",
+    "move_number": 12,
     "phase": "middlegame",
-    "material": "White up one pawn",
-    "white_pieces": "King g1, Queen d1, Rook a1, ...",
-    "black_pieces": "King g8, ...",
-    "last_move": "White played Nf3xe5, capturing a pawn",
-    "threats_against_us": "Our queen on d8 is attacked by the bishop on b5"
+    "material": "White is ahead by a pawn",
+    "in_check": "no",
+    "our_pieces": "King g8, Queen d8, Rooks a8 and f8, Bishop d6, Knight f6, Pawns a7 b7 c7 f7 g7 h7",
+    "their_pieces": "King g1, Queen h5, ...",
+    "recent_moves": "11. Nxe5 Bd6 12. Qh5",
+    "threats_against_us": ["Our knight on f6 is attacked by the queen on h5"]
   },
   "questions": {
     "move": {
       "type": "choice",
-      "instructions": "You play `side_to_move`. Pick the strongest chess move. Prefer moves that win material, deliver checkmate, or remove threats against our pieces.",
-      "criteria": { "Nxe5": "captures undefended knight; good", "O-O": "castles kingside; neutral" }
+      "instructions": {
+        "question": "You play `side_to_move`. Which move should we play?",
+        "guidance": "Each option says what the move does and the engine's assessment: winning, good, neutral, bad or losing. Prefer winning and good moves. Among similar moves, prefer ones that remove threats against our pieces and keep our king safe."
+      },
+      "criteria": {
+        "Nxe5": { "effect": "captures the knight on e5, undefended", "assessment": "good" },
+        "O-O": { "effect": "castles kingside", "assessment": "neutral" }
+      }
     }
   }
 }
 ```
 
-Option keys are SAN strings, which are unique within a position.
+Option keys are SAN strings (unique within a position since `from_fen` validates en passant).
 
-### 5.4 Client and configuration
+State fields, all computed by `describe.rs`:
+- `move_number`: the fullmove number.
+- `phase`: `endgame` by the eval's endgame rule; otherwise `opening` while the fullmove number is at
+  most 10; otherwise `middlegame`.
+- `material`: material-only difference `diff` in centipawns; "material is equal" when
+  `|diff| < 50`, else "<Colour> is ahead by about N pawns of material" with `N = round(|diff| / 100)`
+  (singular "pawn" when N is 1).
+- `our_pieces` / `their_pieces`: King, Queen, Rooks, Bishops, Knights, Pawns in that order, each with
+  its squares in a1..h8 order ("Rooks a8 and f8", "Pawns a7 b7 c7").
+- `recent_moves`: the last six plies in SAN with move numbers; empty string at the start.
+- `threats_against_us`: each of our pieces the opponent can win by SEE, most valuable first, at most
+  three, phrased "Our <piece> on <square> is attacked by the <piece> on <square>" (naming the least
+  valuable attacker).
 
-- `trait MoveChooser { fn choose(&self, req: &ChoiceRequest) -> Result<ChoiceAnswer, JevError>; }`
-  with `JevClient` (over `ureq`) as the real implementation and a mock in tests.
-- Environment variables:
+### 5.6 Player flow
+
+`ComputerPlayer::choose_move(&Game)`:
+1. Game over: return `None`.
+2. Exactly one legal move: `OnlyMove`, no API call.
+3. Search all root moves. If a mate in one exists: `MateInOne`, no API call.
+4. No chooser (no key): `Fallback` with note "JEV_API_KEY not set — local search".
+5. Annotate. Shortlist: when `filter_losing` is on and a non-losing move exists, drop `losing`
+   moves; sort by score, best first; keep the first `max_options` (clamped to 1..=255, which also
+   covers positions with more than 255 legal moves). The search best move always survives.
+6. Ask Jev. On error: `Fallback` with a note naming the cause (HTTP status, timeout, overloaded,
+   invalid response).
+7. If the chosen key is not in the shortlist: `Fallback` with a note.
+8. Veto: if `best_score − score(pick) > veto_margin_cp` (150), play the highest-probability option
+   within the margin (the search best always qualifies) as `Vetoed { jev_pick }`. Otherwise `Jev`.
+
+`top` holds the three highest-probability options; `latency` covers the whole call.
+
+### 5.7 Client, retries and configuration
+
+- `JevClient` posts with `ureq` 3.x. Request/response types are plain `serde` structs, so they can be
+  tested without a network.
+- Retries: at most 3 attempts. Retry 429, 5xx (including 529) and transport errors; backoff 250 ms
+  then 500 ms, or the `retry-after` value when present, capped at 2 s. No retry on other 4xx.
+  Timeout 5 s per attempt.
+- Environment variables (read by `from_env`, parsed by `from_vars`); an invalid value falls back to
+  the default and adds a line to `config.warnings` for the TUI to show:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `JEV_API_KEY` | none | Required for Jev play. Absent means local-search fallback. |
-| `JEV_MODEL` | `jev-latest` | Model alias. |
+| `JEV_API_KEY` (fallback `TYPESAFE_API_KEY`) | none | Required for Jev play. Absent or empty means local-search fallback. |
+| `JEV_MODEL` | `jev-latest` | Model alias or versioned ID. |
 | `JEV_BASE_URL` | `https://api.typesafe.ai` | Override for testing. |
 | `JEV_MAX_OPTIONS` | `40` | Shortlist cap, clamped to 1..=255. |
-| `JEV_FILTER_LOSING` | `true` | Drop `losing` moves when alternatives exist. |
+| `JEV_FILTER_LOSING` | `true` | Drop `losing` moves when alternatives exist (`true/false/1/0/yes/no`). |
 
-- Request timeout 5 seconds. Up to 3 attempts with exponential backoff on 429 / 529 and
-  transport errors. No retry on 401 / 422.
-- The API key is never logged and never rendered in the TUI.
+### 5.8 Verification and evaluation harness
 
-### 5.5 Fallback
+Offline tests (no network):
+- eval colour symmetry; search finds mate in one and mate in two, refuses to hang the queen, scores
+  stalemate, repetition and fifty-move draws as 0;
+- SEE on known exchanges;
+- golden annotations and buckets on fixed FENs; golden state JSON;
+- request JSON and response parsing against the documented examples; the retry decision table;
+  `Debug` for `JevClient` hides the key;
+- config parsing including invalid values and the key fallback;
+- player paths with a mock `MoveChooser`: game over, only move, mate in one, no key, shortlist
+  filter / cap / order, veto, unknown option, error fallback, `top` ordering.
 
-Missing key, network failure, or exhausted retries: play the search best move. The TUI shows
-"Jev unavailable — local search".
+Plus one `#[ignore]` live test against the real API, and an `#[ignore]` release timing test for the
+search budget.
 
-### 5.6 Output
+`examples/jev_eval.rs` (needs a key; exits with a message otherwise) runs 20 fixed positions
+(openings, tactics, endgames, defence) through the real player and prints, per position, Jev's pick,
+the search best, the source, whether a veto happened, latency and tokens; then a summary with
+agreement %, veto %, mean latency and token cost. It is the tool for tuning the guidance text.
 
-`ComputerMove { mv, source: Jev | Forced | Vetoed | Fallback, top3: [(san, probability)], confidence, latency_ms }`.
-
-### 5.7 Verification
-
-- Mock-chooser tests for shortlist filtering and cap, veto, forced shortcuts, fallback paths,
-  SAN key mapping, and env config parsing.
-- Golden annotation tests on fixed FENs (hanging piece, fork, mate-in-1, promotion).
-- One `#[ignore]` live test against the real API.
-- Cost estimate: about 1–2k input tokens per move at $0.042 per million — negligible.
+Cost estimate: about 1–2k input tokens per move at $0.042 per million — negligible.
 
 ## 6. Sub-project 3 — `tui`
 
@@ -270,7 +416,8 @@ Missing key, network failure, or exhausted retries: play the search best move. T
 Sub-projects run sequentially; each is merge-ready before the next starts.
 
 1. `core` — done when the perft suite passes and the benchmark target is met.
-2. `engine` — done when mock tests pass and the ignored live test passes once.
+2. `engine` — done when the offline tests pass, the ignored live test passes once, and the
+   evaluation harness has been run once with its summary recorded in `HANDOFF.md`.
 3. `tui` — done when all three game modes are playable end to end.
 4. Cleanup — delete `src/pieces/`, `src/board.rs`, `src/ai.rs` and the old `Game`; remove
    `drawille`, `mockall` and the `[env]` key; update `CLAUDE.md`; extend CI with

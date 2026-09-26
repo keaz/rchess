@@ -4,10 +4,10 @@ Read this first. Follow the protocol in section 8 of
 `docs/superpowers/specs/2026-09-26-rchess-redesign-design.md`.
 
 ## Current
-Sub-project: engine (not started) | Plan: to be written — docs/superpowers/plans/2026-09-26-engine.md
-Branch: main @ 0a7be39 (feat/core-bitboards and docs/redesign-spec fast-forward merged, then deleted)
-Last completed task: core sub-project merged into main — core DONE
-Next task: write the engine plan with superpowers:writing-plans from spec section 5 (read "Core API caveats" below first)
+Sub-project: engine (design revised, awaiting spec review) | Plan: to be written — docs/superpowers/plans/2026-09-26-engine.md
+Branch: feat/jev-engine (from main @ bd3abbb)
+Last completed task: engine brainstorming — spec section 5 revised and committed
+Next task: user reviews spec section 5; then write the engine plan with superpowers:writing-plans
 State: green (except 3 pre-existing old-code test failures)
 
 ## Verify before continuing
@@ -34,6 +34,7 @@ cargo test --lib core:: && cargo test --test core_properties && cargo test --rel
   panels, undo/flip/new/FEN/PGN).
 - No LLM code exists in the repo; "remove LLM code" means deleting the old greedy `ai.rs`.
 - `JEV_API_KEY` is present in the user's environment.
+- Engine design (spec 5, revised): user chose to add the `examples/jev_eval.rs` evaluation harness.
 - Core plan adds `error.rs`, `zobrist.rs` and `san.rs` beyond the spec's file list (split for focus;
   the public API matches spec section 4.3; `Game::history()` is named `Game::moves()`).
 - Slider magic numbers are hardcoded in the plan (generated offline with a seeded search) and
@@ -47,6 +48,7 @@ cargo test --lib core:: && cargo test --test core_properties && cargo test --rel
 - None.
 
 ## Log (newest first)
+- 2026-09-26 engine brainstorming: spec section 5 revised (history-aware search, structured criteria, key fallback, retry-after, eval harness).
 - 2026-09-26 feat/core-bitboards fast-forward merged into main; merged branches deleted.
 - 2026-09-26 core final-review fix wave: FEN validation (en passant, material budget), MoveList capacity 321, debug legality assert in play, saturating clocks, API polish, fuzz test.
 - 2026-09-26 core sub-project complete; perft suite, property tests and bench green
