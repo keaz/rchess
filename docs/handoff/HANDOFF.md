@@ -6,8 +6,8 @@ Read this first. Follow the protocol in section 8 of
 ## Current
 Sub-project: engine | Plan: docs/superpowers/plans/2026-09-26-engine.md
 Branch: feat/jev-engine
-Last completed task: engine task 5 (position description)
-Next task: engine task 6 (configuration)
+Last completed task: engine task 6 (configuration)
+Next task: engine task 7 (Jev client)
 State: green (except 3 pre-existing old-code test failures)
 
 ## Verify before continuing
@@ -50,6 +50,7 @@ cargo test --lib engine::
 - None.
 
 ## Log (newest first)
+- 2026-09-26 engine task 6 done: configuration
 - 2026-09-26 engine task 5 done: position description
 - 2026-09-26 engine task 4 done: annotation and buckets
 - 2026-09-26 engine task 3 done: search
