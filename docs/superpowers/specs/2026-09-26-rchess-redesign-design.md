@@ -175,8 +175,15 @@ pub struct JevClient { /* private; Debug hides the key */ }            // impl M
 pub struct ComputerPlayer<C: MoveChooser> { /* private */ }
 impl<C: MoveChooser> ComputerPlayer<C> {
     pub fn new(chooser: Option<C>, config: EngineConfig) -> Self;
+    pub fn config(&self) -> &EngineConfig;
     pub fn choose_move(&self, game: &Game) -> Option<ComputerMove>;    // None only when game over
 }
+impl ComputerPlayer<JevClient> {
+    pub fn from_config(config: EngineConfig) -> Self;                  // real client when a key is set
+}
+
+/// Every legal move with its search score, best first (used by the player and the harness).
+pub fn analyse(game: &Game) -> Vec<ScoredMove>;
 
 pub struct ComputerMove {
     pub mv: Move,
@@ -221,8 +228,9 @@ Rules:
 Per root move, `annotate.rs` produces plain words (joined with "; ") from facts code computes:
 
 - castles kingside / castles queenside
-- captures the <piece> on <square> — plus exactly one of "undefended", "equal trade", "loses
-  material in the exchange" (from SEE)
+- captures the <piece> on <square> — plus exactly one of "undefended" (no recapture possible),
+  "wins material in the exchange" (SEE ≥ 50), "equal trade" (−50 < SEE < 50), "loses material in
+  the exchange" (SEE ≤ −50)
 - captures en passant
 - promotes to a <piece>
 - gives check / delivers checkmate
