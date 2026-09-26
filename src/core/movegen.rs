@@ -103,7 +103,7 @@ impl Position {
             push_all(&mut list, from, to, theirs);
         }
 
-        self.pawn_moves(&mut list, target, &pin_ray);
+        self.pawn_moves(&mut list, target, pin_ray);
 
         if checkers.is_empty() {
             self.castles(&mut list);
@@ -129,11 +129,11 @@ impl Position {
         pinned
     }
 
-    fn pawn_moves(
+    fn pawn_moves<F: Fn(Square) -> Bitboard>(
         &self,
         list: &mut MoveList,
         target: Bitboard,
-        pin_ray: &dyn Fn(Square) -> Bitboard,
+        pin_ray: F,
     ) {
         let us = self.side_to_move();
         let theirs = self.occupied_by(!us);

@@ -14,6 +14,7 @@ State: green
 cargo test --lib core:: && cargo test --release --lib core::perft -- --ignored
 
 ## Notes / decisions made during work
+- movegen: pawn_moves takes a generic closure (impl Fn) instead of the plan's &dyn Fn, because the spec forbids trait objects in core.
 - Move generation: own bitboard rewrite (not `shakmaty`, not fixing the old design).
 - Jev role: hybrid — code annotates and shortlists, Jev picks via one `choice` question, code
   vetoes blunders and plays forced moves / mate-in-1 directly.
