@@ -6,8 +6,8 @@ Read this first. Follow the protocol in section 8 of
 ## Current
 Sub-project: core | Plan: docs/superpowers/plans/2026-09-26-core.md
 Branch: feat/core-bitboards
-Last completed task: 5 (legal move generation and perft)
-Next task: 6 (SAN and UCI parsing)
+Last completed task: 6 (SAN and UCI move text)
+Next task: 7 (Game, outcomes, PGN)
 State: green
 
 ## Verify before continuing
@@ -35,6 +35,7 @@ cargo test --lib core:: && cargo test --release --lib core::perft -- --ignored
 - None.
 
 ## Log (newest first)
+- 2026-09-26 core task 6 done: SAN and UCI move text
 - 2026-09-26 core task 5 done: legal move generation and perft
 - 2026-09-26 core task 4 done: position, FEN, hashing, play
 - 2026-09-26 core task 3 done: move type

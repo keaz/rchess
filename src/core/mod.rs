@@ -11,6 +11,7 @@ mod mv;
 mod perft;
 mod piece;
 mod position;
+mod san;
 mod square;
 mod zobrist;
 
