@@ -5,13 +5,13 @@ Read this first. Follow the protocol in section 8 of
 
 ## Current
 Sub-project: engine | Plan: docs/superpowers/plans/2026-09-26-engine.md
-Branch: feat/jev-engine (spec revision + plan committed; no engine code yet)
-Last completed task: engine plan written and verified (every task replayed in a scratch copy: all stages compile and pass)
-Next task: engine task 1 (dependencies, module root and static evaluation)
+Branch: feat/jev-engine
+Last completed task: engine task 1 (dependencies and static evaluation)
+Next task: engine task 2 (static exchange evaluation)
 State: green (except 3 pre-existing old-code test failures)
 
 ## Verify before continuing
-git status && cargo test --lib core:: && ls docs/superpowers/plans
+cargo test --lib engine::
 
 ## Core API caveats (read before building on core)
 - `Position::play` / `to_san` require a move from `self.legal_moves()`; debug builds assert, release builds may corrupt the position; use `Game::play` for unvalidated input.
@@ -50,6 +50,7 @@ git status && cargo test --lib core:: && ls docs/superpowers/plans
 - None.
 
 ## Log (newest first)
+- 2026-09-26 engine task 1 done: dependencies and static evaluation
 - 2026-09-26 engine implementation plan written (9 tasks), verified by replay; prototype harness run: 63% agreement with search, 0 vetoes, 305 ms mean latency.
 - 2026-09-26 engine brainstorming: spec section 5 revised (history-aware search, structured criteria, key fallback, retry-after, eval harness).
 - 2026-09-26 feat/core-bitboards fast-forward merged into main; merged branches deleted.

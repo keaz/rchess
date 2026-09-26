@@ -6,6 +6,7 @@ use pieces::{Color, PieceType};
 pub mod ai;
 pub mod board;
 pub mod core;
+pub mod engine;
 pub mod pieces;
 
 #[derive(Debug)]
