@@ -5,14 +5,13 @@ Read this first. Follow the protocol in section 8 of
 
 ## Current
 Sub-project: core | Plan: docs/superpowers/plans/2026-09-26-core.md
-Branch: docs/redesign-spec (plan committed; implementation branch feat/core-bitboards not yet created)
-Last completed task: core plan written and verified (all plan code replayed in a scratch copy: every task compiles and passes)
-Next task: core Task 0 (branch setup), then Task 1
-State: green for new work (no code changed yet). Note: `cargo test` on `main` is already red —
-3 of 58 tests fail in the old code; this is pre-existing.
+Branch: feat/core-bitboards
+Last completed task: 1 (foundation types)
+Next task: 2 (attack tables)
+State: green
 
 ## Verify before continuing
-git status && ls docs/superpowers/specs docs/superpowers/plans
+cargo test --lib core::
 
 ## Notes / decisions made during work
 - Move generation: own bitboard rewrite (not `shakmaty`, not fixing the old design).
@@ -35,5 +34,6 @@ git status && ls docs/superpowers/specs docs/superpowers/plans
 - None.
 
 ## Log (newest first)
+- 2026-09-26 core task 1 done: foundation types
 - 2026-09-26 core implementation plan written (8 tasks + setup), verified by replay.
 - 2026-09-26 brainstorming complete; spec and handoff file written.
