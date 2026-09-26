@@ -6,12 +6,12 @@ Read this first. Follow the protocol in section 8 of
 ## Current
 Sub-project: engine | Plan: docs/superpowers/plans/2026-09-26-engine.md
 Branch: feat/jev-engine
-Last completed task: engine task 3 (search)
-Next task: engine task 4 (annotation)
+Last completed task: engine task 4 (annotation and buckets)
+Next task: engine task 5 (position description)
 State: green (except 3 pre-existing old-code test failures)
 
 ## Verify before continuing
-cargo test --lib engine:: && cargo test --release --lib engine::search -- --ignored
+cargo test --lib engine::
 
 ## Core API caveats (read before building on core)
 - `Position::play` / `to_san` require a move from `self.legal_moves()`; debug builds assert, release builds may corrupt the position; use `Game::play` for unvalidated input.
@@ -50,6 +50,7 @@ cargo test --lib engine:: && cargo test --release --lib engine::search -- --igno
 - None.
 
 ## Log (newest first)
+- 2026-09-26 engine task 4 done: annotation and buckets
 - 2026-09-26 engine task 3 done: search
 - 2026-09-26 engine task 2 done: static exchange evaluation
 - 2026-09-26 engine task 1 done: dependencies and static evaluation
