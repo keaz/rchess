@@ -6,8 +6,8 @@ Read this first. Follow the protocol in section 8 of
 ## Current
 Sub-project: core | Plan: docs/superpowers/plans/2026-09-26-core.md
 Branch: feat/core-bitboards
-Last completed task: 2 (attack tables)
-Next task: 3 (move type)
+Last completed task: 3 (move type)
+Next task: 4 (position, FEN, Zobrist, play)
 State: green
 
 ## Verify before continuing
@@ -34,6 +34,7 @@ cargo test --lib core::
 - None.
 
 ## Log (newest first)
+- 2026-09-26 core task 3 done: move type
 - 2026-09-26 core task 2 done: attack tables
 - 2026-09-26 core task 1 done: foundation types
 - 2026-09-26 core implementation plan written (8 tasks + setup), verified by replay.

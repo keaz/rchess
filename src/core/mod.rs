@@ -6,6 +6,7 @@
 mod attacks;
 mod bitboard;
 mod error;
+mod mv;
 mod piece;
 mod square;
 
@@ -15,5 +16,6 @@ pub use attacks::{
 };
 pub use bitboard::Bitboard;
 pub use error::ChessError;
+pub use mv::Move;
 pub use piece::{Color, Piece, PieceKind};
 pub use square::Square;
