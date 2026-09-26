@@ -5,13 +5,23 @@ Read this first. Follow the protocol in section 8 of
 
 ## Current
 Sub-project: engine (not started) | Plan: to be written — docs/superpowers/plans/2026-09-26-engine.md
-Branch: feat/core-bitboards (complete, ready for user to merge)
+Branch: feat/core-bitboards (complete, ready for user to merge) @ 9d0550a
 Last completed task: core task 8 (property tests, benchmark, wrap-up) — core sub-project DONE
 Next task: user merges feat/core-bitboards; then write the engine plan with superpowers:writing-plans from spec section 5
 State: green (except 3 pre-existing old-code test failures)
 
 ## Verify before continuing
 cargo test --lib core:: && cargo test --test core_properties && cargo test --release --lib core::perft -- --ignored
+
+## Core API caveats (read before building on core)
+- `Position::play` / `to_san` require a move from `self.legal_moves()`; debug builds assert, release builds may corrupt the position; use `Game::play` for unvalidated input.
+- `Game::undo` first withdraws a pending resignation and returns `None`; check `outcome()` to tell that apart from "nothing to undo".
+- `parse_san` is strict (no `b8Q`, lowercase piece letters, or long algebraic `Ng1f3`) and reports every mismatch as `IllegalMove`; SAN leniency belongs to the TUI input layer.
+- The en passant square (and so the Zobrist hash) is set whenever an enemy pawn attacks it, even when that capture is illegal because of a pin; a threefold repetition involving such a position can be missed. Rare; documented only.
+- `from_fen` rejects positions beyond the promotion material budget; `MoveList` capacity (321) is derived from that budget.
+- `pub mod core` shadows the built-in `core` crate at the crate root: write `::core::` in `src/lib.rs`.
+- CI (`cargo test --verbose`) stops at the 3 known old-code failures, so `core_properties` and the bench are not exercised in CI until the cleanup sub-project (consider `--no-fail-fast`).
+- `CLAUDE.md` still says "3 of 58" failing tests; now 3 of 105 plus property tests. Update in cleanup.
 
 ## Notes / decisions made during work
 - movegen: pawn_moves takes a generic closure (impl Fn) instead of the plan's &dyn Fn, because the spec forbids trait objects in core.
@@ -37,6 +47,7 @@ cargo test --lib core:: && cargo test --test core_properties && cargo test --rel
 - None.
 
 ## Log (newest first)
+- 2026-09-26 core final-review fix wave: FEN validation (en passant, material budget), MoveList capacity 321, debug legality assert in play, saturating clocks, API polish, fuzz test.
 - 2026-09-26 core sub-project complete; perft suite, property tests and bench green
 - 2026-09-26 core task 7 done: Game, outcomes, PGN
 - 2026-09-26 core task 6 done: SAN and UCI move text
