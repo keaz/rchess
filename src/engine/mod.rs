@@ -5,6 +5,7 @@ mod config;
 mod describe;
 mod eval;
 mod jev;
+mod player;
 mod search;
 mod see;
 
@@ -12,4 +13,5 @@ pub use annotate::{Annotation, Bucket};
 pub use config::EngineConfig;
 pub use describe::JevState;
 pub use jev::{ChoiceAnswer, ChoiceOption, ChoiceRequest, JevClient, JevError, MoveChooser};
+pub use player::{ComputerMove, ComputerPlayer, MoveSource};
 pub use search::{MATE, ScoredMove, analyse};
