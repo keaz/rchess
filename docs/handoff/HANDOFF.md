@@ -5,9 +5,9 @@ Read this first. Follow the protocol in section 8 of
 
 ## Current
 Sub-project: engine (not started) | Plan: to be written — docs/superpowers/plans/2026-09-26-engine.md
-Branch: feat/core-bitboards (complete, ready for user to merge) @ 9d0550a
-Last completed task: core task 8 (property tests, benchmark, wrap-up) — core sub-project DONE
-Next task: user merges feat/core-bitboards; then write the engine plan with superpowers:writing-plans from spec section 5
+Branch: main @ 0a7be39 (feat/core-bitboards and docs/redesign-spec fast-forward merged, then deleted)
+Last completed task: core sub-project merged into main — core DONE
+Next task: write the engine plan with superpowers:writing-plans from spec section 5 (read "Core API caveats" below first)
 State: green (except 3 pre-existing old-code test failures)
 
 ## Verify before continuing
@@ -21,7 +21,7 @@ cargo test --lib core:: && cargo test --test core_properties && cargo test --rel
 - `from_fen` rejects positions beyond the promotion material budget; `MoveList` capacity (321) is derived from that budget.
 - `pub mod core` shadows the built-in `core` crate at the crate root: write `::core::` in `src/lib.rs`.
 - CI (`cargo test --verbose`) stops at the 3 known old-code failures, so `core_properties` and the bench are not exercised in CI until the cleanup sub-project (consider `--no-fail-fast`).
-- `CLAUDE.md` still says "3 of 58" failing tests; now 3 of 105 plus property tests. Update in cleanup.
+- `CLAUDE.md` still says "3 of 58" failing tests; now 3 of 109 lib tests plus 2 property tests. Update in cleanup.
 
 ## Notes / decisions made during work
 - movegen: pawn_moves takes a generic closure (impl Fn) instead of the plan's &dyn Fn, because the spec forbids trait objects in core.
@@ -47,6 +47,7 @@ cargo test --lib core:: && cargo test --test core_properties && cargo test --rel
 - None.
 
 ## Log (newest first)
+- 2026-09-26 feat/core-bitboards fast-forward merged into main; merged branches deleted.
 - 2026-09-26 core final-review fix wave: FEN validation (en passant, material budget), MoveList capacity 321, debug legality assert in play, saturating clocks, API polish, fuzz test.
 - 2026-09-26 core sub-project complete; perft suite, property tests and bench green
 - 2026-09-26 core task 7 done: Game, outcomes, PGN
