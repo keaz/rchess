@@ -4,14 +4,14 @@ Read this first. Follow the protocol in section 8 of
 `docs/superpowers/specs/2026-09-26-rchess-redesign-design.md`.
 
 ## Current
-Sub-project: core | Plan: docs/superpowers/plans/2026-09-26-core.md
-Branch: feat/core-bitboards
-Last completed task: 7 (Game, outcomes, PGN)
-Next task: 8 (property tests, benchmark, wrap-up)
-State: green
+Sub-project: engine (not started) | Plan: to be written — docs/superpowers/plans/2026-09-26-engine.md
+Branch: feat/core-bitboards (complete, ready for user to merge)
+Last completed task: core task 8 (property tests, benchmark, wrap-up) — core sub-project DONE
+Next task: user merges feat/core-bitboards; then write the engine plan with superpowers:writing-plans from spec section 5
+State: green (except 3 pre-existing old-code test failures)
 
 ## Verify before continuing
-cargo test --lib core::
+cargo test --lib core:: && cargo test --test core_properties && cargo test --release --lib core::perft -- --ignored
 
 ## Notes / decisions made during work
 - movegen: pawn_moves takes a generic closure (impl Fn) instead of the plan's &dyn Fn, because the spec forbids trait objects in core.
@@ -31,11 +31,13 @@ cargo test --lib core::
 - Reference performance from the prototype: full published perft suite (~594M leaf nodes)
   in 1.6 s release; criterion `startpos depth 5` about 15 ms.
 - Game::undo withdraws a pending resignation first (returns None, keeps moves); a second undo takes back the move. Deviation from the plan's code, by controller ruling.
+- Benchmark results (criterion, 10 samples): startpos depth 5 [14.654 ms 14.811 ms 15.283 ms], kiwipete depth 4 [9.9514 ms 9.9703 ms 9.9899 ms].
 
 ## Open questions for user
 - None.
 
 ## Log (newest first)
+- 2026-09-26 core sub-project complete; perft suite, property tests and bench green
 - 2026-09-26 core task 7 done: Game, outcomes, PGN
 - 2026-09-26 core task 6 done: SAN and UCI move text
 - 2026-09-26 core task 5 done: legal move generation and perft
