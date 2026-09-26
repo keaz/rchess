@@ -307,6 +307,17 @@ mod tests {
     }
 
     #[test]
+    fn mate_in_one_on_the_hundredth_halfmove_skips_jev() {
+        let p = player(MockChooser::answering("x", vec![]));
+        let result = p
+            .choose_move(&game("6k1/5ppp/8/8/8/8/5PPP/4R1K1 w - - 99 80"))
+            .unwrap();
+        assert_eq!(result.san, "Re8#");
+        assert_eq!(result.source, MoveSource::MateInOne);
+        assert!(p.chooser.as_ref().unwrap().requests().is_empty());
+    }
+
+    #[test]
     fn no_key_falls_back_to_search() {
         let p: ComputerPlayer<MockChooser> = ComputerPlayer::new(None, EngineConfig::default());
         let result = p.choose_move(&Game::new()).unwrap();

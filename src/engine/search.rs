@@ -61,16 +61,17 @@ struct Searcher {
 }
 
 impl Searcher {
-    fn is_draw(&self, pos: &Position) -> bool {
+    /// Draws that hold whatever the legal moves are: a repeated position or
+    /// insufficient material. The fifty-move rule is checked separately, after
+    /// mate and stalemate, because a checkmate on the hundredth half-move wins
+    /// (the same precedence as `Game::outcome`).
+    fn is_forced_draw(&self, pos: &Position) -> bool {
         let hash = pos.hash();
-        pos.halfmove_clock() >= 100
-            || pos.is_insufficient_material()
-            || self.history.contains(&hash)
-            || self.path.contains(&hash)
+        pos.is_insufficient_material() || self.history.contains(&hash) || self.path.contains(&hash)
     }
 
     fn negamax(&mut self, pos: &Position, depth: u32, ply: i32, mut alpha: i32, beta: i32) -> i32 {
-        if self.is_draw(pos) {
+        if self.is_forced_draw(pos) {
             return 0;
         }
         if depth == 0 {
@@ -79,6 +80,9 @@ impl Searcher {
         let mut moves = pos.legal_moves();
         if moves.is_empty() {
             return if pos.is_check() { -(MATE - ply) } else { 0 };
+        }
+        if pos.halfmove_clock() >= 100 {
+            return 0;
         }
         moves.sort_unstable_by_key(|&mv| -order_key(pos, mv));
         self.path.push(pos.hash());
@@ -98,13 +102,16 @@ impl Searcher {
     /// Resolves captures (and all evasions when in check) so the static
     /// evaluation is only trusted in quiet positions.
     fn quiesce(&mut self, pos: &Position, ply: i32, mut alpha: i32, beta: i32, qply: u32) -> i32 {
-        if self.is_draw(pos) {
+        if self.is_forced_draw(pos) {
             return 0;
         }
         let in_check = pos.is_check();
         let mut moves = pos.legal_moves();
         if moves.is_empty() {
             return if in_check { -(MATE - ply) } else { 0 };
+        }
+        if pos.halfmove_clock() >= 100 {
+            return 0;
         }
         if qply >= QUIESCENCE_PLIES {
             return evaluate(pos);
@@ -212,6 +219,22 @@ mod tests {
         let scored = analyse_fen("4k3/8/8/8/8/8/8/Q3K3 w - - 99 80");
         assert!(!scored.is_empty());
         assert!(scored.iter().all(|s| s.score == 0), "{scored:?}");
+    }
+
+    #[test]
+    fn mate_on_the_hundredth_halfmove_is_mate() {
+        // Re8# makes the clock 100; checkmate outranks the fifty-move rule.
+        let scored = analyse_fen("6k1/5ppp/8/8/8/8/5PPP/4R1K1 w - - 99 80");
+        assert_eq!(scored[0].mv.to_uci(), "e1e8");
+        assert_eq!(scored[0].score, MATE - 1);
+    }
+
+    #[test]
+    fn quiet_mate_on_the_hundredth_halfmove_is_mate() {
+        // Qg7# is a quiet move that makes the clock 100.
+        let scored = analyse_fen("7k/8/5K2/8/8/8/8/6Q1 w - - 99 80");
+        assert_eq!(scored[0].mv.to_uci(), "g1g7");
+        assert_eq!(scored[0].score, MATE - 1);
     }
 
     #[test]
