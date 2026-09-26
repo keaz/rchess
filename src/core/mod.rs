@@ -6,6 +6,7 @@
 mod attacks;
 mod bitboard;
 mod error;
+mod game;
 mod movegen;
 mod mv;
 mod perft;
@@ -21,6 +22,7 @@ pub use attacks::{
 };
 pub use bitboard::Bitboard;
 pub use error::ChessError;
+pub use game::{Game, Outcome};
 pub use movegen::MoveList;
 pub use mv::Move;
 pub use perft::perft;
