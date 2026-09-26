@@ -153,6 +153,10 @@ mod tests {
         assert_eq!(san_of("7k/8/8/8/8/8/8/1N1K1N2 w - - 0 1", "b1d2"), "Nbd2");
         // Rooks on a1 and a5 can both reach a3: rank digit disambiguates.
         assert_eq!(san_of("7k/8/8/R7/8/8/8/R3K3 w - - 0 1", "a1a3"), "R1a3");
+        // Queens on a1, a3 and c1 all reach b2: a1 needs both file and rank.
+        assert_eq!(san_of("8/7k/8/8/8/Q7/8/Q1Q1K3 w - - 0 1", "a1b2"), "Qa1b2");
+        assert_eq!(san_of("8/7k/8/8/8/Q7/8/Q1Q1K3 w - - 0 1", "a3b2"), "Q3b2");
+        assert_eq!(san_of("8/7k/8/8/8/Q7/8/Q1Q1K3 w - - 0 1", "c1b2"), "Qcb2");
     }
 
     #[test]

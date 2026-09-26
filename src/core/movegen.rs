@@ -13,18 +13,29 @@ use super::{
     position::CastleRights,
 };
 
-/// Fixed-capacity move buffer. 256 exceeds the known maximum of 218 legal
-/// moves in any position, and nothing is heap-allocated.
+/// 218 is the published maximum number of legal moves in any *reachable*
+/// position (see `known_maximum_of_218_moves_fits` below). `CAPACITY` is
+/// larger: it is the proven bound for every position `Position::from_fen`
+/// accepts and every position reached from one by `Position::play`, since
+/// promotions and captures never increase the promotion-material budget sum
+/// (see `Position::validate`).
+///
+/// Derivation: 1 queen 27 + 2 rooks 28 + 2 bishops 26 + 2 knights 16 + 8
+/// budget units x 27 (extra queens outmove pawns, which have at most 12)
+/// + king 8 = 321.
+const CAPACITY: usize = 321;
+
+/// Fixed-capacity move buffer; nothing is heap-allocated.
 #[derive(Clone)]
 pub struct MoveList {
-    moves: [Move; 256],
+    moves: [Move; CAPACITY],
     len: usize,
 }
 
 impl MoveList {
     fn new() -> MoveList {
         MoveList {
-            moves: [Move::NULL; 256],
+            moves: [Move::NULL; CAPACITY],
             len: 0,
         }
     }
@@ -309,6 +320,14 @@ mod tests {
         for promo in ["a7a8q", "a7a8r", "a7a8b", "a7a8n"] {
             assert!(moves.contains(&promo.to_string()));
         }
+    }
+
+    #[test]
+    fn known_maximum_of_218_moves_fits() {
+        // The published maximum for a reachable position.
+        let pos =
+            Position::from_fen("R6R/3Q4/1Q4Q1/4Q3/2Q4Q/Q4Q2/pp1Q4/kBNN1KB1 w - - 0 1").unwrap();
+        assert_eq!(pos.legal_moves().len(), 218);
     }
 
     #[test]

@@ -203,7 +203,7 @@ impl Position {
         if let Some(ep) = self.ep.take() {
             self.hash ^= KEYS.ep_file[ep.file() as usize];
         }
-        self.halfmove += 1;
+        self.halfmove = self.halfmove.saturating_add(1);
 
         if mv.is_en_passant() {
             let captured = Square::from_file_rank(to.file(), from.rank()).expect("on board");
@@ -248,7 +248,7 @@ impl Position {
         }
 
         if us == Color::Black {
-            self.fullmove += 1;
+            self.fullmove = self.fullmove.saturating_add(1);
         }
         self.side = them;
         self.hash ^= KEYS.side;
@@ -351,6 +351,21 @@ impl Position {
             if ep.rank() != expected_rank {
                 return Err(err("en passant square on wrong rank"));
             }
+            // The ep field must be the midpoint of an actual double pawn push: the
+            // square itself and the square the pawn came from must be empty, and
+            // the pawn that just moved must be sitting where it landed. `offset`
+            // is safe here: after the rank check `ep` is on rank 6 with White to
+            // move or rank 3 with Black to move.
+            let push: i8 = if pos.side == Color::White { 8 } else { -8 };
+            let occupied = pos.occupied();
+            if occupied.contains(ep)
+                || occupied.contains(ep.offset(push))
+                || !pos
+                    .pieces_of(!pos.side, PieceKind::Pawn)
+                    .contains(ep.offset(-push))
+            {
+                return Err(err("en passant square does not follow a double pawn push"));
+            }
             // Normalize: keep it only when the side to move has a pawn that could capture.
             if (pawn_attacks(!pos.side, ep) & pos.pieces_of(pos.side, PieceKind::Pawn)).any() {
                 pos.ep = Some(ep);
@@ -377,6 +392,24 @@ impl Position {
         }
         if (self.pieces(PieceKind::Pawn) & (Bitboard::RANK_1 | Bitboard::RANK_8)).any() {
             return Err("pawn on first or last rank");
+        }
+        // Promotion budget: pawns can promote but a side can never end up with more
+        // total material than it started with, so each piece beyond the starting
+        // count of 1 queen / 2 rooks / 2 bishops / 2 knights must have cost a pawn.
+        // This also caps each side at 8 pawns + 8 budget units = 16 pieces.
+        for color in Color::ALL {
+            let pawns = self.pieces_of(color, PieceKind::Pawn).count();
+            let queens = self.pieces_of(color, PieceKind::Queen).count();
+            let rooks = self.pieces_of(color, PieceKind::Rook).count();
+            let bishops = self.pieces_of(color, PieceKind::Bishop).count();
+            let knights = self.pieces_of(color, PieceKind::Knight).count();
+            let extra = queens.saturating_sub(1)
+                + rooks.saturating_sub(2)
+                + bishops.saturating_sub(2)
+                + knights.saturating_sub(2);
+            if pawns > 8 || pawns + extra > 8 {
+                return Err("too much material for one side");
+            }
         }
         let rights = [
             (CastleRights::WHITE_KING, Color::White, Square::H1),
@@ -514,16 +547,34 @@ mod tests {
     fn fen_rejects_bad_input() {
         for fen in [
             "",
-            "8/8/8/8/8/8/8/8 w - - 0 1",      // no kings
-            "4k3/8/8/8/8/8/8/4K3 x - - 0 1",  // bad side
-            "4k3/8/8/8/8/8/8/4K2 w - - 0 1",  // short rank
-            "4k3/8/8/8/8/8/8/4K4 w - - 0 1",  // long rank
-            "4k3/8/8/8/8/8/8/4K3 w K - 0 1",  // castling right without rook
-            "4k3/8/8/8/8/8/8/P3K3 w - - 0 1", // pawn on rank 1
-            "4k3/8/8/8/8/8/8/4RK2 w - - 0 1", // Black in check with White to move
+            "8/8/8/8/8/8/8/8 w - - 0 1",           // no kings
+            "4k3/8/8/8/8/8/8/4K3 x - - 0 1",       // bad side
+            "4k3/8/8/8/8/8/8/4K2 w - - 0 1",       // short rank
+            "4k3/8/8/8/8/8/8/4K4 w - - 0 1",       // long rank
+            "4k3/8/8/8/8/8/8/4K3 w K - 0 1",       // castling right without rook
+            "4k3/8/8/8/8/8/8/P3K3 w - - 0 1",      // pawn on rank 1
+            "4k3/8/8/8/8/8/8/4RK2 w - - 0 1",      // Black in check with White to move
+            "4k3/8/8/8/8/8/8/4K2X w - - 0 1",      // bad piece letter
+            "4k3/8/8/8/8/8/8/4K3 w - e3 0 1",      // en passant square on the wrong rank
+            "4k3/8/8/4P3/8/8/8/4K3 w - f6 0 1",    // no black pawn on f5 to have double-pushed
+            "4k3/8/8/4PK2/8/8/8/8 w - f6 0 1",     // f5 holds the white king, not a black pawn
+            "4k3/8/5n2/4Pp2/8/8/8/4K3 w - f6 0 1", // f6 (the ep square) is occupied by a knight
+            "4k3/5p2/8/4Pp2/8/8/8/4K3 w - f6 0 1", // origin square f7 is occupied
+            "QQQQQQbk/Q6p/Q6Q/Q6Q/Q6Q/Q6Q/Q6Q/KQQQQQQQ w - - 0 1", // too many queens (261 pseudo-legal moves)
+            "4k3/pppppppp/p7/8/8/8/8/4K3 b - - 0 1",               // nine black pawns
         ] {
             assert!(Position::from_fen(fen).is_err(), "{fen}");
         }
+    }
+
+    #[test]
+    fn clocks_saturate_instead_of_overflowing() {
+        // Both clocks are already at u16::MAX; a plain `+= 1` would panic in debug builds.
+        let pos = Position::from_fen("4k3/8/8/8/8/8/8/R3K3 b - - 65535 65535").unwrap();
+        let mv = pos.parse_uci("e8d8").unwrap();
+        let next = pos.play(mv);
+        assert_eq!(next.halfmove_clock(), 65535);
+        assert_eq!(next.fullmove_number(), 65535);
     }
 
     #[test]
