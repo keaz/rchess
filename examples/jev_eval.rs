@@ -83,11 +83,12 @@ fn main() {
     let player = ComputerPlayer::from_config(config);
 
     println!(
-        "{:<24} {:<8} {:<8} {:<10} {:>7} {:>7}",
-        "position", "played", "search", "source", "ms", "tokens"
+        "{:<24} {:<8} {:<8} {:<8} {:<10} {:>7} {:>7}",
+        "position", "played", "jev pick", "search", "source", "ms", "tokens"
     );
     let (mut answered, mut agreed, mut vetoes, mut fallbacks) = (0, 0, 0, 0);
-    let mut total_latency = Duration::ZERO;
+    // Latency of the positions Jev answered; forced moves and fallbacks are left out.
+    let mut answered_latency = Duration::ZERO;
     let mut total_tokens: u64 = 0;
     for (name, game) in &games {
         let search_best = analyse(game)
@@ -107,6 +108,7 @@ fn main() {
         };
         if let Some(pick) = &jev_pick {
             answered += 1;
+            answered_latency += result.latency;
             if *pick == search_best {
                 agreed += 1;
             }
@@ -117,13 +119,13 @@ fn main() {
         if result.source == MoveSource::Fallback {
             fallbacks += 1;
         }
-        total_latency += result.latency;
         total_tokens += u64::from(result.input_tokens.unwrap_or(0));
         let tokens = result
             .input_tokens
             .map_or("-".to_string(), |t| t.to_string());
+        let pick = jev_pick.as_deref().unwrap_or("-");
         println!(
-            "{name:<24} {:<8} {search_best:<8} {source:<10} {:>7} {tokens:>7}",
+            "{name:<24} {:<8} {pick:<8} {search_best:<8} {source:<10} {:>7} {tokens:>7}",
             result.san,
             result.latency.as_millis()
         );
@@ -149,10 +151,12 @@ fn main() {
         "vetoes: {vetoes} ({:.0}% of answers); fallbacks: {fallbacks}",
         percent(vetoes, answered)
     );
-    println!(
-        "mean latency: {} ms",
-        total_latency.as_millis() / games.len() as u128
-    );
+    let mean_latency = if answered == 0 {
+        "n/a".to_string()
+    } else {
+        format!("{} ms", answered_latency.as_millis() / answered as u128)
+    };
+    println!("mean latency of Jev answers: {mean_latency}");
     println!(
         "input tokens: {total_tokens} (about ${:.6})",
         total_tokens as f64 * DOLLARS_PER_MILLION_TOKENS / 1_000_000.0
