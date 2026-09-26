@@ -6,7 +6,9 @@
 mod attacks;
 mod bitboard;
 mod error;
+mod movegen;
 mod mv;
+mod perft;
 mod piece;
 mod position;
 mod square;
@@ -18,7 +20,9 @@ pub use attacks::{
 };
 pub use bitboard::Bitboard;
 pub use error::ChessError;
+pub use movegen::MoveList;
 pub use mv::Move;
+pub use perft::perft;
 pub use piece::{Color, Piece, PieceKind};
 pub use position::{CastleRights, Position, START_FEN};
 pub use square::Square;

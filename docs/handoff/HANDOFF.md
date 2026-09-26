@@ -6,12 +6,12 @@ Read this first. Follow the protocol in section 8 of
 ## Current
 Sub-project: core | Plan: docs/superpowers/plans/2026-09-26-core.md
 Branch: feat/core-bitboards
-Last completed task: 4 (position, FEN, hashing, play)
-Next task: 5 (legal move generation + perft)
+Last completed task: 5 (legal move generation and perft)
+Next task: 6 (SAN and UCI parsing)
 State: green
 
 ## Verify before continuing
-cargo test --lib core::
+cargo test --lib core:: && cargo test --release --lib core::perft -- --ignored
 
 ## Notes / decisions made during work
 - Move generation: own bitboard rewrite (not `shakmaty`, not fixing the old design).
@@ -34,6 +34,7 @@ cargo test --lib core::
 - None.
 
 ## Log (newest first)
+- 2026-09-26 core task 5 done: legal move generation and perft
 - 2026-09-26 core task 4 done: position, FEN, hashing, play
 - 2026-09-26 core task 3 done: move type
 - 2026-09-26 core task 2 done: attack tables
