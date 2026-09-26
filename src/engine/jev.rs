@@ -26,16 +26,22 @@ const ERROR_SNIPPET_CHARS: usize = 200;
 pub struct ChoiceOption {
     /// SAN, used as the option key.
     pub key: String,
+    /// Plain-language facts about the move.
     pub effect: String,
+    /// The engine's bucket for the move.
     pub assessment: Bucket,
 }
 
 /// One `choice` question about one position.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChoiceRequest {
+    /// The position description (a serialized `JevState`).
     pub state: Value,
+    /// The question Jev answers.
     pub question: String,
+    /// How Jev should weigh the options.
     pub guidance: String,
+    /// The shortlisted moves, best first.
     pub options: Vec<ChoiceOption>,
 }
 
@@ -69,33 +75,45 @@ impl ChoiceRequest {
 /// Jev's answer to the `move` question.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChoiceAnswer {
+    /// Key of the option Jev chose.
     pub choice: String,
     /// Every option with its probability, most likely first (ties by key).
     pub probabilities: Vec<(String, f32)>,
+    /// Jev's confidence in its choice, from 0 to 1.
     pub confidence: f32,
     /// Versioned model ID that answered, e.g. `jev-1.13.0`.
     pub model: String,
+    /// Input tokens billed for the request.
     pub input_tokens: u32,
 }
 
+/// Why a Jev request failed. Messages never contain the API key.
 #[derive(Debug, Error, Clone, PartialEq)]
 pub enum JevError {
+    /// The API answered with a status other than 200.
     #[error("HTTP {status}: {message}")]
     Http {
+        /// The HTTP status code.
         status: u16,
+        /// Up to 200 printable characters of the response body.
         message: String,
+        /// The `Retry-After` delay, when the server sent one in seconds.
         retry_after: Option<Duration>,
     },
+    /// The request did not finish within the configured timeout.
     #[error("request timed out")]
     Timeout,
+    /// The connection failed (host lookup, connect or I/O); worth retrying.
     #[error("network error: {0}")]
     Transport(String),
+    /// A 200 response whose body is not a usable answer.
     #[error("invalid response: {0}")]
     InvalidResponse(String),
 }
 
 /// Something that can answer a `choice` question: `JevClient`, or a mock in tests.
 pub trait MoveChooser: Send + Sync {
+    /// Answers one `choice` question. An error is final: retries happen inside.
     fn choose(&self, request: &ChoiceRequest) -> Result<ChoiceAnswer, JevError>;
 }
 
@@ -141,11 +159,20 @@ pub fn parse_answer(body: &str) -> Result<ChoiceAnswer, JevError> {
     })
 }
 
-/// Error for a non-200 response, keeping at most 200 characters of the body.
+/// At most `max_chars` characters of `text`, with every control character (CR, LF,
+/// ESC, ...) replaced by a space so server text cannot break a one-line display.
+pub fn printable(text: &str, max_chars: usize) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(max_chars)
+        .collect()
+}
+
+/// Error for a non-200 response, keeping at most 200 printable characters of the body.
 pub fn http_error(status: u16, body: &str, retry_after: Option<Duration>) -> JevError {
     JevError::Http {
         status,
-        message: body.trim().chars().take(ERROR_SNIPPET_CHARS).collect(),
+        message: printable(body.trim(), ERROR_SNIPPET_CHARS),
         retry_after,
     }
 }
@@ -351,6 +378,23 @@ mod tests {
             http_error(401, "  bad key\n", None).to_string(),
             "HTTP 401: bad key"
         );
+    }
+
+    #[test]
+    fn http_errors_replace_control_characters() {
+        let body = "<html>\r\nBad Gateway\x1b[31m red\x07</html>";
+        let JevError::Http { message, .. } = http_error(502, body, None) else {
+            panic!("expected an HTTP error");
+        };
+        assert!(!message.chars().any(char::is_control), "{message:?}");
+        assert_eq!(message, "<html>  Bad Gateway [31m red </html>");
+        // Replacement happens before the 200-character cut.
+        let long = "\r\n".repeat(150) + "tail";
+        let JevError::Http { message, .. } = http_error(502, &format!("x{long}"), None) else {
+            panic!("expected an HTTP error");
+        };
+        assert_eq!(message.chars().count(), 200);
+        assert!(!message.chars().any(char::is_control));
     }
 
     #[test]

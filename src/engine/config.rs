@@ -4,21 +4,28 @@
 use std::fmt;
 use std::time::Duration;
 
+/// Jev model used when `JEV_MODEL` is unset.
 pub const DEFAULT_MODEL: &str = "jev-latest";
+/// API base URL used when `JEV_BASE_URL` is unset or invalid.
 pub const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
+/// Shortlist cap used when `JEV_MAX_OPTIONS` is unset or invalid.
 pub const DEFAULT_MAX_OPTIONS: usize = 40;
 /// Jev accepts at most 255 options in one `choice` question.
 pub const MAX_CHOICE_OPTIONS: usize = 255;
 
+/// Settings for the computer player, normally read with [`EngineConfig::from_env`].
+/// `Debug` output redacts the API key.
 #[derive(Clone, PartialEq, Eq)]
 pub struct EngineConfig {
     /// `None` means no Jev: the player falls back to local search.
     pub api_key: Option<String>,
+    /// Jev model ID sent with each request, e.g. `jev-latest`.
     pub model: String,
     /// Base URL without a trailing slash.
     pub base_url: String,
     /// Shortlist cap, always within 1..=255.
     pub max_options: usize,
+    /// Leave `losing` moves off the shortlist when any other move exists.
     pub filter_losing: bool,
     /// Timeout for one HTTP attempt.
     pub timeout: Duration,

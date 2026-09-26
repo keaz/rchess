@@ -2,6 +2,7 @@
 //! else goes through a shortlist, one Jev `choice` question and a veto check.
 //! It never fails: any problem degrades to the local search's best move.
 
+use std::fmt;
 use std::time::{Duration, Instant};
 
 use crate::core::{Game, Move};
@@ -9,9 +10,11 @@ use crate::core::{Game, Move};
 use super::annotate::{Annotation, Bucket, annotate};
 use super::config::{EngineConfig, MAX_CHOICE_OPTIONS};
 use super::describe::describe;
-use super::jev::{ChoiceOption, ChoiceRequest, JevClient, MoveChooser};
+use super::jev::{ChoiceOption, ChoiceRequest, JevClient, MoveChooser, printable};
 use super::search::{MATE, analyse};
 
+/// Longest part of an unknown option key echoed back in a note.
+const NOTE_KEY_CHARS: usize = 40;
 const QUESTION: &str = "You play `side_to_move`. Which move should we play?";
 const GUIDANCE: &str = "Each option says what the move does and the engine's assessment: \
 winning, good, neutral, bad or losing. Prefer winning and good moves. Among similar moves, \
@@ -27,32 +30,65 @@ pub enum MoveSource {
     /// A mate in one; Jev was not asked.
     MateInOne,
     /// Jev picked `jev_pick`, but it scored too far below the search best.
-    Vetoed { jev_pick: String },
+    Vetoed {
+        /// SAN of the option Jev picked.
+        jev_pick: String,
+    },
     /// Jev was unavailable or answered unusably; the search best was played.
     Fallback,
+}
+
+impl fmt::Display for MoveSource {
+    /// A short label for the TUI: `Jev`, `only move`, `mate in one`,
+    /// `vetoed (Jev picked Qxd5)` or `local search`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MoveSource::Jev => f.write_str("Jev"),
+            MoveSource::OnlyMove => f.write_str("only move"),
+            MoveSource::MateInOne => f.write_str("mate in one"),
+            MoveSource::Vetoed { jev_pick } => write!(f, "vetoed (Jev picked {jev_pick})"),
+            MoveSource::Fallback => f.write_str("local search"),
+        }
+    }
 }
 
 /// A chosen move plus everything the TUI shows about how it was chosen.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ComputerMove {
+    /// The move to play.
     pub mv: Move,
+    /// The move in SAN.
     pub san: String,
+    /// Where the move came from.
     pub source: MoveSource,
     /// Up to three Jev options with probabilities, most likely first.
     pub top: Vec<(String, f32)>,
+    /// Jev's confidence in its choice, when Jev answered.
     pub confidence: Option<f32>,
     /// Versioned model ID that answered.
     pub model: Option<String>,
     /// Time for the whole `choose_move` call.
     pub latency: Duration,
+    /// Input tokens billed, when Jev answered.
     pub input_tokens: Option<u32>,
     /// Why a fallback or veto happened.
     pub note: Option<String>,
 }
 
+/// Chooses computer moves: local search, plus Jev through `C` when available.
 pub struct ComputerPlayer<C: MoveChooser> {
     chooser: Option<C>,
     config: EngineConfig,
+}
+
+impl<C: MoveChooser> fmt::Debug for ComputerPlayer<C> {
+    /// Shows the config (its API key redacted) and whether a chooser is present.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ComputerPlayer")
+            .field("has_chooser", &self.chooser.is_some())
+            .field("config", &self.config)
+            .finish()
+    }
 }
 
 impl ComputerPlayer<JevClient> {
@@ -63,10 +99,13 @@ impl ComputerPlayer<JevClient> {
 }
 
 impl<C: MoveChooser> ComputerPlayer<C> {
+    /// A player that asks `chooser`. `None` means local search only: every move
+    /// that would go to Jev is the search best, reported as `Fallback`.
     pub fn new(chooser: Option<C>, config: EngineConfig) -> ComputerPlayer<C> {
         ComputerPlayer { chooser, config }
     }
 
+    /// The configuration this player was built with.
     pub fn config(&self) -> &EngineConfig {
         &self.config
     }
@@ -131,9 +170,14 @@ impl<C: MoveChooser> ComputerPlayer<C> {
             }
         };
         let Some(pick) = candidates.iter().find(|a| a.san == answer.choice) else {
+            let cut = if answer.choice.chars().count() > NOTE_KEY_CHARS {
+                "…"
+            } else {
+                ""
+            };
             let note = format!(
-                "Jev returned an unknown option ({}) — local search",
-                answer.choice
+                "Jev returned an unknown option ({}{cut}) — local search",
+                printable(&answer.choice, NOTE_KEY_CHARS)
             );
             return Some(plain(best.mv, MoveSource::Fallback, Some(note)));
         };
@@ -359,6 +403,42 @@ mod tests {
         );
         assert_eq!(request.question, QUESTION);
         assert_eq!(request.state["side_to_move"], "White");
+
+        // Keys follow the search order, best first, with the losing moves removed.
+        let g = game(HANGING_QUEEN_TRAP);
+        let expected: Vec<String> = annotate(g.position(), &analyse(&g))
+            .into_iter()
+            .filter(|a| a.bucket != Bucket::Losing)
+            .map(|a| a.san)
+            .take(EngineConfig::default().max_options)
+            .collect();
+        let keys: Vec<String> = request.options.iter().map(|o| o.key.clone()).collect();
+        assert!(keys.len() > 4, "{keys:?}");
+        assert_eq!(keys, expected);
+    }
+
+    #[test]
+    fn top_is_capped_at_three_and_sorted() {
+        let answer = vec![("Kd2", 0.4), ("Kf2", 0.3), ("Qd4", 0.2), ("Ke2", 0.1)];
+        let p = player(MockChooser::answering("Kd2", answer));
+        let result = p.choose_move(&game(HANGING_QUEEN_TRAP)).unwrap();
+        let request = &p.chooser.as_ref().unwrap().requests()[0];
+        for key in ["Kd2", "Kf2", "Qd4", "Ke2"] {
+            assert!(
+                request.options.iter().any(|o| o.key == key),
+                "{key} is on the shortlist"
+            );
+        }
+        assert_eq!(result.top.len(), 3);
+        assert!(result.top.windows(2).all(|w| w[0].1 >= w[1].1));
+        assert_eq!(
+            result.top,
+            vec![
+                ("Kd2".to_string(), 0.4),
+                ("Kf2".to_string(), 0.3),
+                ("Qd4".to_string(), 0.2)
+            ]
+        );
     }
 
     #[test]
@@ -455,6 +535,53 @@ mod tests {
         let result = p.choose_move(&game(HANGING_QUEEN_TRAP)).unwrap();
         assert_eq!(result.source, MoveSource::Fallback);
         assert!(result.note.unwrap().contains("unknown option (Qh8)"));
+    }
+
+    #[test]
+    fn unknown_option_note_is_short_and_printable() {
+        let choice = "Qh8\r\n\x1b[2Jzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
+        let p = player(MockChooser::answering(choice, vec![(choice, 1.0)]));
+        let result = p.choose_move(&game(HANGING_QUEEN_TRAP)).unwrap();
+        assert_eq!(result.source, MoveSource::Fallback);
+        let note = result.note.unwrap();
+        assert!(!note.chars().any(char::is_control), "{note:?}");
+        assert_eq!(
+            note,
+            format!(
+                "Jev returned an unknown option (Qh8   [2J{}…) — local search",
+                "z".repeat(31)
+            )
+        );
+    }
+
+    #[test]
+    fn move_source_labels() {
+        assert_eq!(MoveSource::Jev.to_string(), "Jev");
+        assert_eq!(MoveSource::OnlyMove.to_string(), "only move");
+        assert_eq!(MoveSource::MateInOne.to_string(), "mate in one");
+        assert_eq!(
+            MoveSource::Vetoed {
+                jev_pick: "Qxd5".to_string()
+            }
+            .to_string(),
+            "vetoed (Jev picked Qxd5)"
+        );
+        assert_eq!(MoveSource::Fallback.to_string(), "local search");
+    }
+
+    #[test]
+    fn debug_shows_the_config_without_the_key() {
+        let config = EngineConfig {
+            api_key: Some("secret-key-123".to_string()),
+            ..EngineConfig::default()
+        };
+        let p = ComputerPlayer::new(Some(MockChooser::answering("x", vec![])), config.clone());
+        let text = format!("{p:?}");
+        assert!(!text.contains("secret-key-123"), "{text}");
+        assert!(text.contains("<redacted>"), "{text}");
+        assert!(text.contains("has_chooser: true"), "{text}");
+        let p: ComputerPlayer<MockChooser> = ComputerPlayer::new(None, config);
+        assert!(format!("{p:?}").contains("has_chooser: false"));
     }
 
     #[test]

@@ -16,20 +16,30 @@ use super::see::{capture_gain, capturers, exchange_value, see, winnable_pieces};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Bucket {
+    /// At most 50 centipawns below the best move, and at least +300 or a mate for us.
     Winning,
+    /// At most 50 centipawns below the best move.
     Good,
+    /// 51 to 150 centipawns below the best move.
     Neutral,
+    /// 151 to 300 centipawns below the best move.
     Bad,
+    /// More than 300 centipawns below the best move, or allows checkmate.
     Losing,
 }
 
 /// One root move with its SAN, search score, effect words and bucket.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Annotation {
+    /// The move.
     pub mv: Move,
+    /// The move in SAN; the option key sent to Jev.
     pub san: String,
+    /// Search score in centipawns for the side to move.
     pub score: i32,
+    /// Plain-language facts joined with "; ", or "quiet move".
     pub effect: String,
+    /// The verdict relative to the best move.
     pub bucket: Bucket,
 }
 

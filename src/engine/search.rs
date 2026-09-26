@@ -20,7 +20,9 @@ const QUIESCENCE_PLIES: u32 = 8;
 /// A legal root move and its score in centipawns for the side to move.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScoredMove {
+    /// A legal move of the analysed position.
     pub mv: Move,
+    /// Its score in centipawns for the side to move; a mate `n` plies away is `±(MATE - n)`.
     pub score: i32,
 }
 

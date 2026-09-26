@@ -12,17 +12,27 @@ use super::see::{capturers, least_valuable, winnable_pieces};
 /// The `state` field of a Jev request. Field order is the JSON order.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct JevState {
+    /// `White` or `Black`.
     pub side_to_move: String,
+    /// The full-move number.
     pub move_number: u16,
+    /// `opening`, `middlegame` or `endgame`.
     pub phase: String,
+    /// The material balance in words, e.g. "White is ahead by about 1 pawn of material".
     pub material: String,
+    /// `yes` or `no`.
     pub in_check: String,
+    /// The side to move's pieces, e.g. "King g1, Rooks a1 and f1, Pawns a2 b2".
     pub our_pieces: String,
+    /// The opponent's pieces, in the same form.
     pub their_pieces: String,
+    /// The last six plies in SAN with move numbers; empty before the first move.
     pub recent_moves: String,
+    /// Up to three of our pieces the opponent can win, most valuable first.
     pub threats_against_us: Vec<String>,
 }
 
+/// The Jev `state` for the game's current position.
 pub fn describe(game: &Game) -> JevState {
     let pos = game.position();
     let us = pos.side_to_move();
