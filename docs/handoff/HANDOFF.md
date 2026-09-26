@@ -5,8 +5,8 @@ Read this first. Follow the protocol in section 8 of
 
 ## Current
 Sub-project: tui (not started) | Plan: to be written — docs/superpowers/plans/2026-09-26-tui.md
-Branch: feat/jev-engine (complete, ready for user to merge)
-Last completed task: engine task 9 (evaluation harness and wrap-up) — engine sub-project DONE
+Branch: feat/jev-engine (complete, ready for user to merge) @ e344fce
+Last completed task: engine final-review fix wave — engine sub-project DONE
 Next task: user merges feat/jev-engine; then brainstorm/plan the TUI from spec section 6
 State: green (except 3 pre-existing old-code test failures)
 
@@ -21,7 +21,16 @@ cargo test --lib engine:: && cargo test --lib core:: && cargo test --test core_p
 - `from_fen` rejects positions beyond the promotion material budget; `MoveList` capacity (321) is derived from that budget.
 - `pub mod core` shadows the built-in `core` crate at the crate root: write `::core::` in `src/lib.rs`.
 - CI (`cargo test --verbose`) stops at the 3 known old-code failures, so `core_properties` and the bench are not exercised in CI until the cleanup sub-project (consider `--no-fail-fast`).
-- `CLAUDE.md` still says "3 of 58" failing tests; now 3 of 109 lib tests plus 2 property tests. Update in cleanup.
+- `CLAUDE.md` still says "3 of 58" failing tests; now 3 of 199 lib tests plus 2 property tests. Update in cleanup.
+
+### Engine caveats (read before building the TUI on engine)
+- Give the worker a `Game` clone, not a `Position`: `analyse` needs the move history for repetition detection and `describe` sends the recent moves.
+- Worst-case `choose_move` latency is about 19 s (3 attempts × 5 s timeout + backoff or Retry-After + search) and it cannot be cancelled; discard stale results by generation counter.
+- Debug builds search about 23x slower than release (Kiwipete about 1.3 s vs 56 ms): the TUI plan should run `--release` or raise the dev profile's `opt-level`.
+- Crowded positions (many pawns in contact) take up to ~0.85 s in release: quiescence has no pruning and there is no time limit yet.
+- Never enable TRACE-level logging for `ureq` / `ureq_proto`: it would print the `Authorization` header with the API key.
+- Jev receives the state fields and the options in alphabetical order (serde_json sorts object keys; `preserve_order` stays off by ruling).
+- Jev is still asked when the shortlist has one entry; this inflates the harness agreement figure slightly.
 
 ## Notes / decisions made during work
 - movegen: pawn_moves takes a generic closure (impl Fn) instead of the plan's &dyn Fn, because the spec forbids trait objects in core.
@@ -46,12 +55,16 @@ cargo test --lib engine:: && cargo test --lib core:: && cargo test --test core_p
 - Game::undo withdraws a pending resignation first (returns None, keeps moves); a second undo takes back the move. Deviation from the plan's code, by controller ruling.
 - Benchmark results (criterion, 10 samples): startpos depth 5 [14.654 ms 14.811 ms 15.283 ms], kiwipete depth 4 [9.9514 ms 9.9703 ms 9.9899 ms].
 - Evaluation harness run (`examples/jev_eval.rs`, 20 positions): 19 answered by Jev, agreement with search best 12/19 (63%), 0 vetoes, 0 fallbacks, mean latency 311 ms, 15900 input tokens (about $0.000668).
-- TUI integration: own a ComputerPlayer<JevClient> (ComputerPlayer::from_config(EngineConfig::from_env())) on the worker thread; show EngineConfig.warnings, ComputerMove.note, source, top and model.
+- TUI integration: send `game.clone()` (the whole `Game`) to a long-lived worker thread that owns the ComputerPlayer<JevClient> (ComputerPlayer::from_config(EngineConfig::from_env())), or share the player through `Arc` (it is `Sync`, not `Clone`); worst-case `choose_move` latency is about 19 s (3 attempts × 5 s timeout + backoff + search), so tag each request with a generation counter and discard stale results; show EngineConfig.warnings, ComputerMove.note, source (its `Display` label), top and model.
+- The ignored live Jev round-trip test (`engine::jev::tests::live_choice_round_trip`) passed once during Task 7, with the user's key.
+- Test counts after the final fix wave: `cargo test --lib engine::` 87 passed, 2 ignored; `cargo test --lib core::` 51 passed, 1 ignored; `core_properties` 2 passed; whole lib 193 passed, 3 failed (old code), 3 ignored.
+- Final-review fix wave: a mate on the 100th half-move now outranks the fifty-move rule; SEE ignores pinned pieces off their pin line; annotation facts corrected ("exposed to capture" wording, no such fact for the capturing piece, a king only attacks undefended pieces); JEV_BASE_URL validated; transport errors classified (new `JevError::Request`), 1 MiB body cap and offline TcpListener tests; notes stripped of control characters; public docs, `ComputerPlayer` Debug and `MoveSource` Display; harness `jev pick` column and answered-only latency.
 
 ## Open questions for user
 - None.
 
 ## Log (newest first)
+- 2026-09-26 engine final-review fix wave (F1–F18): mate before fifty-move rule, pin-aware SEE, annotation fixes, transport hardening and offline tests, API polish, harness columns, docs
 - 2026-09-26 engine sub-project complete; harness run recorded
 - 2026-09-26 engine task 8 done: computer player
 - 2026-09-26 engine task 7 done: Jev client

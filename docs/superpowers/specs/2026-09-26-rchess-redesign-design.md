@@ -412,7 +412,8 @@ Cost estimate: about 1–2k input tokens per move at $0.042 per million — negl
 ### 6.4 Concurrency
 
 - Main thread runs the event loop, polling `crossterm` events on a 50 ms tick, and redraws.
-- A computer turn spawns a worker thread with a `Position` copy; the result returns over
+- A computer turn hands the worker a clone of the `Game` (the engine needs the move history for
+  repetition detection and recent moves); the result returns over
   `std::sync::mpsc`. Each request carries a generation counter; results whose generation no
   longer matches (after undo or new game) are discarded.
 - The UI thread never blocks on the network.
