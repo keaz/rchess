@@ -4,6 +4,10 @@ use super::{ChessError, Move, PieceKind, Position, Square};
 
 impl Position {
     /// SAN for a legal move, including `+` / `#` suffixes.
+    ///
+    /// `mv` must come from `self.legal_moves()`. Debug builds assert this;
+    /// release builds may corrupt the position. Use `Game::play` for
+    /// unvalidated moves.
     pub fn to_san(&self, mv: Move) -> String {
         let mut san = self.san_body(mv);
         let next = self.play(mv);

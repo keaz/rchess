@@ -187,8 +187,17 @@ impl Position {
                 || (bishops & !Bitboard::DARK_SQUARES).is_empty())
     }
 
-    /// Plays `mv`, which must come from `self.legal_moves()`.
+    /// Plays `mv`, returning the resulting position.
+    ///
+    /// `mv` must come from `self.legal_moves()`. Debug builds assert this;
+    /// release builds may corrupt the position. Use `Game::play` for
+    /// unvalidated moves.
     pub fn play(&self, mv: Move) -> Position {
+        debug_assert!(
+            self.legal_moves().contains(&mv),
+            "Position::play: {mv} is not legal in {}",
+            self.to_fen()
+        );
         let mut next = *self;
         next.apply(mv);
         next
@@ -575,6 +584,21 @@ mod tests {
         let next = pos.play(mv);
         assert_eq!(next.halfmove_clock(), 65535);
         assert_eq!(next.fullmove_number(), 65535);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "is not legal")]
+    fn play_panics_on_stale_move_in_debug_builds() {
+        // a1d1 is a quiet rook move on this position...
+        let stale = Position::from_fen("4k3/8/8/8/8/8/8/R3K3 w - - 0 1")
+            .unwrap()
+            .parse_uci("a1d1")
+            .unwrap();
+        // ...but replayed here, d1 holds a black knight: the move is stale
+        // (it should be a capture) and must not be applied silently.
+        let other = Position::from_fen("4k3/8/8/8/8/8/8/R2nK3 w - - 0 1").unwrap();
+        other.play(stale);
     }
 
     #[test]
