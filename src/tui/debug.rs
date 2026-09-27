@@ -62,20 +62,38 @@ pub fn enabled(flag: bool, get: impl Fn(&str) -> Option<String>) -> bool {
 /// The debug log file: `RCHESS_DEBUG_LOG` when set, else
 /// `$XDG_STATE_HOME/rchess/jev-debug.jsonl`, else `~/.local/state/rchess/jev-debug.jsonl`
 /// (on macOS too). Empty variables count as unset, and so does a relative
-/// `XDG_STATE_HOME` (the XDG base directory rules say to ignore one). `None` when none
-/// of the three is set.
+/// `XDG_STATE_HOME` (the XDG base directory rules say to ignore one). A leading `~/` in
+/// `RCHESS_DEBUG_LOG` is expanded to `HOME`, as for save paths ([`expand_tilde`]); other
+/// text (including `~name`) is used as given. `None` when none of the three is set, or
+/// when `RCHESS_DEBUG_LOG` starts with `~/` and `HOME` is not set.
 ///
 /// `get` reads an environment variable; pass `|k| std::env::var(k).ok()`.
 pub fn log_path(get: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
     let set = |name: &str| get(name).filter(|value| !value.is_empty());
     if let Some(path) = set(DEBUG_LOG_ENV) {
-        return Some(PathBuf::from(path));
+        return expand_tilde(&path, set("HOME").as_deref());
     }
     let state = set("XDG_STATE_HOME")
         .map(PathBuf::from)
         .filter(|dir| dir.is_absolute())
         .or_else(|| set("HOME").map(|home| Path::new(&home).join(".local").join("state")))?;
     Some(state.join(LOG_DIR).join(LOG_FILE))
+}
+
+/// Expands a leading `~/` in `path` to `home`, the same rule
+/// [`super::files::resolve_path`] uses for save paths: `~name` and a path with no
+/// leading `~` are returned as given, and `~` alone (a folder, not a file) falls
+/// through unchanged too, since a caller turns it into a file path itself. `None` when
+/// `path` starts with `~/` (or `~\` on Windows) and `home` is not set or empty — there is
+/// then nothing to expand it to.
+fn expand_tilde(path: &str, home: Option<&str>) -> Option<PathBuf> {
+    match path.strip_prefix('~') {
+        Some(rest) if rest.starts_with(std::path::is_separator) => {
+            let home = home.filter(|home| !home.is_empty())?;
+            Some(Path::new(home).join(rest.trim_start_matches(std::path::is_separator)))
+        }
+        _ => Some(PathBuf::from(path)),
+    }
 }
 
 /// `time` in UTC as RFC 3339 with milliseconds: `2026-09-27T14:03:05.120Z`. Times before
@@ -574,7 +592,8 @@ pub struct LogFailure {
 /// The debug log: records go over a channel to the `debug-log` thread, which appends
 /// each as a line ([`log_line`]) and flushes it. The file and any missing folders are
 /// created with the first record: folders with mode 0700, the file with mode 0600 (an
-/// existing file is appended to and keeps its mode).
+/// existing file is appended to and its mode is tightened to 0600 too; an existing
+/// folder keeps its mode).
 ///
 /// The first error ends the thread; [`DebugLog::failure`] then reports it once and
 /// nothing more is written. Records never wait: [`DebugLog::write`] only sends.
@@ -716,7 +735,9 @@ fn write_records(path: &Path, queued: &Receiver<Record>) -> Result<(), LogFailur
 }
 
 /// Opens `path` for appending, creating it (mode 0600) and its missing folders (mode
-/// 0700) as needed.
+/// 0700) as needed. `OpenOptionsExt::mode` only applies when the open call creates the
+/// file, so an existing file with a looser mode (left over from an older build, or made
+/// by another process) is explicitly tightened to 0600 here too.
 fn open_log(path: &Path) -> io::Result<File> {
     if let Some(folder) = path
         .parent()
@@ -732,7 +753,16 @@ fn open_log(path: &Path) -> io::Result<File> {
     options.append(true).create(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    options.open(path)
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = file.metadata()?.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(file)
 }
 
 /// Writes `record` as one line and flushes it.
@@ -909,6 +939,28 @@ mod tests {
         }
         assert_eq!(log(&[]), None);
         assert_eq!(log(&[("HOME", ""), ("XDG_STATE_HOME", "state")]), None);
+        // A leading `~/` in RCHESS_DEBUG_LOG is the home folder, as for save paths.
+        assert_eq!(
+            log(&[(DEBUG_LOG_ENV, "~/jev.jsonl"), ("HOME", "/home/ana")]),
+            Some(PathBuf::from("/home/ana/jev.jsonl"))
+        );
+        assert_eq!(
+            log(&[(DEBUG_LOG_ENV, "~/a/b.jsonl"), ("HOME", "/home/ana")]),
+            Some(PathBuf::from("/home/ana/a/b.jsonl"))
+        );
+        // Only a leading `~/` is the home folder: `~name` and an inner `~` are literal.
+        assert_eq!(
+            log(&[(DEBUG_LOG_ENV, "~ana/jev.jsonl"), ("HOME", "/home/ana")]),
+            Some(PathBuf::from("~ana/jev.jsonl"))
+        );
+        assert_eq!(
+            log(&[(DEBUG_LOG_ENV, "logs/~/jev.jsonl"), ("HOME", "/home/ana")]),
+            Some(PathBuf::from("logs/~/jev.jsonl"))
+        );
+        // Without HOME there is nothing to expand `~/` to: no log, rather than a literal
+        // `./~/...` folder.
+        assert_eq!(log(&[(DEBUG_LOG_ENV, "~/jev.jsonl")]), None);
+        assert_eq!(log(&[(DEBUG_LOG_ENV, "~/jev.jsonl"), ("HOME", "")]), None);
     }
 
     #[test]
@@ -1324,12 +1376,19 @@ mod tests {
         let dir = TempDir::new("debug-log");
         let path = dir.join("jev.jsonl");
         fs::write(&path, "{\"earlier\":true}\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
         let mut log = DebugLog::start(path.clone());
         log.write(&record(false));
         log.close(Duration::from_secs(10));
         let text = fs::read_to_string(&path).unwrap();
         assert_eq!(text.lines().count(), 2);
         assert!(text.starts_with("{\"earlier\":true}\n{\"time\""));
+        #[cfg(unix)]
+        assert_eq!(mode(&path), 0o600, "a looser existing mode is tightened");
     }
 
     #[test]

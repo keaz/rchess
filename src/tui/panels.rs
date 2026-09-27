@@ -524,32 +524,40 @@ fn command_panel(frame: &mut Frame, area: Rect, editor: &LineEditor, focused: bo
     }
 }
 
-/// Status: `DEBUG` in debug mode and the mode on the top border (the first of
-/// [`App::mode_labels`] that fits, so a narrow panel shows `You (W) vs Local` rather than
-/// nothing), then whose turn it is, the Jev vs Jev pace, the thinking spinner and the
+/// Status: the mode on the top border (the first of [`App::mode_labels`] that fits, so
+/// a narrow panel shows `You (W) vs Local` rather than nothing) always keeps the
+/// border; `DEBUG` joins it there too when both fit. When they do not, the mode title
+/// still keeps the border and `DEBUG` starts the first status line instead ([`status_lines`]).
+/// Then comes whose turn it is, the Jev vs Jev pace, the thinking spinner and the
 /// latest message.
 fn status_panel(frame: &mut Frame, area: Rect, app: &App, now: Instant) {
     const TITLE: &str = " Status ";
-    let mut block = side_block("Status");
-    let mut titles = TITLE.len();
-    if app.debug_mode() {
-        block = block.title_top(Line::from(DEBUG_TAG).yellow().bold());
-        // One border cell between the two titles.
-        titles += DEBUG_TAG.len() + 1;
-    }
-    let inner = block.inner(area);
-    // Two corners and at least two border cells between the titles.
-    let room = usize::from(area.width).saturating_sub(titles + 4);
+    let block = side_block("Status");
+    // Two corners and at least two border cells between the title and the mode.
+    let room = usize::from(area.width).saturating_sub(TITLE.len() + 4);
     let mode = app
         .mode_labels()
         .into_iter()
         .map(|label| format!(" {label} "))
         .find(|mode| Span::raw(mode.as_str()).width() <= room);
+    // DEBUG only takes the border when the mode title (chosen above, without shrinking
+    // for DEBUG) still fits alongside it; the mode title never loses its spot to DEBUG.
+    let debug_on_border = app.debug_mode()
+        && mode.as_ref().is_some_and(|mode| {
+            let both = TITLE.len() + DEBUG_TAG.len() + 1 + Span::raw(mode.as_str()).width() + 4;
+            both <= usize::from(area.width)
+        });
+    let mut block = block;
+    if debug_on_border {
+        block = block.title_top(Line::from(DEBUG_TAG).yellow().bold());
+    }
     let block = match mode {
         Some(mode) => block.title_top(Line::from(mode).right_aligned()),
         None => block,
     };
-    let lines = status_lines(app, now, inner.width, inner.height);
+    let inner = block.inner(area);
+    let debug_in_lines = app.debug_mode() && !debug_on_border;
+    let lines = status_lines(app, now, inner.width, inner.height, debug_in_lines);
     side_panel(frame, area, block, lines);
 }
 
@@ -563,17 +571,44 @@ fn fitted(full: String, brief: String, width: u16) -> String {
 }
 
 /// The Status panel's text for `rows` rows `width` cells wide, steadiest first, so a long
-/// message is what gets cut when the panel is full: whose turn it is, the Jev vs Jev pace
-/// (the only place the pause and step delay are shown), the thinking spinner (or the wait
-/// for an earlier request), and the latest message in the rows left ([`fit_message`]). The
-/// turn and thinking lines drop words rather than wrap (the computer's name "Local search"
-/// is long), so they keep one row each; a game's outcome has no brief form and may wrap,
-/// and the message gets the rows its wrapped lines leave.
-fn status_lines(app: &App, now: Instant, width: u16, rows: u16) -> Vec<Line<'static>> {
+/// message is what gets cut when the panel is full: whose turn it is (`DEBUG` in front of
+/// it when `debug_first`, because the Status border had no room for both titles), the Jev
+/// vs Jev pace (the only place the pause and step delay are shown), the thinking spinner
+/// (or the wait for an earlier request), and the latest message in the rows left
+/// ([`fit_message`]). The turn and thinking lines drop words rather than wrap (the
+/// computer's name "Local search" is long), so they keep one row each; a game's outcome
+/// has no brief form and may wrap, and the message gets the rows its wrapped lines leave.
+fn status_lines(
+    app: &App,
+    now: Instant,
+    width: u16,
+    rows: u16,
+    debug_first: bool,
+) -> Vec<Line<'static>> {
     let game = app.game();
     let in_check = game.outcome().is_none() && game.position().is_check();
-    let turn = Line::from(fitted(app.turn_text(), app.turn_text_brief(), width)).bold();
-    let mut lines = vec![if in_check { turn.red() } else { turn }];
+    const DEBUG_PREFIX: &str = "DEBUG ";
+    let prefix_width = if debug_first {
+        u16::try_from(Span::raw(DEBUG_PREFIX).width()).unwrap_or(u16::MAX)
+    } else {
+        0
+    };
+    let turn_text = fitted(
+        app.turn_text(),
+        app.turn_text_brief(),
+        width.saturating_sub(prefix_width),
+    );
+    let turn_style = if in_check {
+        Style::new().bold().red()
+    } else {
+        Style::new().bold()
+    };
+    let mut spans = Vec::new();
+    if debug_first {
+        spans.push(Span::raw(DEBUG_PREFIX).yellow().bold());
+    }
+    spans.push(Span::styled(turn_text, turn_style));
+    let mut lines = vec![Line::from(spans)];
     if app.mode() == Mode::JevVsJev && game.outcome().is_none() {
         let pace = if app.paused() {
             "paused · space resumes".to_string()
