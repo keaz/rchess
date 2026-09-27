@@ -4,10 +4,10 @@ Read this first. Follow the protocol in section 8 of
 `docs/superpowers/specs/2026-09-26-rchess-redesign-design.md`.
 
 ## Current
-Sub-project: tui (not started) | Plan: to be written — docs/superpowers/plans/2026-09-27-tui.md
-Branch: main @ e768bfc (fix/engine-pin-and-endpoint fast-forward merged, then deleted)
-Last completed task: engine follow-up merged (SEE pin release fixed, Jev endpoint fixed to the quickstart URL)
-Next task: brainstorm/plan the TUI from spec section 6 (read "Core API caveats", the engine caveats and "Known open issues" first)
+Sub-project: tui (design revised, awaiting spec review) | Plan: to be written — docs/superpowers/plans/2026-09-27-tui.md
+Branch: feat/tui (from main @ 4b7e8f9)
+Last completed task: TUI brainstorming — spec section 6 revised and committed
+Next task: user reviews spec section 6; then write the TUI plan with superpowers:writing-plans
 State: green (except 3 pre-existing old-code test failures)
 
 ## Verify before continuing
@@ -72,6 +72,7 @@ cargo test --lib engine:: && cargo test --lib core:: && cargo test --test core_p
 - None.
 
 ## Log (newest first)
+- 2026-09-27 TUI brainstorming: spec section 6 revised (terminal guard, thread-aware panic hook, signals, stale-reply check, lenient move text, glyph sets, dev opt-level 3, snapshot tests).
 - 2026-09-27 fix/engine-pin-and-endpoint merged into main: SEE pins recomputed after the first capture, kings respect pinned guards, fixed Jev endpoint (JEV_BASE_URL removed), wire format pinned to the quickstart.
 - 2026-09-27 engine follow-up on fix/engine-pin-and-endpoint: SEE pin release fixed, pin-aware `new_attack`, fixed Jev endpoint (base-URL variable removed); ready to merge; next: TUI brainstorming.
 - 2026-09-27 feat/jev-engine fast-forward merged into main (engine DONE); SEE pin-release issue left open by user choice, recorded under Known open issues.
