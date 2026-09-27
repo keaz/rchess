@@ -32,7 +32,9 @@ nothing touches the network), drives it with keystrokes or signals, and checks:
     signal at once, SIGTERM with the terminal restored;
   - answers like Kitty: start-up goes on at once, the answer is not echoed,
     Image is the starting style and pieces are kitty pictures (unicode
-    placeholders), and a resize asks nothing (placeholders scale with the cells);
+    placeholders), and a resize asks nothing (placeholders scale with the cells)
+    but sends new pictures with new ids; a quit, and a SIGTERM, delete every
+    picture sent by its id;
   - answers like a Sixel terminal with a 10x20 font, then zooms out to 8x16
     (more cells, and SIGWINCH): the resize asks for the cell size again (CSI 16 t,
     the status request and the device attributes, nothing else), and with the
@@ -45,7 +47,8 @@ nothing touches the network), drives it with keystrokes or signals, and checks:
     answers arrive takes its own answer (11x22), not the late one, and the UI
     still reacts to the next resize without a key;
 * exit writes ?1006l ?1002l ?1000l ?2004l and then ?1049l (after kitty pictures,
-  Kitty's delete-all-images command comes first, and only then), then only shows the
+  one delete-by-id command for each picture sent comes first, naming the ids the
+  transmissions used, and only then), then only shows the
   cursor again (?25h) and draws nothing on the main screen, exits with status 0,
   and leaves the pty's termios exactly as it was before the program started
   (ICANON and ECHO back on);
@@ -116,9 +119,14 @@ FULL_FONT_QUERY = FONT_QUERY + ATTRIBUTES_REQUEST
 ATTRIBUTES_ANSWER = b"\x1b[?62;4c"
 # A Sixel terminal's answer to the font query after a zoom to an 8x16 pixel cell.
 ZOOMED_ANSWER = b"\x1b[6;16;8t\x1b[0n" + ATTRIBUTES_ANSWER
-# Kitty's command to delete every image and free its data, written at exit after
-# kitty pictures were drawn.
-KITTY_DELETE = b"\x1b_Ga=d,d=A\x1b\\"
+# Kitty's command to delete one image by id and free its data (uppercase I), written
+# at exit once for every kitty picture sent. Pictures are virtual placements, which
+# Kitty deletes only by id (a=d,d=A leaves them).
+KITTY_DELETE = re.compile(rb"\x1b_Ga=d,d=I,i=(\d+)\x1b\\")
+# Any kitty delete command, whatever it names.
+KITTY_ANY_DELETE = re.compile(rb"\x1b_Ga=d")
+# The first chunk of a kitty picture's transmission, which names its id.
+KITTY_TRANSMIT = re.compile(rb"\x1b_Gq=2,i=(\d+),a=T,U=1")
 # Kitty's unicode placeholder: every cell of a kitty picture holds one.
 PLACEHOLDER = "\U0010EEEE"
 SECRET_VARS = ("JEV_API_KEY", "TYPESAFE_API_KEY")
@@ -435,6 +443,33 @@ def check_setup(app, query=False):
         check(not sent, "images off: no graphics query", f"found {sent}")
 
 
+def check_kitty_deletes(app, after, label):
+    """Checks that every kitty picture sent (the ids of the transmissions before
+    `after`) is deleted by its id once, with uppercase I (which frees its data), all
+    before ?1006l and nothing else deleted, and that no other kind of delete is sent."""
+    sent = {int(i) for i in KITTY_TRANSMIT.findall(app.stream[:after])}
+    check(bool(sent), f"{label}: kitty pictures were sent")
+    check(0 not in sent, f"{label}: no kitty picture has id 0", f"ids {sorted(sent)}")
+    deletes = list(KITTY_DELETE.finditer(app.stream))
+    deleted = [int(m.group(1)) for m in deletes]
+    check(
+        set(deleted) == sent and len(deleted) == len(sent),
+        f"{label}: each kitty picture sent is deleted by its id, once",
+        f"sent {sorted(sent)}, deleted {sorted(deleted)}",
+    )
+    check(
+        len(KITTY_ANY_DELETE.findall(app.stream)) == len(deletes),
+        f"{label}: kitty pictures are deleted by id only (no a=d,d=A)",
+    )
+    teardown = ordered(app.stream, TEARDOWN, after)
+    check(
+        bool(deletes) and teardown is not None
+        and all(after <= m.start() < teardown[0] for m in deletes),
+        f"{label}: the kitty pictures are deleted at exit, before ?1006l and ?1049l",
+        f"deletes at {[m.start() for m in deletes]}, teardown at {teardown}",
+    )
+
+
 def check_teardown(app, after, label, kitty=False):
     offsets = ordered(app.stream, TEARDOWN, after)
     check(
@@ -443,14 +478,9 @@ def check_teardown(app, after, label, kitty=False):
         f"offsets {offsets}",
     )
     if kitty:
-        deleted = ordered(app.stream, [KITTY_DELETE] + TEARDOWN, after)
-        check(
-            deleted is not None and app.stream.count(KITTY_DELETE) == 1,
-            f"{label}: the kitty pictures are deleted once, before ?1006l and ?1049l",
-            f"offsets {deleted}",
-        )
+        check_kitty_deletes(app, after, label)
     else:
-        check(KITTY_DELETE not in app.stream, f"{label}: no kitty delete command")
+        check(not KITTY_ANY_DELETE.search(app.stream), f"{label}: no kitty delete command")
     if offsets is not None:
         tail = app.stream[offsets[-1] + len(TEARDOWN[-1]):]
         # The cursor comes back (it is hidden while the UI runs) and nothing else follows.
@@ -959,6 +989,13 @@ def scenario_query_kitty(binary):
             app.pump(0.05)
         app.idle(0.3)
         check(b"a=T,U=1" in app.stream[resized_at:], "a resize redraws the kitty pictures")
+        before = set(KITTY_TRANSMIT.findall(app.stream[:resized_at]))
+        after = set(KITTY_TRANSMIT.findall(app.stream[resized_at:]))
+        check(
+            bool(after) and not (before & after),
+            "the redrawn pictures have new ids (the old ones must be deleted too)",
+            f"before {sorted(before)}, after {sorted(after)}",
+        )
         check(b"[16t" not in app.stream[resized_at:], "a resize asks nothing with kitty pictures")
         set_window(app, ROWS, COLS, 0, 0)
         app.idle(0.3)
@@ -973,6 +1010,27 @@ def scenario_query_kitty(binary):
         check(app.wait_exit(), "process exits after y")
         check(app.status == 0, "exit status 0", f"status {app.status}")
         check_teardown(app, quit_at, "quit after kitty pictures", kitty=True)
+    finally:
+        app.close()
+
+
+def scenario_query_kitty_signal(binary):
+    print("scenario: SIGTERM after kitty pictures; they are deleted by id before the restore")
+    app = App(binary, env=QUERY_ENV)
+    try:
+        check(wait_for_query(app) is not None, "the graphics query is written")
+        os.write(app.master, KITTY_ANSWER)
+        check(app.wait_screen("1. Human vs Human"), "menu renders")
+        app.send(b"1")
+        check(app.wait_screen("White to move"), "Human vs Human starts")
+        check(KITTY_TRANSMIT.search(app.stream) is not None, "pieces are sent as kitty pictures")
+        signal_at = len(app.stream)
+        os.kill(app.pid, signal.SIGTERM)
+        exited = app.wait_exit(timeout=3.0)
+        check(exited, "process exits after SIGTERM")
+        if exited:
+            check(app.status == -signal.SIGTERM, "terminated by SIGTERM", f"status {app.status}")
+        check_teardown(app, signal_at, "SIGTERM after kitty pictures", kitty=True)
     finally:
         app.close()
 
@@ -1223,6 +1281,7 @@ def main():
     scenario_query_signal(binary)
     scenario_query_hangup(binary)
     scenario_query_kitty(binary)
+    scenario_query_kitty_signal(binary)
     scenario_query_sixel_zoom(binary)
     for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         scenario_signal(binary, signum)

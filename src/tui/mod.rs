@@ -34,7 +34,6 @@ use std::time::{Duration, Instant};
 
 use ratatui::backend::Backend;
 use ratatui::crossterm::event::Event;
-use ratatui_image::picker::ProtocolType;
 
 use crate::core::Game;
 use crate::engine::{ComputerMove, ComputerPlayer, EngineConfig};
@@ -235,14 +234,10 @@ fn play(
         &mut app,
         quit,
         |app| {
+            // Kitty keeps pictures after the program ends unless they are deleted: the
+            // board builds each with an id from `terminal::next_kitty_id`, which
+            // `terminal::leave` deletes.
             screen.draw(|frame| app.render(frame, Instant::now()))?;
-            // Kitty keeps pictures after the program ends unless they are deleted.
-            if let Some(picker) = app.picker()
-                && picker.protocol_type() == ProtocolType::Kitty
-                && !app.piece_images().is_empty()
-            {
-                terminal::note_kitty_images(picker.tmux_detected());
-            }
             Ok(())
         },
         |replies| {

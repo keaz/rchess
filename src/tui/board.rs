@@ -31,10 +31,12 @@ use ratatui::{
 };
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::Protocol;
+use ratatui_image::protocol::kitty::Kitty;
 use ratatui_image::{Image, Resize};
 
 use super::glyphs::{self, GlyphSet, Palette};
 use super::pieces::{ImageCache, ImageKey};
+use super::terminal;
 use crate::core::{Color as Side, Piece, PieceKind, Position as ChessPosition, Square};
 
 /// The smallest square `(width, height)` in cells: one row, with room for the
@@ -309,10 +311,27 @@ impl PieceImages {
         self.cache
             .get_or_insert_with(key, |key| {
                 let image = DynamicImage::ImageRgba8(key.composite());
-                picker.new_protocol(image, cells, Resize::Fit(None)).ok()
+                if picker.protocol_type() == ProtocolType::Kitty {
+                    kitty_picture(image, cells, picker.tmux_detected())
+                } else {
+                    picker.new_protocol(image, cells, Resize::Fit(None)).ok()
+                }
             })
             .as_ref()
     }
+}
+
+/// A Kitty picture of `image`, which is exactly the pixel size of `cells`, sent
+/// through tmux when `tmux`. It is what `Picker::new_protocol` builds, except that
+/// the image id comes from [`terminal::next_kitty_id`] instead of a random number:
+/// Kitty pictures are virtual placements, which the terminal deletes only by id, so
+/// the restore must know every id sent. The transmission is not compressed, as the
+/// graphics query never asks whether the terminal can inflate it.
+fn kitty_picture(image: DynamicImage, cells: Size, tmux: bool) -> Option<Protocol> {
+    let id = terminal::next_kitty_id(tmux);
+    Kitty::new(image, cells, id, tmux, false)
+        .ok()
+        .map(Protocol::Kitty)
 }
 
 impl fmt::Debug for PieceImages {
@@ -1665,6 +1684,49 @@ mod tests {
         scene.position = fen("4k3/8/8/8/8/8/P7/4K3 w - - 0 1");
         scene.draw(&mut images);
         assert_eq!(images.len(), 4);
+    }
+
+    /// The ids of the kitty pictures whose image data `buffer` sends (the `i=` of each
+    /// transmission).
+    fn kitty_ids_sent(buffer: &Buffer) -> Vec<u32> {
+        buffer
+            .content()
+            .iter()
+            .filter_map(|cell| cell.symbol().split_once("_Gq=2,i="))
+            .map(|(_, rest)| {
+                let id = rest.split(',').next().unwrap_or_default();
+                id.parse().expect("a numeric id")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn kitty_pictures_use_ids_the_session_records_for_deletion() {
+        // Kitty deletes a virtual placement only by its id, so every id a picture is
+        // sent with must be one the terminal restore will delete, including those of
+        // pictures dropped when the squares or the font change.
+        let mut scene = Scene::new(89, 41, KINGS_AND_KNIGHT);
+        scene.picker = Some(picker_for(ProtocolType::Kitty, CellSize::DEFAULT));
+        let mut images = PieceImages::new();
+        let (terminal, _) = scene.draw(&mut images);
+        let first = kitty_ids_sent(terminal.backend().buffer());
+        assert_eq!(first.len(), 3, "{first:?}");
+
+        images.clear();
+        let (terminal, _) = scene.draw(&mut images);
+        let second = kitty_ids_sent(terminal.backend().buffer());
+        assert_eq!(second.len(), 3, "{second:?}");
+
+        let recorded = crate::tui::terminal::recorded_kitty_ids();
+        let mut all = first.clone();
+        all.extend(&second);
+        for id in &all {
+            assert_ne!(*id, 0);
+            assert!(recorded.contains(id), "{id} is not recorded");
+        }
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), 6, "every picture has its own id");
     }
 
     #[test]
