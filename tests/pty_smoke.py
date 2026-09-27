@@ -30,8 +30,8 @@ nothing touches the network), drives it with keystrokes or signals, and checks:
   local search move played without disturbing the screen; a panic on the UI
   thread restores the terminal before the message is printed (status 101); a
   hung UI thread is still restored and ended by SIGTERM;
-* --help and a non-terminal stdout never touch the terminal, and errors are
-  printed readably;
+* --help, a non-terminal stdout and a non-terminal stdin (`chess < /dev/null`)
+  never touch the terminal, and errors are printed readably;
 * as a control, SIGKILL (which cannot be caught) does leave the pty raw, which
   shows the termios check can fail.
 
@@ -41,6 +41,7 @@ Exits 0 when every check passes, 1 otherwise.
 import argparse
 import codecs
 import fcntl
+import json
 import os
 import re
 import select
@@ -213,7 +214,7 @@ def child_env(extra=None):
 class App:
     """The binary running on its own pty, with everything it wrote recorded."""
 
-    def __init__(self, binary, args=(), stdout_pipe=False, env=None):
+    def __init__(self, binary, args=(), stdout_pipe=False, stdin_null=False, env=None):
         self.master, self.slave = os.openpty()
         fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
         # Read through the master: on macOS the slave is revoked when the child's
@@ -231,6 +232,8 @@ class App:
                 os.login_tty(self.slave)  # setsid, controlling tty, stdin/stdout/stderr
                 if pipe_w is not None:
                     os.dup2(pipe_w, 1)
+                if stdin_null:
+                    os.dup2(os.open(os.devnull, os.O_RDONLY), 0)
                 os.execve(binary, [binary, *args], child_env(env))
             finally:
                 os._exit(127)
@@ -648,6 +651,39 @@ def scenario_not_a_terminal(binary):
         app.close()
 
 
+def scenario_stdin_not_a_terminal(binary):
+    print("scenario: stdin is /dev/null -> error before the terminal is touched")
+    app = App(binary, stdin_null=True)
+    try:
+        check(app.wait_exit(), "process exits")
+        check(app.status == 1, "exit status 1", f"status {app.status}")
+        check(
+            b"chess: stdin is not a terminal" in app.stream,
+            "error names the problem",
+            app.text().strip()[:100],
+        )
+        check(b"\x1b[" not in app.stream, "no escape sequences (no alternate screen, no menu)")
+        check(termios.tcgetattr(app.master)[:4] == app.termios_before[:4], "termios untouched")
+    finally:
+        app.close()
+
+
+def target_dir():
+    """Where cargo puts its builds, as cargo itself reports it (CARGO_TARGET_DIR and
+    build.target-dir included); without cargo, CARGO_TARGET_DIR or target/."""
+    try:
+        metadata = subprocess.run(
+            ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+            cwd=CRATE,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        return json.loads(metadata)["target_directory"]
+    except (OSError, subprocess.CalledProcessError, ValueError, KeyError):
+        return os.path.join(CRATE, os.environ.get("CARGO_TARGET_DIR") or "target")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--release", action="store_true", help="build and run the release binary")
@@ -658,7 +694,7 @@ def main():
     if not opts.no_build:
         cmd = ["cargo", "build", "--quiet", "--bin", "chess"] + (["--release"] if opts.release else [])
         subprocess.run(cmd, cwd=CRATE, check=True)
-    binary = os.path.join(CRATE, "target", profile, "chess")
+    binary = os.path.join(target_dir(), profile, "chess")
     if not os.access(binary, os.X_OK):
         sys.exit(f"no binary at {binary}; build it first")
     print(f"binary: {binary}")
@@ -681,6 +717,7 @@ def main():
     scenario_arguments(binary)
     scenario_help(binary)
     scenario_not_a_terminal(binary)
+    scenario_stdin_not_a_terminal(binary)
 
     HOME.cleanup()
     print()
