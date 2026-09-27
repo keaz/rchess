@@ -53,12 +53,17 @@ src/
     jev.rs          Jev request/response types, HTTP client, retry policy
     config.rs       EngineConfig from environment variables
     player.rs       ComputerPlayer: forced moves, shortlist, ask Jev, veto, fallback
-  tui/              sub-project 3
+  tui/              sub-project 3 (see section 6.1 for the full layout)
+    terminal.rs     terminal guard, panic hook, signals
+    event.rs        AppEvent and the poll loop
     app.rs          App state machine (Menu, Playing, GameOver, dialogs)
-    board_widget.rs board rendering, highlights, flip
-    panels.rs       status, Jev panel, move list, captured pieces
-    input.rs        mouse, keyboard, command box parsing
     worker.rs       background thread for computer moves
+    board.rs        board widget and hit-testing
+    panels.rs       status, Jev panel, move list, captured pieces
+    input.rs        command box editor and command parsing
+    movetext.rs     lenient move parsing
+    glyphs.rs       piece glyph sets and palettes
+    files.rs        saving FEN and PGN
 ```
 
 Dependency direction is strictly `tui -> engine -> core`. `core` has no external runtime
@@ -68,7 +73,7 @@ dependencies (except `thiserror`), no I/O, and no trait objects.
 
 | Purpose | Crate |
 | --- | --- |
-| TUI | `ratatui`, `crossterm` |
+| TUI | `ratatui` 0.30 (crossterm 0.29 through `ratatui::crossterm`), `signal-hook` |
 | HTTP (sync, used on a worker thread) | `ureq` 3.x with the `json` feature |
 | JSON | `serde`, `serde_json` |
 | Errors | `thiserror` |
@@ -376,15 +381,62 @@ Cost estimate: about 1–2k input tokens per move at $0.042 per million — negl
 
 ## 6. Sub-project 3 — `tui`
 
-### 6.1 Screens
+Revised 2026-09-27 after `core` and `engine` were built: the design below re-validates the original
+section against the APIs as merged, current ratatui/crossterm behaviour (verified by compiling and
+running scratch programs under a pty), and the engine caveats in `docs/handoff/HANDOFF.md`. The user's
+terminals are GPU/Linux terminals (Ghostty, Kitty, WezTerm, Alacritty).
 
-- `Menu`: Human vs Human; Human vs Jev (choose White, Black or random); Jev vs Jev (watch mode
-  with adjustable step delay); Load FEN; Quit.
-- `Playing`: main screen (layout below).
-- `GameOver` overlay: result and reason; new game, save PGN, back to menu.
-- Dialogs: FEN input, save path for FEN/PGN, promotion picker (Q/R/B/N), resign confirmation.
+### 6.1 Structure and dependencies
 
-### 6.2 Playing layout
+```
+src/main.rs            launches the TUI (the old CLI entry is dropped; the legacy chess::Game stays
+                       until the cleanup sub-project)
+src/tui/
+  mod.rs               run(): terminal setup/teardown, main loop
+  terminal.rs          guard: raw mode, alternate screen, click-and-drag mouse capture, bracketed
+                       paste; restored on every exit path; thread-aware panic hook; SIGINT/SIGTERM/SIGHUP
+  event.rs             AppEvent { Term(Event), Engine(EngineReply), Tick } and the 50 ms poll loop
+  app.rs               App state machine: Menu | Playing | GameOver plus a dialog stack;
+                       handle(AppEvent) -> Action
+  worker.rs            Arc<ComputerPlayer<JevClient>>, named "engine" thread, catch_unwind,
+                       request/reply with generation and position hash
+  board.rs             board widget; square_rect / square_at hit-testing (flip-aware)
+  panels.rs            status, Jev panel, move list, captured pieces
+  input.rs             hand-rolled single-line command editor and command parser
+  movetext.rs          lenient move parsing (SAN, UCI, loose SAN with ambiguity detection)
+  glyphs.rs            Solid / Outline / Ascii glyph sets and palettes (truecolor with 256-colour fallback)
+  files.rs             saving FEN/PGN: `~` expansion, extension, overwrite confirmation, temp file + rename
+```
+
+- Dependencies: `ratatui = "0.30"` and `signal-hook`; crossterm is imported only through
+  `ratatui::crossterm` (no direct crossterm dependency, so the versions cannot diverge). Dev:
+  `insta`. No text-input or temp-file crates (`tui-textarea` 0.7 pulls ratatui 0.29 and does not
+  compile against 0.30).
+- `Cargo.toml` adds `[profile.dev.package.chess] opt-level = 3`, so `cargo run` searches Kiwipete in
+  about 0.10 s instead of about 1.34 s (release: about 0.06 s).
+- `tui` uses only `chess::core` and `chess::engine`, never the legacy crate-root `chess::Game`.
+- The TUI stays in the `chess` crate; splitting it into a separate workspace member is left to the
+  cleanup sub-project.
+
+### 6.2 Screens
+
+- `Menu`: Human vs Human; Human vs Jev (White, Black or random); Jev vs Jev (watch mode: step
+  delay adjustable with `+`/`-`, default 1 s; `space` pauses); Load FEN; Quit. The menu shows the Jev
+  status ("Jev ready (jev-latest)" or "No JEV_API_KEY — local search") and any
+  `EngineConfig.warnings`. Without a key the computer is called "Local search" wherever the UI names
+  it (menu entries, mode label, turn and thinking lines, its panel's title, PGN names), so the screen
+  never says "Jev" while Jev is not playing.
+- `Playing`: the main screen (layout below). The Status panel's top border names the mode, trying
+  shorter forms until one fits beside the title: `You (White) vs Local search`, then
+  `You (W) vs Local`, then `W You · B Local` (`Local search vs Local search`, then `Local vs Local`;
+  with a key the same with `Jev`, and `Jev vs Jev` always fits). The turn and thinking lines drop the
+  player's name rather than wrap.
+- `GameOver` overlay: result and reason; New game, Save PGN, Menu.
+- Dialogs: FEN input, save path, overwrite confirmation, promotion picker (Q R B N, mouse or keys),
+  resign confirmation, help. Every dialog renders `Clear` before drawing.
+- Below 60×20 the screen shows only "Terminal too small (need 60×20)".
+
+Playing layout:
 
 ```
 ┌ Board ─────────────────┐┌ Status ──────────────┐
@@ -401,35 +453,104 @@ Cost estimate: about 1–2k input tokens per move at $0.042 per million — negl
                           └──────────────────────┘
 ```
 
-- Board scales with terminal size; each square at least two columns wide. Unicode pieces by
-  default, `--ascii` flag for fallback glyphs.
-- Highlights: selected piece, its legal targets, last move, king in check.
+### 6.3 Board rendering
 
-### 6.3 Input
+- Squares are 3×1 cells by default, 5×2 when the terminal has room, 7×3 on large terminals, with rank
+  and file labels.
+- Palette: mid-tone squares (`Rgb(0xB5,0x88,0x63)` / `Rgb(0x7A,0x56,0x34)` when `COLORTERM` is
+  `truecolor`/`24bit`, else `Indexed(137)` / `Indexed(94)`); pieces pure white/black
+  (`Rgb(255,255,255)`/`Rgb(0,0,0)` or `Indexed(231)`/`Indexed(16)`), never ANSI white/black.
+- Highlights: last move (tint), selected piece, legal targets (dot), keyboard cursor (outline), king in
+  check (red).
+- Glyph sets: Solid (default: ♚♛♜♝♞♟ for both sides, colour carries the side; the pawn is written as
+  `U+265F U+FE0E`; U+FE0F is never emitted), Outline, Ascii (`Piece::to_fen_char`). `g` cycles them;
+  `--glyphs solid|outline|ascii` and `RCHESS_GLYPHS` set the start; `NO_COLOR` switches to Outline.
+  A test asserts every glyph and filler is one cell wide.
+- `f` flips; a game as Black against Jev starts flipped.
 
-- Mouse: click a piece, then click a target square.
-- Keyboard: arrow keys move a cursor, Enter selects/confirms, Esc cancels.
-- Command box (focus with `/` or `:`): UCI (`e2e4`) or SAN (`Nf3`) moves, and commands
-  `:undo`, `:flip`, `:new`, `:fen <FEN>`, `:savefen <path>`, `:savepgn <path>`, `:resign`,
-  `:quit`, `:help`.
-- Hotkeys: `u` undo, `f` flip, `n` new game, `q` quit.
-- Undo against Jev reverts to the human's previous turn (two plies). Undo is disabled while a
-  computer move is in flight.
+### 6.4 Input
 
-### 6.4 Concurrency
+- Focus stack: dialog > command box > board; each event goes to the topmost focus only. Key events
+  count only when `kind == Press`.
+- Mouse: click a piece then a target, or drag and drop; the wheel scrolls the move list; menus and
+  dialogs are clickable. Hit-testing uses the rectangles saved during the last draw.
+- Keyboard: arrows move a cursor; Enter selects/moves; Esc cancels. Hotkeys (board focus only):
+  `u` undo, `f` flip, `n` new, `g` glyphs, `?` help, `q` or Ctrl+C quit (asks for confirmation while a
+  game is in progress); Ctrl+S saves PGN from the board or the command box.
+- Alt chords: Esc typed quickly before a key arrives as Alt+key. Outside text fields (board, menu,
+  yes/no dialogs, game-over overlay) it is handled as Esc followed by the key; while typing (the
+  command box, the FEN and save-path dialogs) Alt chords are ignored, so readline habits (Alt+B,
+  Alt+F, ...) neither change the text nor reach the board.
+- Command box (`/` or `:`): single line with ←/→/Home/End/Backspace/Delete; bracketed paste with
+  control characters stripped; a newline in pasted text submits. Commands: `:undo`, `:flip`, `:new`,
+  `:fen <FEN>`, `:savefen <path>`, `:savepgn <path>`, `:resign`, `:glyphs`, `:help`, `:quit`. No move
+  or command starts with a space, so space in an empty command box does what it does on the board:
+  it retries a failed engine, and in Jev vs Jev pauses or resumes; after any text it is a space.
+- Move text: strict `parse_san`, then UCI (case-insensitive), then loose SAN (case-insensitive; `x`,
+  `+`, `#`, `=` optional). A move is played only when exactly one legal move matches; otherwise the
+  status panel shows "ambiguous: Bc3, bxc3" or "not a legal move: <text>" and the text stays in the
+  box for editing. Echoed input (a move, an unknown command or argument, a pasted FEN) is cut to its
+  first 24 characters plus "…", so a pasted FEN shows only its start. FEN errors show only core's
+  reason (`invalid FEN: <reason>`), never the FEN text core appends to it.
+- Undo against Jev returns to the human's previous turn (two plies, or one if Jev's reply has not
+  arrived). Undo, new game and menu stay available while Jev is thinking; the late reply is discarded.
+- Saving: `~` expanded, `.pgn`/`.fen` appended when missing, an existing file triggers an overwrite
+  prompt, written through a temp file and rename. PGN gets the Seven Tag Roster with a real Date and
+  White/Black set to "You", "Jev" or "Local search", and move text wrapped at 80 columns.
 
-- Main thread runs the event loop, polling `crossterm` events on a 50 ms tick, and redraws.
-- A computer turn hands the worker a clone of the `Game` (the engine needs the move history for
-  repetition detection and recent moves); the result returns over
-  `std::sync::mpsc`. Each request carries a generation counter; results whose generation no
-  longer matches (after undo or new game) are discarded.
-- The UI thread never blocks on the network.
-- A panic hook restores the terminal (leave raw mode and alternate screen) before printing.
+### 6.5 Concurrency
 
-### 6.5 Verification
+- The main loop polls terminal events with a 50 ms timeout, drains engine replies, and redraws on
+  state change or tick. The app sees only `AppEvent`s.
+- One `Arc<ComputerPlayer<JevClient>>` is built from `EngineConfig::from_env()`. Each computer turn
+  spawns a thread named "engine" with `(generation, position hash, game.clone())` and runs
+  `choose_move` inside `catch_unwind`. After a panic the same thread runs the local search and replies
+  with its best move, noted "engine error — local search"; the UI never calls `analyse` (a search can
+  take seconds and must neither block nor crash the UI). Only if the local search panics too is the
+  reply a failure: the UI stops asking and says so until space (on the board or in an empty command
+  box) retries.
+- At most two requests are out at once (`MAX_IN_FLIGHT = 2`: the live one plus one discarded one still
+  running). Threads cannot be cancelled, so undo, new game or menu while the computer thinks leave the
+  old request running; without the cap a held key would start a burst of paid Jev calls (or CPU-bound
+  searches). A request over the cap waits for an old one to answer, and the status panel says so.
+- A reply is applied only when its generation and position hash both match the current game (a legal
+  but stale reply must not be played). `None` means the game is over.
+- While the engine thinks, the status panel shows a spinner with elapsed seconds; the Jev panel shows
+  the last `ComputerMove`'s source, top 3 with probabilities, confidence, model, latency and note.
+- Jev vs Jev requests the next move after the step delay unless paused; the game ending stops it.
 
-- `App` logic tested headlessly by feeding input events and asserting state.
-- Render snapshot tests with ratatui `TestBackend` and `insta`.
+### 6.6 Terminal safety
+
+- Setup: `ratatui::try_init`, then a click-and-drag-only mouse capture (`?1000h ?1002h ?1006h`; no
+  `?1003h` motion reporting) and bracketed paste.
+- A guard always disables mouse capture and bracketed paste, calls `ratatui::try_restore` and shows
+  the cursor, ignoring every error: on normal exit, on error return, and from the panic hook. Nothing on
+  the restore path may print: on a hung-up tty `eprintln!` panics, and `ratatui::restore`, ratatui's
+  panic hook and `Terminal`'s `Drop` all print their errors, which turns a closed terminal into an
+  abort. So the `Terminal` is never dropped.
+- The panic hook replaces ratatui's and is thread-aware: on "main" it restores, then calls the hook
+  that was in place before `ratatui::try_init`; a panic on any other thread leaves the terminal alone
+  (the engine thread's panic is caught by `catch_unwind`).
+- `signal-hook` flags for SIGINT, SIGTERM and SIGHUP are checked every tick, so the app exits through
+  the guard, then ends by that signal. If the UI does not react within 1 s (crossterm keeps polling a
+  hung-up tty), the signal thread restores and ends the process itself. When the UI loop instead ends
+  with an I/O error, it waits up to 100 ms (`SIGNAL_GRACE`) after the restore for a quit signal: a tty
+  that hangs up fails the next write at about the moment its SIGHUP arrives, and the process should
+  end by that signal, not by the error.
+- Logging is never configured to TRACE for `ureq` (it would print the API key).
+
+### 6.7 Verification
+
+- Headless, offline tests only: engines use a mock `MoveChooser` or `ComputerPlayer::new(None, ..)`,
+  never `from_env`.
+- App logic: scripted `AppEvent` sequences for menu flows, click and drag moves, the promotion
+  picker, undo while thinking, stale-reply discard, commands, dialogs and the glyph toggle.
+- Pure functions: `square_rect`/`square_at` round trips (flipped too), lenient move parsing including
+  ambiguity, PGN wrapping and headers, path handling, glyph widths.
+- Render snapshots with `insta` and `TestBackend` at 80×24, 120×40 and a too-small size; colours
+  checked with buffer debug snapshots; latency, tokens, model and confidence blanked.
+- `main.rs` does only terminal setup. The last plan step is a manual smoke test in a real terminal by
+  the user (the agent cannot drive a TUI).
 
 ## 7. Delivery Plan
 
@@ -438,7 +559,8 @@ Sub-projects run sequentially; each is merge-ready before the next starts.
 1. `core` — done when the perft suite passes and the benchmark target is met.
 2. `engine` — done when the offline tests pass, the ignored live test passes once, and the
    evaluation harness has been run once with its summary recorded in `HANDOFF.md`.
-3. `tui` — done when all three game modes are playable end to end.
+3. `tui` — done when all three game modes are playable end to end, the headless tests and snapshots
+   pass, and the user has smoke-tested `cargo run` in a real terminal.
 4. Cleanup — delete `src/pieces/`, `src/board.rs`, `src/ai.rs` and the old `Game`; remove
    `drawille`, `mockall` and the `[env]` key; update `CLAUDE.md`; extend CI with
    `cargo fmt --check` and `cargo clippy -- -D warnings`.

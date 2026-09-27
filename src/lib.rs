@@ -8,6 +8,7 @@ pub mod board;
 pub mod core;
 pub mod engine;
 pub mod pieces;
+pub mod tui;
 
 #[derive(Debug)]
 pub struct Game {

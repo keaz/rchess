@@ -1,0 +1,24 @@
+---
+source: src/tui/panels.rs
+expression: h.terminal.backend()
+---
+"                                                            "
+"┌ rchess ──────────────────────────────────────────────────┐"
+"│  New game                                                │"
+"│                                                          │"
+"│    1. Human vs Human                                     │"
+"│    2. Human vs Jev: play White                           │"
+"┌ Load FEN ────────────────────────────────────────────────┐"
+"│ Paste or type a FEN:                                     │"
+"│ > hello                                                  │"
+"│                                                          │"
+"│ invalid FEN: expected 4 to 6 fields                      │"
+"│                                                          │"
+"│                   [ Load ]  [ Cancel ]                   │"
+"└──────────────────────────────────────────────────────────┘"
+"│  Jev ready (jev-test)                                    │"
+"│                                                          │"
+"│  arrows/jk choose · Enter/1-7 start · q quit             │"
+"└──────────────────────────────────────────────────────────┘"
+"                                                            "
+"                                                            "

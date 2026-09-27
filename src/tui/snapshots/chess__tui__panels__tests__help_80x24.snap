@@ -1,0 +1,28 @@
+---
+source: src/tui/panels.rs
+expression: h.terminal.backend()
+---
+"┌ Board ────────────────────────────────────┐┌ Status ───────── Human vs Human ┐"
+"│                                           ││ White to move                   │"
+"│ 8  ♜    ♞    ♝    ♛    ♚    ♝    ♞    ♜   ││                                 │"
+"│                                           ││                                 │"
+"│ 7  ♟︎    ┌ Help ────────────────────────────────────────────────────┐         │"
+"│         │ Mouse     click a piece, then a square, or drag it there │─────────┤"
+"│ 6       │ Arrows    move the cursor; Enter picks up and puts down  │         │"
+"│         │ Esc       drop the piece, or leave the command box       │         │"
+"│ 5       │ /         type a move: e4, Nf3, e2e4, O-O, e8=Q          │         │"
+"│         │ :         type a command:                                │         │"
+"│ 4       │             :undo :flip :new :resign :glyphs :help :quit │         │"
+"│         │             :fen <FEN>  :savefen <path>  :savepgn <path> │         │"
+"│ 3       │ u  f  n   undo, flip the board, new game                 │         │"
+"│         │ g  m  ?   glyph set, menu, this help                     │         │"
+"│ 2  ♟︎    │ Ctrl+S    save the game as PGN                           │         │"
+"│         │ q         quit (Ctrl+C works everywhere)                 │         │"
+"│ 1  ♜    │ Space     pause watching, or retry a failed engine       │         │"
+"│         │ +  -      watching: slower, faster                       │         │"
+"│    a    └───────────────────────────────────── Esc or click closes ┘         │"
+"│                                           ││                                 │"
+"└───────────────────────────────────────────┘├ Captured ───────────────────────┤"
+"┌ Command ──────────────────────────────────┐│ White                           │"
+"│ / move  : command  ? help                 ││ Black                           │"
+"└───────────────────────────────────────────┘└─────────────────────────────────┘"
