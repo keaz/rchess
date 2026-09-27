@@ -705,10 +705,12 @@ what is sent to Jev. Sections 6.x still hold except where this section changes t
   keyed by (piece, background RGB, pixel width, pixel height); a size change clears the cache. The
   cache holds the ratatui-image protocol object built for that composite, so a piece that moves to a
   square of the same colour reuses it. Legal-target dots on empty squares, the keyboard cursor and
-  the labels are text as in 6.3; nothing is drawn on top of an image. When the session drew Kitty
-  pictures, every restore path writes Kitty's delete-all command (`ESC _ G a=d,d=A ESC \`, tmux-wrapped
-  when needed) before leaving the alternate screen, so the pictures do not stay in the terminal's
-  image memory.
+  the labels are text as in 6.3; nothing is drawn on top of an image. Kitty pictures are sent as
+  virtual placements (unicode placeholders), which Kitty deletes only by image id, so with the Kitty
+  protocol the TUI builds each picture with an id it chooses (`ratatui_image::protocol::kitty::Kitty::new`),
+  remembers every id it sent, and every restore path writes one delete-by-id command per id
+  (`ESC _ G a=d,d=I,i=<id> ESC \`, tmux-wrapped when needed) before leaving the alternate screen, so
+  the pictures do not stay in the terminal's image memory.
 - Indexed palettes (no truecolor) composite onto the RGB value of the indexed colour's xterm
   default. Colours used for compositing come from the same `Palette` as the text rendering.
 - Tests: snapshots keep using text styles; unit tests cover square-size maths, the composite (pixel
