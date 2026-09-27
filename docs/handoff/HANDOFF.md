@@ -5,9 +5,9 @@ Read this first. Follow the protocol in section 8 of
 
 ## Current
 Sub-project: cleanup (not started) | Plan: to be written from spec section 7 step 4
-Branch: feat/tui (complete after the user's manual smoke test; ready for user to merge)
+Branch: main (feat/tui merged locally at 575c3f6; not pushed — main is ahead of origin/main)
 Last completed task: tui final-review fix wave (A1–A4, B1–B10) — tui sub-project DONE pending manual smoke test
-Next task: user runs `cargo run` for the manual smoke test below and merges feat/tui; then plan the cleanup sub-project
+Next task: plan the cleanup sub-project (spec section 7 step 4); the manual TUI smoke test below is still worth running once
 State: green (except 3 pre-existing old-code test failures)
 
 ## Verify before continuing
@@ -139,6 +139,7 @@ Run `cargo run` in a real terminal (Ghostty, Kitty, WezTerm or Alacritty) and ch
 - None.
 
 ## Log (newest first)
+- 2026-09-27 feat/tui merged into main locally (575c3f6); merged result verified: tui:: 293 passed, whole crate only the 3 known old-code failures, pty smoke green
 - 2026-09-27 tui final-review fix wave: game-over overlay focus, NO_COLOR marks, fitted status messages, turn-only message clearing, stdin check, move-list columns, watchdog raw mode, smoke-test target dir
 - 2026-09-27 tui sub-project complete; pty smoke test green; awaiting manual smoke test
 - 2026-09-27 tui task 6 fix round 1: stale error message no longer survives an engine reply
