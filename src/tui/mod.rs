@@ -547,6 +547,8 @@ mod tests {
         result: io::Result<()>,
         draws: usize,
         unused_steps: usize,
+        /// [`App::in_flight`] at every draw, so before every batch.
+        in_flight: Vec<usize>,
     }
 
     /// Runs [`run_loop`] on an 80×24 `TestBackend`, serving `steps` as batches. Running
@@ -556,11 +558,13 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
         let mut steps = VecDeque::from(steps);
         let mut draws = 0;
+        let mut in_flight = Vec::new();
         let result = run_loop(
             app,
             quit,
             |app| {
                 draws += 1;
+                in_flight.push(app.in_flight());
                 terminal
                     .draw(|frame| app.render(frame, Instant::now()))
                     .map(drop)
@@ -587,6 +591,7 @@ mod tests {
             result,
             draws,
             unused_steps: steps.len(),
+            in_flight,
         }
     }
 
@@ -861,6 +866,73 @@ mod tests {
         );
         run.result.expect("loop ends cleanly");
         assert_eq!(app.game().moves().len(), 1);
+        assert_eq!(
+            run.in_flight,
+            [0, 1, 0],
+            "counted while outstanding, released by the answer"
+        );
         assert_eq!(app.in_flight(), 0);
+    }
+
+    /// An engine that answers only once released, like a slow Jev call.
+    struct BlockedEngine {
+        release: std::sync::Mutex<Receiver<()>>,
+        inner: Arc<dyn Engine>,
+    }
+
+    impl Engine for BlockedEngine {
+        fn choose(&self, game: &Game) -> Option<ComputerMove> {
+            // A closed channel releases too.
+            let _ = self.release.lock().expect("release lock").recv();
+            self.inner.choose(game)
+        }
+
+        fn status(&self) -> String {
+            self.inner.status()
+        }
+
+        fn uses_jev(&self) -> bool {
+            self.inner.uses_jev()
+        }
+
+        fn warnings(&self) -> Vec<String> {
+            self.inner.warnings()
+        }
+    }
+
+    #[test]
+    fn quitting_does_not_wait_for_a_slow_engine() {
+        // Engine threads cannot be cancelled (spec 6.5), so quitting must not join them.
+        let (release, released) = mpsc::channel();
+        // Should the loop wait anyway, the engine is let go after 10 s and the timing
+        // assertion below fails instead of the test hanging.
+        let late = release.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(10));
+            let _ = late.send(());
+        });
+        let engine = Arc::new(BlockedEngine {
+            release: std::sync::Mutex::new(released),
+            inner: local_engine(),
+        });
+        let mut app = App::new(engine, GlyphSet::Solid, true, Vec::new()).with_home(None);
+        let quit = AtomicI32::new(0);
+        let started = Instant::now();
+        let run = drive(
+            &mut app,
+            &quit,
+            vec![
+                Step::Events(chars("3")),
+                Step::Events(chars("q")),
+                Step::Events(chars("y")),
+            ],
+        );
+        let took = started.elapsed();
+        run.result.expect("loop ends cleanly");
+        assert!(app.should_quit());
+        assert!(app.is_thinking(), "the engine never answered");
+        assert_eq!(app.in_flight(), 1);
+        assert!(took < Duration::from_secs(5), "quit took {took:?}");
+        let _ = release.send(());
     }
 }
