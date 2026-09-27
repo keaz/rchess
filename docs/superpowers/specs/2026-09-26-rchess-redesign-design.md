@@ -661,9 +661,15 @@ what is sent to Jev. Sections 6.x still hold except where this section changes t
   Image; `--glyphs image|solid|outline|ascii` and `RCHESS_GLYPHS` accept `image`. `NO_COLOR` still
   starts in Outline (the colour-independent marks of 6.3 apply to text styles only).
 - Graphics detection: at start-up, after raw mode and the alternate screen are entered and before
-  mouse capture, bracketed paste and the event loop start, the TUI builds a
-  `ratatui_image::picker::Picker` with `Picker::from_query_stdio_with_options` and a 1 s timeout.
-  The picker chooses Kitty (Ghostty, Kitty), iTerm2 (WezTerm, iTerm2), Sixel or Halfblocks. The query
+  mouse capture, bracketed paste and the event loop start, the TUI writes the capability query from
+  `ratatui_image::picker::cap_parser::Parser::query` and reads the answers itself on the UI thread
+  with `poll` and a 1 s deadline, feeding `Parser::push` until the status report arrives.
+  (`Picker::from_query_stdio` is not used: when a terminal never answers, its reader thread stays
+  blocked on stdin after the timeout and swallows keystrokes.) The result picks Kitty (Ghostty,
+  Kitty), iTerm2 (WezTerm, iTerm2, from the environment as ratatui-image does), Sixel or
+  Halfblocks, and the font size from the cell-size answer, else from
+  `crossterm::terminal::window_size()` pixels, else 10×20; the `Picker` is then built for that
+  protocol and font size. The query
   is skipped (text styles only, `Image` removed from the `g` cycle) when `--glyphs`/`RCHESS_GLYPHS`
   names a text style, when `NO_COLOR` is set, or when `RCHESS_IMAGES=off`. A query error or timeout
   never stops the program: it falls back to Halfblocks and adds a menu warning.
