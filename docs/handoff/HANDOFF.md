@@ -4,10 +4,10 @@ Read this first. Follow the protocol in section 8 of
 `docs/superpowers/specs/2026-09-26-rchess-redesign-design.md`.
 
 ## Current
-Sub-project: cleanup (not started) | Plan: to be written from spec section 7 step 4
-Branch: main (feat/tui merged locally at 575c3f6; not pushed — main is ahead of origin/main)
-Last completed task: tui final-review fix wave (A1–A4, B1–B10) — tui sub-project DONE pending manual smoke test
-Next task: plan the cleanup sub-project (spec section 7 step 4); the manual TUI smoke test below is still worth running once
+Sub-project: tui-polish (spec section 9) | Plan: to be written (docs/superpowers/plans/2026-09-27-tui-polish.md)
+Branch: feat/tui-polish (spec section 9 committed; no code yet). main has feat/tui merged locally at 575c3f6, not pushed.
+Last completed task: tui-polish design approved by the user and written as spec section 9
+Next task: write the tui-polish plan; after tui-polish, the cleanup sub-project (spec section 7 step 5)
 State: green (except 3 pre-existing old-code test failures)
 
 ## Verify before continuing
@@ -139,6 +139,7 @@ Run `cargo run` in a real terminal (Ghostty, Kitty, WezTerm or Alacritty) and ch
 - None.
 
 ## Log (newest first)
+- 2026-09-27 user smoke-tested the TUI: wants it to fill the terminal, bigger and clearer pieces, and a Jev debug view; tui-polish designed (spec section 9: full-screen layout, Cburnett piece images via ratatui-image, --debug exchange view and JSON-lines log)
 - 2026-09-27 feat/tui merged into main locally (575c3f6); merged result verified: tui:: 293 passed, whole crate only the 3 known old-code failures, pty smoke green
 - 2026-09-27 tui final-review fix wave: game-over overlay focus, NO_COLOR marks, fitted status messages, turn-only message clearing, stdin check, move-list columns, watchdog raw mode, smoke-test target dir
 - 2026-09-27 tui sub-project complete; pty smoke test green; awaiting manual smoke test
