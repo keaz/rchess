@@ -5,9 +5,9 @@ Read this first. Follow the protocol in section 8 of
 
 ## Current
 Sub-project: tui-polish (spec section 9) | Plan: to be written (docs/superpowers/plans/2026-09-27-tui-polish.md)
-Branch: feat/tui-polish (spec section 9 committed; no code yet). main has feat/tui merged locally at 575c3f6, not pushed.
+Branch: feat/tui-polish (spec section 9 committed, amended for the graphics query and rustix; no code yet). main has feat/tui merged locally at 575c3f6, not pushed.
 Last completed task: tui-polish design approved by the user and written as spec section 9
-Next task: write the tui-polish plan; after tui-polish, the cleanup sub-project (spec section 7 step 5)
+Next task: write the tui-polish plan (in progress: a prototype is being built in the git-ignored .superpowers/sdd/2026-09-27-tui-polish/proto clone, then converted to plan patches and replayed); after tui-polish, the cleanup sub-project (spec section 7 step 5)
 State: green (except 3 pre-existing old-code test failures)
 
 ## Verify before continuing
