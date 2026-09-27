@@ -268,6 +268,14 @@ mod tests {
     }
 
     #[test]
+    fn a_capture_that_releases_a_pin_is_not_a_threat() {
+        // Qxc3 would leave the e-file and free the pinned bishop on e5 to take the queen.
+        let game = Game::from_fen("4k3/8/8/4b3/8/2p5/8/4QK2 b - - 0 1").unwrap();
+        let threats = describe(&game).threats_against_us;
+        assert!(!threats.iter().any(|t| t.contains("c3")), "{threats:?}");
+    }
+
+    #[test]
     fn check_and_middlegame() {
         let game =
             Game::from_fen("rnbqkbnr/ppp2ppp/8/3pp3/4P3/5Q2/PPPP1PPP/RNB1KBNR b KQkq - 0 12")

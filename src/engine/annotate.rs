@@ -168,6 +168,7 @@ fn attacks(kind: PieceKind, color: Color, sq: Square, occupied: Bitboard) -> Bit
 /// The most valuable enemy piece (not the king) the moved piece attacks from its new
 /// square but did not attack before, when it is worth more than the mover or undefended.
 /// A king counts as worth more than anything, so it only "attacks" undefended pieces.
+/// A defender pinned to its king off the line to the attacked piece does not count.
 fn new_attack(pos: &Position, child: &Position, mv: Move) -> Option<String> {
     let us = pos.side_to_move();
     let before_kind = pos.piece_at(mv.from())?.kind;
@@ -178,7 +179,8 @@ fn new_attack(pos: &Position, child: &Position, mv: Move) -> Option<String> {
     let mut best: Option<(i32, Square, PieceKind)> = None;
     for sq in after & !before & enemies {
         let kind = child.piece_at(sq)?.kind;
-        let defended = (child.attackers_to(sq, child.occupied()) & child.occupied_by(!us)).any();
+        // A defender pinned to its king off the line to `sq` does not defend it.
+        let defended = capturers(child, sq, child.occupied(), !us).any();
         let value = piece_value(kind);
         if (value > exchange_value(mover) || !defended) && best.is_none_or(|(v, _, _)| value > v) {
             best = Some((value, sq, kind));
@@ -351,6 +353,30 @@ mod tests {
             find(&pos, &list, "f3e5").effect,
             "captures the pawn on e5, undefended"
         );
+    }
+
+    #[test]
+    fn a_capture_that_releases_a_pin_loses_the_capturer() {
+        // Qe1 pins Be5 to the king on e8; Qxc3 leaves the e-file and Bxc3 wins the queen.
+        let fen = "4k3/8/8/4b3/8/2p5/8/4QK2 w - - 0 1";
+        let (pos, list) = annotations(fen);
+        let effect = &find(&pos, &list, "e1c3").effect;
+        assert!(
+            effect.starts_with("captures the pawn on c3, loses material in the exchange"),
+            "{effect}"
+        );
+        // With Black to move the pawn on c3 is not really attacked, so c2 rescues nothing.
+        let (pos, list) = annotations(&fen.replace(" w ", " b "));
+        let effect = &find(&pos, &list, "c3c2").effect;
+        assert!(!effect.contains("to safety"), "{effect}");
+    }
+
+    #[test]
+    fn a_pinned_defender_does_not_defend_an_attacked_piece() {
+        // Re1 pins Be6 to the king on e8, so the bishop does not defend the knight
+        // on d5: Rd1 attacks it although the knight is worth less than the rook.
+        let (pos, list) = annotations("4k3/8/4b3/3n4/8/8/8/R3R2K w - - 0 1");
+        assert_eq!(find(&pos, &list, "a1d1").effect, "attacks the knight on d5");
     }
 
     #[test]

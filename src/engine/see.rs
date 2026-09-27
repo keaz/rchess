@@ -3,9 +3,12 @@
 //! and may stop whenever continuing would lose material.
 //!
 //! A piece absolutely pinned to its own king takes part only when the target square
-//! lies on the line through its king and itself. Pins are computed once, for the
-//! position passed in (before the first capture); a pin created or released during
-//! the exchange is not modelled.
+//! lies on the line through its king and itself. The first capturer is checked
+//! against the pins of the position before it moves. The recaptures are checked
+//! against the pins of the position after the first capture, so a pin that capture
+//! releases (the pinning piece itself captures and leaves the line) or creates (the
+//! capturer uncovers a line to the enemy king) is honoured. Pins created or released
+//! by later captures in the exchange are not modelled.
 
 use crate::core::{
     Bitboard, Color, Move, PieceKind, Position, Square, between, bishop_attacks, line, rook_attacks,
@@ -26,25 +29,100 @@ pub fn exchange_value(kind: PieceKind) -> i32 {
     }
 }
 
-/// Absolutely pinned pieces of each color, indexed by `Color::index`.
-type Pins = [Bitboard; 2];
-
-fn pins(pos: &Position) -> Pins {
-    [pinned(pos, Color::White), pinned(pos, Color::Black)]
+/// Absolutely pinned pieces and the king squares they are pinned to, both indexed
+/// by `Color::index`.
+struct Pins {
+    pinned: [Bitboard; 2],
+    kings: [Square; 2],
 }
 
-/// Pieces of `color` that are the only piece between their king and an enemy
+/// One side's pieces as the pin scan sees them.
+#[derive(Clone, Copy)]
+struct Side {
+    king: Square,
+    occupied: Bitboard,
+    /// Rooks and queens.
+    orthogonal: Bitboard,
+    /// Bishops and queens.
+    diagonal: Bitboard,
+}
+
+impl Side {
+    fn of(pos: &Position, color: Color) -> Side {
+        let queens = pos.pieces_of(color, PieceKind::Queen);
+        Side {
+            king: pos.king_square(color),
+            occupied: pos.occupied_by(color),
+            orthogonal: pos.pieces_of(color, PieceKind::Rook) | queens,
+            diagonal: pos.pieces_of(color, PieceKind::Bishop) | queens,
+        }
+    }
+}
+
+/// Pins of both colors in `pos` as it stands.
+fn pins(pos: &Position) -> Pins {
+    let sides = [Side::of(pos, Color::White), Side::of(pos, Color::Black)];
+    pins_of(&sides, pos.occupied())
+}
+
+/// Pins of both colors in the position that results when the piece on `from`
+/// captures on `to`, becoming `kind_after` (differs from its kind only for a
+/// promotion). `ep_victim` is the square of a pawn taken en passant.
+fn pins_after_capture(
+    pos: &Position,
+    from: Square,
+    to: Square,
+    kind_after: PieceKind,
+    ep_victim: Option<Square>,
+) -> Pins {
+    let mover = pos.piece_at(from).expect("capture source holds a piece");
+    let removed = to.bb() | ep_victim.map_or(Bitboard::EMPTY, Square::bb);
+    let mut sides = [Side::of(pos, Color::White), Side::of(pos, Color::Black)];
+
+    let theirs = &mut sides[(!mover.color).index()];
+    theirs.occupied &= !removed;
+    theirs.orthogonal &= !removed;
+    theirs.diagonal &= !removed;
+
+    let ours = &mut sides[mover.color.index()];
+    ours.occupied = (ours.occupied & !from.bb()) | to.bb();
+    ours.orthogonal &= !from.bb();
+    ours.diagonal &= !from.bb();
+    match kind_after {
+        PieceKind::King => ours.king = to,
+        PieceKind::Rook => ours.orthogonal |= to.bb(),
+        PieceKind::Bishop => ours.diagonal |= to.bb(),
+        PieceKind::Queen => {
+            ours.orthogonal |= to.bb();
+            ours.diagonal |= to.bb();
+        }
+        PieceKind::Pawn | PieceKind::Knight => {}
+    }
+
+    let occupied = sides[0].occupied | sides[1].occupied;
+    pins_of(&sides, occupied)
+}
+
+fn pins_of(sides: &[Side; 2], occupied: Bitboard) -> Pins {
+    Pins {
+        pinned: [
+            pinned(&sides[0], &sides[1], occupied),
+            pinned(&sides[1], &sides[0], occupied),
+        ],
+        kings: [sides[0].king, sides[1].king],
+    }
+}
+
+/// Pieces of `ours` that are the only piece between their king and an enemy
 /// rook, bishop or queen on the same line.
-fn pinned(pos: &Position, color: Color) -> Bitboard {
-    let king = pos.king_square(color);
-    let theirs = pos.occupied_by(!color);
-    let queens = pos.pieces_of(!color, PieceKind::Queen);
-    let snipers = (rook_attacks(king, theirs) & (pos.pieces_of(!color, PieceKind::Rook) | queens))
-        | (bishop_attacks(king, theirs) & (pos.pieces_of(!color, PieceKind::Bishop) | queens));
+fn pinned(ours: &Side, theirs: &Side, occupied: Bitboard) -> Bitboard {
+    let king = ours.king;
+    let snipers = (rook_attacks(king, theirs.occupied) & theirs.orthogonal)
+        | (bishop_attacks(king, theirs.occupied) & theirs.diagonal);
     let mut pinned = Bitboard::EMPTY;
     for sniper in snipers {
-        let blockers = between(king, sniper) & pos.occupied();
-        if blockers.count() == 1 && (blockers & pos.occupied_by(color)).any() {
+        let blockers = between(king, sniper) & occupied;
+        if blockers.count() == 1 && (blockers & ours.occupied).any() {
             pinned |= blockers;
         }
     }
@@ -61,9 +139,11 @@ pub fn see(pos: &Position, mv: Move) -> i32 {
         .expect("capture source holds a piece")
         .kind;
     let mut occupied = pos.occupied() ^ from.bb();
-    let captured = if mv.is_en_passant() {
-        let captured_sq = Square::from_file_rank(to.file(), from.rank()).expect("on board");
-        occupied ^= captured_sq.bb();
+    let ep_victim = mv
+        .is_en_passant()
+        .then(|| Square::from_file_rank(to.file(), from.rank()).expect("on board"));
+    let captured = if let Some(victim) = ep_victim {
+        occupied ^= victim.bb();
         piece_value(PieceKind::Pawn)
     } else {
         pos.piece_at(to).map_or(0, |piece| piece_value(piece.kind))
@@ -75,9 +155,10 @@ pub fn see(pos: &Position, mv: Move) -> i32 {
         ),
         None => (captured, exchange_value(mover)),
     };
+    let pins = pins_after_capture(pos, from, to, mv.promotion().unwrap_or(mover), ep_victim);
     swap(
         pos,
-        &pins(pos),
+        &pins,
         to,
         occupied,
         !pos.side_to_move(),
@@ -92,11 +173,13 @@ pub fn capture_gain(pos: &Position, sq: Square) -> i32 {
     let Some(target) = pos.piece_at(sq) else {
         return 0;
     };
-    let pins = pins(pos);
-    let attackers = pin_aware_capturers(pos, &pins, sq, pos.occupied(), !target.color);
+    // The first capturer must be free to move in the position as it stands; the
+    // recaptures are judged in the position after its capture.
+    let attackers = pin_aware_capturers(pos, &pins(pos), sq, pos.occupied(), !target.color);
     let Some((from, kind)) = least_valuable(pos, attackers) else {
         return 0;
     };
+    let pins = pins_after_capture(pos, from, sq, kind, None);
     let occupied = pos.occupied() ^ from.bb();
     let gain = swap(
         pos,
@@ -124,9 +207,9 @@ fn pin_aware_capturers(
     color: Color,
 ) -> Bitboard {
     let mut attackers = pos.attackers_to(target, occupied) & occupied & pos.occupied_by(color);
-    let pinned = attackers & pins[color.index()];
+    let pinned = attackers & pins.pinned[color.index()];
     if pinned.any() {
-        let king = pos.king_square(color);
+        let king = pins.kings[color.index()];
         for sq in pinned {
             if !line(king, sq).contains(target) {
                 attackers ^= sq.bb();
@@ -272,6 +355,28 @@ mod tests {
         let a2: Square = "a2".parse().unwrap();
         assert_eq!(capturers(&pos, e7, pos.occupied(), Color::White), e2.bb());
         assert!(capturers(&pos, a2, pos.occupied(), Color::White).is_empty());
+    }
+
+    /// The queen on e1 pins the bishop on e5 to the king on e8.
+    const PIN_RELEASED: &str = "4k3/8/8/4b3/8/2p5/8/4QK2 w - - 0 1";
+
+    #[test]
+    fn pin_released_by_the_first_capture() {
+        // Qxc3 leaves the e-file, so the bishop is free to take back: 100 - 900.
+        assert_eq!(see_of(PIN_RELEASED, "e1c3"), -800);
+    }
+
+    #[test]
+    fn capture_gain_sees_the_released_pin() {
+        let fen = PIN_RELEASED.replace(" w ", " b ");
+        assert_eq!(gain_on(&fen, "c3"), 0);
+    }
+
+    #[test]
+    fn pin_created_by_the_first_capture() {
+        // Nxd5 opens the a1-h8 diagonal: the knight on f6 is now pinned to the
+        // king on h8 by the bishop on a1 and cannot take back on d5.
+        assert_eq!(see_of("7k/8/5n2/3p4/8/2N5/8/B3K3 w - - 0 1", "c3d5"), 100);
     }
 
     #[test]
