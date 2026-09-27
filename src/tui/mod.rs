@@ -8,6 +8,8 @@
 
 pub mod board;
 pub mod glyphs;
+pub mod input;
+pub mod movetext;
 
 #[cfg(test)]
 mod test_support;
