@@ -540,6 +540,8 @@ pub struct App {
     uses_jev: bool,
     warnings: Vec<String>,
     palette: Palette,
+    /// The terminal shows no colour (`NO_COLOR`): the board marks highlights with text too.
+    no_color: bool,
     glyphs: GlyphSet,
     pick_side: fn() -> Side,
     today: fn() -> String,
@@ -612,6 +614,7 @@ impl App {
             uses_jev,
             warnings: all_warnings,
             palette: glyphs::palette(truecolor),
+            no_color: false,
             glyphs,
             pick_side: random_side,
             today,
@@ -643,6 +646,14 @@ impl App {
             too_small: false,
             quit: false,
         }
+    }
+
+    /// Says whether the terminal shows no colour ([`glyphs::no_color`]); the board then
+    /// marks the selection, capture targets, check and the last move without colour too.
+    #[must_use]
+    pub fn with_no_color(mut self, no_color: bool) -> App {
+        self.no_color = no_color;
+        self
     }
 
     /// Replaces the coin flip used by "Human vs Jev: random side" (tests pass a fixed side).
@@ -795,6 +806,11 @@ impl App {
     /// The colours in use.
     pub fn palette(&self) -> &Palette {
         &self.palette
+    }
+
+    /// True when the terminal shows no colour (see [`with_no_color`](Self::with_no_color)).
+    pub fn no_color(&self) -> bool {
+        self.no_color
     }
 
     /// The command box text.
@@ -2181,6 +2197,8 @@ mod tests {
     use std::fs;
     use std::sync::mpsc;
 
+    use ratatui::style::Modifier;
+
     use super::*;
     use crate::core::{Position as ChessPosition, START_FEN};
     use crate::engine::{MoveSource, analyse};
@@ -2446,6 +2464,21 @@ mod tests {
         h.click_square(sq("b1"));
         h.click(0, 0);
         assert_eq!(h.app.selected(), None, "outside the grid");
+    }
+
+    #[test]
+    fn without_colour_the_board_marks_the_selection_with_attributes() {
+        let mut h = Harness::build(FakeEngine::local(), (80, 24), Vec::new(), |app| {
+            app.with_no_color(true)
+        });
+        h.char('1');
+        h.click_square(sq("g1"));
+        let (column, row) = h.square_cell(sq("g1"));
+        assert!(
+            h.buffer()[(column, row)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
     }
 
     #[test]

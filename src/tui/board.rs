@@ -11,7 +11,7 @@
 use ratatui::{
     buffer::{Buffer, Cell},
     layout::{Position as CellPosition, Rect},
-    style::Color,
+    style::{Color, Modifier},
     widgets::Widget,
 };
 
@@ -122,6 +122,11 @@ fn glyph_cell(rect: Rect) -> CellPosition {
 /// then last move, then the plain square colour. Selection wins over check so
 /// that picking up a king in check still shows it picked up (the Status panel
 /// says "Check" too). The cursor outline is drawn on top of all of them.
+///
+/// Without colour ([`BoardView::no_color`]) the tints show nothing, so the
+/// selected square is reversed, the last move's squares are underlined, a
+/// capture target gets `(` `)` and a king in check `+` `+` beside its glyph
+/// (the cursor's `[` `]` still win there).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Highlights {
     /// Origin and destination of the last move played (tinted).
@@ -152,6 +157,9 @@ pub struct BoardView<'a> {
     pub palette: &'a Palette,
     /// Marks to draw.
     pub highlights: &'a Highlights,
+    /// The terminal shows no colour (`NO_COLOR`, see [`glyphs::no_color`]): mark
+    /// the highlights with text and attributes as well as tints.
+    pub no_color: bool,
 }
 
 impl Widget for BoardView<'_> {
@@ -188,11 +196,16 @@ impl BoardView<'_> {
         let is_target = self.highlights.targets.contains(&sq);
         let is_capture = is_target && (piece.is_some() || self.is_en_passant_target(sq));
         let bg = self.background(sq, is_capture);
+        let modifier = self.modifier(sq);
         for pos in rect.positions() {
             if let Some(cell) = cell_in(buf, clip, pos) {
                 cell.reset();
                 cell.set_bg(bg);
+                cell.modifier = modifier;
             }
+        }
+        if let Some((left, right)) = self.side_marks(sq, is_capture) {
+            self.render_side_marks(rect, left, right, clip, buf);
         }
         if let Some(cell) = cell_in(buf, clip, glyph_cell(rect)) {
             if let Some(piece) = piece {
@@ -237,6 +250,55 @@ impl BoardView<'_> {
             p.light
         } else {
             p.dark
+        }
+    }
+
+    /// Without colour: reversed for the selected square, underlined for the
+    /// last move's squares. With colour the tints are enough.
+    fn modifier(&self, sq: Square) -> Modifier {
+        let h = self.highlights;
+        if !self.no_color {
+            Modifier::empty()
+        } else if h.selected == Some(sq) {
+            Modifier::REVERSED
+        } else if h.last_move.is_some_and(|(from, to)| sq == from || sq == to) {
+            Modifier::UNDERLINED
+        } else {
+            Modifier::empty()
+        }
+    }
+
+    /// Without colour: the marks beside the glyph of a capture target or a king
+    /// in check (a king is never a capture target).
+    fn side_marks(&self, sq: Square, capture_target: bool) -> Option<(&'static str, &'static str)> {
+        if !self.no_color {
+            None
+        } else if capture_target {
+            Some((glyphs::CAPTURE_LEFT, glyphs::CAPTURE_RIGHT))
+        } else if self.highlights.check == Some(sq) {
+            Some((glyphs::CHECK_MARK, glyphs::CHECK_MARK))
+        } else {
+            None
+        }
+    }
+
+    /// Writes `left` and `right` in the square's outer columns on the glyph row.
+    fn render_side_marks(
+        &self,
+        rect: Rect,
+        left: &'static str,
+        right: &'static str,
+        clip: Rect,
+        buf: &mut Buffer,
+    ) {
+        if rect.width < 3 {
+            return;
+        }
+        let y = glyph_cell(rect).y;
+        for (x, mark) in [(rect.left(), left), (rect.right() - 1, right)] {
+            if let Some(cell) = cell_in(buf, clip, CellPosition::new(x, y)) {
+                cell.set_symbol(mark).set_fg(self.palette.black_piece);
+            }
         }
     }
 
@@ -298,7 +360,7 @@ fn cell_in(buf: &mut Buffer, clip: Rect, pos: CellPosition) -> Option<&mut Cell>
 
 #[cfg(test)]
 mod tests {
-    use ratatui::{Terminal, backend::TestBackend, text::Span};
+    use ratatui::{Terminal, backend::TestBackend, style::Modifier, text::Span};
 
     use super::*;
     use crate::tui::glyphs::{SOLID_PAWN, palette};
@@ -320,6 +382,21 @@ mod tests {
         flipped: bool,
         highlights: &Highlights,
     ) -> (Terminal<TestBackend>, BoardGeometry) {
+        draw_marked(
+            width, height, position, glyph_set, flipped, highlights, false,
+        )
+    }
+
+    /// [`draw`] with [`BoardView::no_color`] set as given.
+    fn draw_marked(
+        width: u16,
+        height: u16,
+        position: &ChessPosition,
+        glyph_set: GlyphSet,
+        flipped: bool,
+        highlights: &Highlights,
+        no_color: bool,
+    ) -> (Terminal<TestBackend>, BoardGeometry) {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test backend");
         let pal = palette(true);
         let mut saved = None;
@@ -335,6 +412,7 @@ mod tests {
                         glyphs: glyph_set,
                         palette: &pal,
                         highlights,
+                        no_color,
                     },
                     area,
                 );
@@ -707,6 +785,82 @@ mod tests {
     }
 
     #[test]
+    fn without_colour_the_highlights_are_marked_with_text_and_attributes() {
+        // NO_COLOR: the terminal drops every colour, so tints alone would show nothing.
+        // Fool's mate with the checking queen as the last move; White's king picked up.
+        let position = ChessPosition::from_fen(
+            "rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 1 3",
+        )
+        .expect("valid FEN");
+        let highlights = Highlights {
+            last_move: Some((sq("d8"), sq("h4"))),
+            selected: Some(sq("g1")),
+            targets: vec![sq("h3"), sq("h4")],
+            cursor: None,
+            check: Some(sq("e1")),
+        };
+        let (terminal, g) = draw_marked(
+            31,
+            11,
+            &position,
+            GlyphSet::Outline,
+            false,
+            &highlights,
+            true,
+        );
+        let buf = terminal.backend().buffer();
+        let row = |name: &str| -> String {
+            let rect = square_rect(&g, sq(name));
+            (0..rect.width)
+                .map(|dx| buf[(rect.x + dx, rect.y)].symbol())
+                .collect()
+        };
+        let all = |name: &str, modifier: Modifier| {
+            cells(buf, square_rect(&g, sq(name)))
+                .iter()
+                .all(|c| c.modifier.contains(modifier))
+        };
+
+        // The selected piece is drawn reversed.
+        assert!(all("g1", Modifier::REVERSED));
+        assert_eq!(row("g1"), " \u{2658} ");
+        // A capture target is bracketed in round brackets, not the cursor's square ones.
+        assert_eq!(row("h4"), "(\u{265B})");
+        // A quiet target keeps its dot.
+        assert_eq!(row("h3"), " . ");
+        // Both ends of the last move are underlined.
+        assert!(all("d8", Modifier::UNDERLINED));
+        assert!(all("h4", Modifier::UNDERLINED));
+        // The king in check is flanked by `+`, as in SAN.
+        assert_eq!(row("e1"), "+\u{2654}+");
+        // Nothing else is marked.
+        assert_eq!(row("a2"), " \u{2659} ");
+        assert!(
+            cells(buf, square_rect(&g, sq("a2")))
+                .iter()
+                .all(|c| c.modifier.is_empty())
+        );
+
+        // With colours the marks are the tints alone, as before.
+        let (terminal, g) = draw_marked(
+            31,
+            11,
+            &position,
+            GlyphSet::Outline,
+            false,
+            &highlights,
+            false,
+        );
+        let buf = terminal.backend().buffer();
+        let rect = square_rect(&g, sq("h4"));
+        let symbols: String = (0..3)
+            .map(|dx| buf[(rect.x + dx, rect.y)].symbol())
+            .collect();
+        assert_eq!(symbols, " \u{265B} ");
+        assert!(buf.content().iter().all(|c| c.modifier.is_empty()));
+    }
+
+    #[test]
     fn an_en_passant_target_is_tinted_like_a_capture() {
         let pal = palette(true);
         // Black has just played d7-d5 beside White's e5 pawn.
@@ -782,6 +936,7 @@ mod tests {
             glyphs: GlyphSet::Solid,
             palette: &pal,
             highlights: &highlights,
+            no_color: false,
         };
         view.render(Rect::new(0, 0, 10, 5), &mut buf);
         assert_eq!(buf[(9, 1)].bg, pal.dark, "b8 is dark");

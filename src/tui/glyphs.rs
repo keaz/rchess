@@ -38,8 +38,25 @@ pub const CURSOR_LEFT: &str = "[";
 /// Right edge of the keyboard-cursor outline.
 pub const CURSOR_RIGHT: &str = "]";
 
+/// Left of a legal capture target's glyph when the terminal shows no colour.
+pub const CAPTURE_LEFT: &str = "(";
+
+/// Right of a legal capture target's glyph when the terminal shows no colour.
+pub const CAPTURE_RIGHT: &str = ")";
+
+/// Either side of a king in check when the terminal shows no colour.
+pub const CHECK_MARK: &str = "+";
+
 /// Every non-piece string the board widget writes into a square.
-pub const FILLERS: [&str; 4] = [BLANK, TARGET_MARK, CURSOR_LEFT, CURSOR_RIGHT];
+pub const FILLERS: [&str; 7] = [
+    BLANK,
+    TARGET_MARK,
+    CURSOR_LEFT,
+    CURSOR_RIGHT,
+    CAPTURE_LEFT,
+    CAPTURE_RIGHT,
+    CHECK_MARK,
+];
 
 /// Ends text cut short: a long Jev note, or echoed input (see [`shorten`]).
 pub const ELLIPSIS: &str = "…";
@@ -273,7 +290,7 @@ pub fn initial_glyphs(
         }
     }
     let set = chosen.unwrap_or_else(|| {
-        if get("NO_COLOR").is_some_and(|v| !v.is_empty()) {
+        if no_color(&get) {
             GlyphSet::Outline
         } else {
             GlyphSet::Solid
@@ -290,6 +307,15 @@ pub fn initial_glyphs(
         })
         .collect();
     (set, warnings)
+}
+
+/// True when `NO_COLOR` is set and non-empty (<https://no-color.org/>): the terminal
+/// then shows no colour at all, because crossterm drops every colour it would write under
+/// that same test. Attributes such as reversed and underlined still show.
+///
+/// `get` reads an environment variable; pass `|k| std::env::var(k).ok()`.
+pub fn no_color(get: impl Fn(&str) -> Option<String>) -> bool {
+    get("NO_COLOR").is_some_and(|value| !value.is_empty())
 }
 
 /// Cells `c` takes on screen by ratatui's measure: 1 for most characters, 2 for
@@ -606,6 +632,14 @@ mod tests {
             initial_glyphs(None, env(&[("NO_COLOR", "1"), (GLYPHS_ENV, "solid")])),
             (GlyphSet::Solid, vec![])
         );
+    }
+
+    #[test]
+    fn no_color_needs_a_non_empty_value() {
+        assert!(no_color(env(&[("NO_COLOR", "1")])));
+        assert!(no_color(env(&[("NO_COLOR", "0")])), "any value counts");
+        assert!(!no_color(env(&[("NO_COLOR", "")])));
+        assert!(!no_color(env(&[])));
     }
 
     #[test]

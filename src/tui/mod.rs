@@ -64,7 +64,8 @@ const USAGE: &str = concat!(
     "  JEV_MAX_OPTIONS    moves offered to Jev per turn, 1-255 (default 40)\n",
     "  JEV_FILTER_LOSING  keep losing moves off Jev's shortlist (default true)\n",
     "  RCHESS_GLYPHS      glyph set when --glyphs is not given\n",
-    "  NO_COLOR           start with outline glyphs unless a set is chosen\n",
+    "  NO_COLOR           no colours: start with outline glyphs unless a set is\n",
+    "                     chosen, and mark board highlights with text\n",
     "  COLORTERM          truecolor or 24bit selects 24-bit colours\n",
     "\n",
     "In the game press ? for help. Moves can be typed after / (e4, Nf3, e2e4).\n",
@@ -111,7 +112,8 @@ pub fn run(args: impl IntoIterator<Item = String>) -> io::Result<()> {
     if fault == Some(Fault::EnginePanic) {
         engine = Arc::new(PanickingEngine(engine));
     }
-    let mut app = App::new(engine, glyph_set, glyphs::detect_truecolor(env), warnings);
+    let mut app = App::new(engine, glyph_set, glyphs::detect_truecolor(env), warnings)
+        .with_no_color(glyphs::no_color(env));
 
     // Before `enter`, so a signal that arrives during setup still ends in a
     // clean restore instead of killing the process with the terminal in raw mode.

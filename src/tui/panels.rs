@@ -442,6 +442,7 @@ fn board_panel(frame: &mut Frame, area: Rect, app: &App) -> Option<BoardGeometry
             glyphs: app.glyphs(),
             palette: app.palette(),
             highlights: &highlights,
+            no_color: app.no_color(),
         },
         inner,
     );
