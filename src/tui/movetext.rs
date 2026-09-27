@@ -77,6 +77,12 @@ pub fn parse_move(pos: &ChessPosition, text: &str) -> Result<Move, MoveTextError
 }
 
 /// Steps 3 to 6 of [`parse_move`]: matching on normalised text.
+///
+/// The promotion-without-piece candidates (step 6) are always computed alongside the loose
+/// and piece-spelling matches (steps 4 and 5), never only when those found nothing: a pawn
+/// promotion and some other legal move (for example a bishop capture on the same square) can
+/// share the same text once the promotion piece is left off, and guessing one over reporting
+/// the ambiguity would silently play the wrong move.
 fn loose_match(pos: &ChessPosition, text: &str) -> Result<Move, MoveTextError> {
     let wanted = normalise(text);
     let named = named_piece(text);
@@ -104,48 +110,79 @@ fn loose_match(pos: &ChessPosition, text: &str) -> Result<Move, MoveTextError> {
             })
             .collect();
     }
-    if matches.is_empty() {
-        return missing_promotion(&candidates, &wanted, text);
-    }
+    let promotions = promotion_candidates(&candidates, &wanted);
 
-    match matches.as_slice() {
-        [(mv, _)] => Ok(*mv),
-        many => Err(ambiguous(many.iter().map(|(_, san)| san.clone()))),
+    match (matches.is_empty(), promotions.is_empty()) {
+        (true, true) => Err(MoveTextError::NotLegal(text.to_string())),
+        (true, false) => Err(promotion_only_error(&promotions)),
+        (false, true) => match matches.as_slice() {
+            [(mv, _)] => Ok(*mv),
+            many => Err(ambiguous(many.iter().map(|(_, san)| san.clone()))),
+        },
+        (false, false) => {
+            let sans = matches
+                .iter()
+                .map(|(_, san)| san.clone())
+                .chain(promotion_family_labels(&promotions));
+            Err(ambiguous(sans))
+        }
     }
 }
 
-/// Step 6: the promotion moves `wanted` names once their piece is left out. One pawn move
-/// is [`MoveTextError::NeedsPromotion`]; none is [`MoveTextError::NotLegal`].
-fn missing_promotion(
-    candidates: &[(Move, String)],
+/// Step 6: the promotion moves `wanted` names once their piece is left out (`bxc8` matches
+/// `bxc8=Q`, `bxc8=R`, `bxc8=B` and `bxc8=N`), taken from `candidates` so a named piece
+/// (`named_piece`) has already excluded every pawn move.
+fn promotion_candidates<'a>(
+    candidates: &'a [(Move, String)],
     wanted: &str,
-    text: &str,
-) -> Result<Move, MoveTextError> {
+) -> Vec<&'a (Move, String)> {
     let without_piece = |spelling: &str| {
         let mut spelling = spelling.to_string();
         spelling.pop();
         spelling
     };
-    let matches: Vec<&(Move, String)> = candidates
+    candidates
         .iter()
         .filter(|(mv, san)| {
             mv.promotion().is_some()
                 && (without_piece(&normalise(san)) == wanted
                     || without_piece(&mv.to_uci()) == wanted)
         })
-        .collect();
-    let Some((first, _)) = matches.first() else {
-        return Err(MoveTextError::NotLegal(text.to_string()));
-    };
+        .collect()
+}
+
+/// The error for a non-empty `promotions` with no other match: [`MoveTextError::NeedsPromotion`]
+/// when they are all the same pawn move (just missing its promotion piece), otherwise
+/// [`MoveTextError::Ambiguous`] over their SANs.
+fn promotion_only_error(promotions: &[&(Move, String)]) -> MoveTextError {
+    let (first, _) = promotions[0];
     let (from, to) = (first.from(), first.to());
-    if matches
+    if promotions
         .iter()
         .all(|(mv, _)| mv.from() == from && mv.to() == to)
     {
-        Err(MoveTextError::NeedsPromotion { from, to })
+        MoveTextError::NeedsPromotion { from, to }
     } else {
-        Err(ambiguous(matches.iter().map(|(_, san)| san.clone())))
+        ambiguous(promotions.iter().map(|(_, san)| san.clone()))
     }
+}
+
+/// One label per distinct pawn move among `promotions`, collapsing its promotion pieces into
+/// a single `bxc8=?` entry so an ambiguity list does not grow one entry per promotion piece.
+fn promotion_family_labels(promotions: &[&(Move, String)]) -> Vec<String> {
+    let mut seen: Vec<(Square, Square)> = Vec::new();
+    let mut labels = Vec::new();
+    for (mv, san) in promotions {
+        let key = (mv.from(), mv.to());
+        if !seen.contains(&key) {
+            seen.push(key);
+            labels.push(match san.find('=') {
+                Some(i) => format!("{}?", &san[..=i]),
+                None => san.clone(),
+            });
+        }
+    }
+    labels
 }
 
 /// [`MoveTextError::Ambiguous`] with the SANs sorted.
@@ -440,6 +477,26 @@ mod tests {
         let pos = ChessPosition::from_fen(PAWN_EP_OR_BISHOP).expect("valid FEN");
         let err = parse_move(&pos, "bc3").expect_err("both moves match");
         assert_eq!(err.to_string(), "ambiguous: Bc3, bxc3");
+    }
+
+    #[test]
+    fn pawn_promotion_without_its_piece_next_to_another_pieces_capture_is_ambiguous() {
+        // White pawn b7 can promote by capturing the rook on c8; the bishop on f5 can also
+        // capture it, without promoting. A lowercase `bxc8` or `bc8` must not silently pick
+        // one: it names either move once the promotion piece is left out.
+        const PAWN_PROMOTION_OR_BISHOP: &str = "2r4k/1P6/8/5B2/8/8/8/K7 w - - 0 1";
+        assert_eq!(
+            uci(PAWN_PROMOTION_OR_BISHOP, "bxc8"),
+            ambiguous(&["Bxc8", "bxc8=?"])
+        );
+        assert_eq!(
+            uci(PAWN_PROMOTION_OR_BISHOP, "bc8"),
+            ambiguous(&["Bxc8", "bxc8=?"])
+        );
+        // The bishop's own letter still names only the bishop.
+        assert_eq!(uci(PAWN_PROMOTION_OR_BISHOP, "Bxc8"), ok("f5c8"));
+        // Naming the promotion piece is still unambiguous.
+        assert_eq!(uci(PAWN_PROMOTION_OR_BISHOP, "bxc8=Q"), ok("b7c8q"));
     }
 
     #[test]
