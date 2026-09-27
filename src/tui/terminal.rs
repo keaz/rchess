@@ -28,6 +28,8 @@ use std::time::Duration;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::cursor::Show;
 use ratatui::crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+#[cfg(unix)]
+use ratatui::crossterm::terminal::disable_raw_mode;
 use ratatui::crossterm::terminal::is_raw_mode_enabled;
 use ratatui::crossterm::{Command, execute};
 
@@ -247,21 +249,40 @@ fn watch_signals(
 }
 
 /// The UI loop did not act on `signal` in time: restore the terminal from here and end
-/// the process by the signal. The restore runs on a helper thread with a deadline, so a
-/// UI thread blocked while writing to the terminal cannot keep the process alive.
+/// the process by the signal. Raw mode goes first: turning it off writes nothing to the
+/// terminal, so it works even when the terminal has stopped reading output and the
+/// escape-sequence writes of [`leave`] block (or a stuck UI thread is blocked in them).
 #[cfg(unix)]
 fn force_quit(signal: std::ffi::c_int) {
+    forced_restore(
+        || {
+            let _ = disable_raw_mode();
+        },
+        leave,
+        RESTORE_DEADLINE,
+    );
+    exit_by_signal(signal);
+}
+
+/// Runs `raw_off` here, then `restore` on a helper thread, waiting at most `deadline` for
+/// it: a restore blocked writing to the terminal cannot keep the process alive.
+#[cfg(unix)]
+fn forced_restore(
+    raw_off: impl FnOnce(),
+    restore: impl FnOnce() + Send + 'static,
+    deadline: Duration,
+) {
+    raw_off();
     let (done_tx, done) = std::sync::mpsc::channel();
     let helper = thread::Builder::new()
         .name("restore".to_string())
         .spawn(move || {
-            leave();
+            restore();
             let _ = done_tx.send(());
         });
     if helper.is_ok() {
-        let _ = done.recv_timeout(RESTORE_DEADLINE);
+        let _ = done.recv_timeout(deadline);
     }
-    exit_by_signal(signal);
 }
 
 /// `ratatui::try_init` failed part-way. If raw mode is on it got past
@@ -432,6 +453,38 @@ mod tests {
     fn quits_on_interrupt_terminate_and_hangup() {
         use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
         assert_eq!(QUIT_SIGNALS, [SIGINT, SIGTERM, SIGHUP]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_forced_restore_turns_raw_mode_off_even_when_the_writes_block() {
+        // A terminal that stopped reading output blocks the escape-sequence writes;
+        // raw mode must be off before they start, and the wait must end at the deadline.
+        use std::sync::Mutex;
+        use std::sync::mpsc;
+        use std::time::Instant;
+        let steps = Arc::new(Mutex::new(Vec::new()));
+        let (unblock, blocked) = mpsc::channel::<()>();
+        let started = Instant::now();
+        let log = Arc::clone(&steps);
+        forced_restore(
+            || steps.lock().unwrap().push("raw mode off"),
+            move || {
+                log.lock().unwrap().push("writes started");
+                let _ = blocked.recv();
+            },
+            Duration::from_millis(50),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the deadline holds"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while steps.lock().unwrap().len() < 2 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(*steps.lock().unwrap(), ["raw mode off", "writes started"]);
+        drop(unblock);
     }
 
     #[cfg(unix)]
