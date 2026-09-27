@@ -1361,6 +1361,7 @@ impl App {
                 }
                 let recovered = computer.note.as_deref() == Some(ENGINE_ERROR_NOTE);
                 self.last_computer = Some((self.game.moves().len(), computer));
+                self.message = None;
                 self.after_engine_move(now);
                 if recovered {
                     self.error(ENGINE_ERROR_NOTE);
@@ -3167,6 +3168,20 @@ mod tests {
             h.app.last_computer().map(|c| c.source.clone()),
             Some(MoveSource::Jev)
         );
+    }
+
+    #[test]
+    fn a_stray_error_while_jev_thinks_does_not_outlive_its_reply() {
+        // Typing a move while it is not the person's turn sets an error; once the engine
+        // replies and it is the person's turn again, that stale error must not remain.
+        let mut h = Harness::new();
+        h.char('2');
+        let request = request(&h.command("e4"));
+        assert!(h.app.is_thinking());
+        h.command("d4");
+        assert_eq!(h.app.status_line(), "Local search to move");
+        h.respond(&request);
+        assert_eq!(h.app.status_line(), "");
     }
 
     #[test]
