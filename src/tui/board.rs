@@ -1940,4 +1940,38 @@ mod tests {
         );
         assert_eq!(images.len(), 3);
     }
+
+    /// The image-encoding crates [`PieceImages::picture`] calls into (resize, sixel, PNG
+    /// and base64) run at the default `opt-level = 0` under `cargo build`/`cargo run`
+    /// unless the dev profile optimises them, which can stall the UI thread for seconds
+    /// while a board's worth of pictures is built. This does not run the encoders (that
+    /// needs a real build, not `cargo test`); it only guards the profile override that
+    /// keeps them fast in a debug build, the same way `[profile.dev.package.chess]`
+    /// already does for this crate's own code.
+    #[test]
+    fn dev_builds_optimise_the_picture_encoding_crates() {
+        let manifest = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+            .expect("Cargo.toml reads");
+        for pkg in [
+            "image",
+            "ratatui-image",
+            "icy_sixel",
+            "png",
+            "fdeflate",
+            "miniz_oxide",
+            "flate2",
+            "base64",
+        ] {
+            let heading = format!("[profile.dev.package.{pkg}]");
+            let after = manifest
+                .split(&heading)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{heading} is missing from Cargo.toml"));
+            let body = after.split("[profile").next().unwrap_or(after);
+            assert!(
+                body.contains("opt-level = 3") || body.contains("opt-level = 2"),
+                "{heading} does not raise opt-level in Cargo.toml"
+            );
+        }
+    }
 }

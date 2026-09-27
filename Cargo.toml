@@ -34,6 +34,37 @@ harness = false
 [profile.dev.package.chess]
 opt-level = 3
 
+# The Image glyph style (src/tui/pieces.rs, src/tui/board.rs) leans on these crates for
+# resizing, sixel/PNG encoding and base64: at the default opt-level 0 building one board's
+# worth of pictures can stall the UI thread for seconds under `cargo run`. Optimise them
+# in the dev profile too; a release build already pays only their optimised cost.
+[profile.dev.package.image]
+opt-level = 3
+
+[profile.dev.package.ratatui-image]
+opt-level = 3
+
+[profile.dev.package.icy_sixel]
+opt-level = 3
+
+[profile.dev.package.png]
+opt-level = 3
+
+[profile.dev.package.fdeflate]
+opt-level = 3
+
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+
+[profile.dev.package.flate2]
+opt-level = 3
+
+[profile.dev.package.base64]
+opt-level = 3
+
+[profile.dev.package.crc32fast]
+opt-level = 3
+
 [profile.test]
 build-override.debug = true
 
