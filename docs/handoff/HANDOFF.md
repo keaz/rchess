@@ -6,12 +6,25 @@ Read this first. Follow the protocol in section 8 of
 ## Current
 Sub-project: cleanup (not started) | Plan: to be written from spec section 7 step 4
 Branch: feat/tui (complete after the user's manual smoke test; ready for user to merge)
-Last completed task: tui task 7 (run loop, main.rs, smoke tests) — tui sub-project DONE pending manual smoke test
-Next task: user runs `cargo run` for the manual smoke test and merges feat/tui; then plan the cleanup sub-project
+Last completed task: tui final-review fix wave (A1–A4, B1–B10) — tui sub-project DONE pending manual smoke test
+Next task: user runs `cargo run` for the manual smoke test below and merges feat/tui; then plan the cleanup sub-project
 State: green (except 3 pre-existing old-code test failures)
 
 ## Verify before continuing
 INSTA_UPDATE=no cargo test --lib tui:: && cargo test --lib engine:: && cargo test --lib core::
+cargo build && env -u JEV_API_KEY -u TYPESAFE_API_KEY python3 tests/pty_smoke.py --no-build
+
+## Manual smoke test (TUI, by the user)
+Run `cargo run` in a real terminal (Ghostty, Kitty, WezTerm or Alacritty) and check:
+- the menu appears;
+- Human vs Human plays by mouse click, by drag and through the command box (`/e4`);
+- Human vs Jev shows "Jev thinking…" then Jev's move with the Jev panel filled (with `JEV_API_KEY`
+  set), or "Local search" wording everywhere without it;
+- `g` cycles the glyph sets; `u` undoes;
+- `:savepgn ~/test` writes `~/test.pgn` and the status line says `saved ~/test.pgn`;
+- `q` asks before quitting, and the shell is normal afterwards (mouse and paste modes off, cursor
+  visible);
+- optional: `NO_COLOR=1 cargo run` marks a picked-up piece reversed and capture targets as `( )`.
 
 ## Core API caveats (read before building on core)
 - `Position::play` / `to_san` require a move from `self.legal_moves()`; debug builds assert, release builds may corrupt the position; use `Game::play` for unvalidated input.
@@ -21,12 +34,12 @@ INSTA_UPDATE=no cargo test --lib tui:: && cargo test --lib engine:: && cargo tes
 - `from_fen` rejects positions beyond the promotion material budget; `MoveList` capacity (321) is derived from that budget.
 - `pub mod core` shadows the built-in `core` crate at the crate root: write `::core::` in `src/lib.rs`.
 - CI (`cargo test --verbose`) stops at the 3 known old-code failures, so `core_properties` and the bench are not exercised in CI until the cleanup sub-project (consider `--no-fail-fast`).
-- `CLAUDE.md` still says "3 of 58" failing tests; now 3 of 199 lib tests plus 2 property tests. Update in cleanup.
+- `CLAUDE.md` still says "3 of 58" failing tests; now 3 of 496 lib tests (493 pass, 3 ignored) plus 2 property tests. Its Commands section names the TUI (`cargo run`, `tests/pty_smoke.py`), but its Architecture section still describes only the legacy crate-root code. Update in cleanup.
 
 ### Engine caveats (read before building the TUI on engine)
 - Give the worker a `Game` clone, not a `Position`: `analyse` needs the move history for repetition detection and `describe` sends the recent moves.
 - Worst-case `choose_move` latency is about 19 s (3 attempts × 5 s timeout + backoff or Retry-After + search) and it cannot be cancelled; discard stale results by generation counter.
-- Debug builds search about 23x slower than release (Kiwipete about 1.3 s vs 56 ms): the TUI plan should run `--release` or raise the dev profile's `opt-level`.
+- Debug builds search about 23x slower than release (Kiwipete about 1.3 s vs 56 ms); feat/tui raised the dev profile (`[profile.dev.package.chess] opt-level = 3`), so `cargo run` searches Kiwipete in about 0.10 s.
 - Crowded positions (many pawns in contact) take up to ~0.85 s in release: quiescence has no pruning and there is no time limit yet.
 - Never enable TRACE-level logging for `ureq` / `ureq_proto`: it would print the `Authorization` header with the API key.
 - Jev receives the state fields and the options in alphabetical order (serde_json sorts object keys; `preserve_order` stays off by ruling).
@@ -66,6 +79,17 @@ INSTA_UPDATE=no cargo test --lib tui:: && cargo test --lib engine:: && cargo tes
 - TUI task 5: implemented as specified in the brief, no deviations. `INSTA_UPDATE=no cargo test --lib tui::` reports 140 passed (brief said 139); the extra test carries forward from task 4's count above (104 baseline + 36 new tests in worker.rs/event.rs/terminal.rs = 140).
 - TUI task 6: implemented as specified in the brief, no deviations. `INSTA_UPDATE=no cargo test --lib tui::` reports 251 passed (brief said 250); the extra test carries forward from task 5's count above (140 baseline + 77 new tests in app.rs + 34 new tests in panels.rs = 251).
 - TUI task 3 fix round 1: `movetext.rs`'s `loose_match` no longer short-circuits on the first loose-SAN or piece-spelling match; it now always also computes the promotion-without-piece candidates (renamed `missing_promotion` to `promotion_candidates`, returning candidates rather than a `Result`) and merges them in, so a pawn promotion typed without its piece (`bxc8`) that also matches another piece's move on the same square (`Bxc8`) is reported `MoveTextError::Ambiguous` (`Bxc8`, `bxc8=?`, the latter collapsing all four promotion pieces via new helper `promotion_family_labels`) instead of silently playing the other piece's move. Deviation from the plan's code (the brief's `loose_match`/`missing_promotion` are restructured), by fix-round ruling to close a verified review finding.
+- TUI final-review fix wave (2026-09-27): A1 command box above the game-over overlay; A2 NO_COLOR board marks; A3 status messages and save errors fitted with `…`, paths shown with `~` and shortened in the folder part; B1 a computer move clears only turn notes; B2 Save dialog unquotes paths; B3 promotion picker Esc gives typed text back; B4 watchdog turns raw mode off before its writes; B5 stdin checked before setup; B6 move list columns; B7 pty smoke test uses cargo's target dir and checks stdin; B8/B9 run-loop tests. Test counts: `INSTA_UPDATE=no cargo test --lib tui::` 291 passed; whole lib 493 passed, 3 failed (old code), 3 ignored; `core_properties` 2 passed. Snapshots changed only by B6 (move rows of game_over_80x24, jev_reply_80x24, jev_vetoed_80x24, mid_game_80x24).
+- Deliberate deviations from spec 6 wording on feat/tui (no code change planned):
+  - 6.2/6.4: while only "Terminal too small" is shown, all input is ignored except Ctrl+C, which quits at once without the confirmation (it could not be seen) (`src/tui/app.rs:1036`).
+  - 6.4: the focus stack also places the game-over overlay: dialog > command box > game-over overlay > board. When the computer's move ends the game while the command box is focused, keys keep going to the box (Esc leaves it); when the person's own move or command ends the game, the box is left so the overlay gets the next keys (A1).
+  - 6.4: extra keys beyond the spec's list: `m` (menu) on the board; `n`/`s`/`m`/`u`/`q`, arrows and Tab on the game-over overlay; Ctrl+S also from the overlay; `:resign` asks first, and undo withdraws a resignation.
+  - 6.4: a bare `:fen`, `:savefen` or `:savepgn` opens its dialog instead of printing a usage message; declining an overwrite gives the typed path back where it was typed; cancelling the promotion picker gives back a move typed without its piece (B3).
+  - 6.4: undo in Jev vs Jev takes back one ply and pauses watching.
+  - 6.3: with `NO_COLOR` the highlights get text and attribute marks as well as tints: selection reversed, last move underlined, capture targets `( )`, king in check `+ +` (A2); the spec names only the switch to Outline glyphs.
+  - 6.2: status messages keep a fixed row budget: a message that does not fit ends in `…`; file paths are shown with `~` and lose folders from the middle first; save errors read `cannot save (<reason>): <path>` (A3). A computer move clears only messages about the turn (B1).
+  - 6.2 layout: the move list writes a game that starts with Black to move as `12. ...  Kd7` (B6), not `12... Kd7`; PGN export is unchanged.
+  - 6.1: `run` also refuses a non-terminal stdin, not only stdout (B5).
 - TUI task 6 fix round 1: `app.rs`'s `apply_outcome` now clears `self.message` in the `EngineOutcome::Move` arm (before the `recovered` check) once the computer's move has been played, so an error set while the engine was thinking (a stray typed move, "asking the engine again", "took back N move(s)") no longer survives into the human's next turn. Deviation from the plan's code (the brief's `apply_outcome` omits this clear), by fix-round ruling to close a verified review finding.
 
 ## Known open issues
@@ -74,10 +98,47 @@ INSTA_UPDATE=no cargo test --lib tui:: && cargo test --lib engine:: && cargo tes
 - Docs nit: the spec (5.2) and older Notes lines name the endpoint `jev::JEV_ENDPOINT`; the public path is `chess::engine::JEV_ENDPOINT`.
 - Historical engine plan text still uses the old "undefended against capture" wording and mentions `JEV_BASE_URL`.
 
+### TUI (deferred minors from reviews)
+- src/tui/glyphs.rs:323 `char_width` returns 1 for control characters, which ratatui's buffer drops (0 cells).
+- src/tui/glyphs.rs:332 `shorten` cuts by char count, so 24 wide or escaped characters can still flood a message, and the cut can split a grapheme cluster.
+- src/tui/glyphs.rs:258 the recommended env accessor `std::env::var(k).ok()` treats a non-UTF-8 `NO_COLOR` or `RCHESS_GLYPHS` as unset, with no warning (crossterm does the same for `NO_COLOR`).
+- src/tui/glyphs.rs:278 the CLI and `RCHESS_GLYPHS` branches of `initial_glyphs` repeat the same parse-or-reject shape.
+- src/tui/test_support/mod.rs:87 the doc of `char_events` says "as the terminal reports them", but every character is sent with no modifiers.
+- src/tui/board.rs:182 the label column and row only get a symbol; their style is never reset, unlike square cells.
+- src/tui/board.rs:923 no test renders a full 7×3 board (cursor outline over 3-row squares, the middle-row glyph cell, label rows).
+- src/tui/input.rs:69 `insert_str` deletes tabs outright, so a pasted `:fen\t<FEN>` joins words and FEN fields.
+- src/tui/input.rs:69 if the box already holds text, a paste made only of line breaks does not submit it.
+- src/tui/input.rs:158 `is_ignored` misses some invisible format characters (U+061C, U+00AD, U+180E, U+034F, U+FFF9-U+FFFB).
+- src/tui/movetext.rs:92 the `kind_of` closure is defined identically in `loose_match` and `long_algebraic`.
+- src/tui/files.rs:129 the no-overwrite check and the rename are two steps, so a file created between them is silently replaced.
+- src/tui/files.rs:127 overwriting a symlink replaces the link with a regular file and leaves its target unchanged.
+- src/tui/files.rs:234 the PGN `Date` tag uses the UTC date, not the local date.
+- src/tui/files.rs:152 `write_file` does two blocking fsyncs (file, then folder) on the UI thread.
+- src/tui/files.rs:184 only the NotFound and IsADirectory branches of `describe` are tested.
+- src/tui/files.rs:300 the `(None, None)` arm in `pgn_export`'s roster loop is dead code duplicating `Game::to_pgn`.
+- src/tui/terminal.rs:298 `leave_once` clears ACTIVE before the restore runs, so a second concurrent caller returns at once and the process can exit mid-restore.
+- src/tui/terminal.rs:161 `leave` stops at the first failed step inside each compound restore call.
+- src/tui/terminal.rs:403 the panic-hook test replaces the process-global hook while other tests run, and leaves the probe hook installed if an early assertion fails.
+- src/tui/terminal.rs:316 a comment in the panic hook says an engine panic reaches the UI as a failed reply; it becomes a local-search move.
+- src/tui/terminal.rs:241 if the terminal closes and no SIGHUP ever reaches chess (a supervisor that ignores SIGHUP, zsh `trap '' HUP`), the UI thread spins at 100% CPU in crossterm's read loop.
+- src/tui/worker.rs:388 `engine_survives_a_panic_and_keeps_answering` uses two engines, so it does not show the same engine keeps answering.
+- src/tui/worker.rs:411 `reply_to_a_closed_channel_is_dropped_quietly` returns before the send it means to test has run.
+- src/tui/test_support/engine.rs:112 `FakeEngine::local()` still reports every move as a Jev move with top three, confidence and model.
+- src/tui/app.rs:1059 an Alt+key chord outside a text field is split into Esc plus the key; if that Esc opens or reveals a text field, the key is typed into it.
+- src/tui/app.rs:1742 `q` asks for confirmation on a board with no moves; `n` and `m` do not.
+- src/tui/mod.rs:328 every event in a batch is hit-tested against the hit map from the draw before the batch, even after an earlier event changed the layout.
+- src/tui/mod.rs:96 `--help` into a closed pipe (`chess --help | true`) prints `chess: Broken pipe (os error 32)` and exits 1.
+- src/tui/mod.rs:287 `--version` and `-V` are unknown arguments (a menu warning).
+- src/tui/mod.rs:341 no test covers `perform`'s branch for a failed engine-thread spawn (the synthetic `EngineOutcome::Failed` reply).
+- src/tui/mod.rs:386 the test module's `fn play(glyphs, warnings) -> Cli` helper shadows the outer `fn play(app, quit, fault)`.
+- src/tui/panels.rs:202 menu warnings that do not fit are dropped without notice at 60×20.
+- src/tui/terminal.rs:161 no cargo test checks the bytes `leave()` writes (tests/pty_smoke.py covers them).
+
 ## Open questions for user
 - None.
 
 ## Log (newest first)
+- 2026-09-27 tui final-review fix wave: game-over overlay focus, NO_COLOR marks, fitted status messages, turn-only message clearing, stdin check, move-list columns, watchdog raw mode, smoke-test target dir
 - 2026-09-27 tui sub-project complete; pty smoke test green; awaiting manual smoke test
 - 2026-09-27 tui task 6 fix round 1: stale error message no longer survives an engine reply
 - 2026-09-27 tui task 6 done: app state machine and rendering

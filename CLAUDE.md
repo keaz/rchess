@@ -6,12 +6,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```sh
 cargo build                 # build
-cargo run                   # play the CLI game (reads moves from stdin)
+cargo run                   # launch the terminal UI (chess::tui); needs a real terminal
 cargo test                  # full suite
 cargo test pieces::rook     # all tests in one module (substring filter)
 cargo test -- --exact pieces::queen::test::test_possible_moves   # one test
 cargo test -- --nocapture   # show println!/log output
 cargo fmt && cargo clippy
+cargo build && env -u JEV_API_KEY -u TYPESAFE_API_KEY python3 tests/pty_smoke.py   # chess::tui on a pty
 ```
 
 Logging: tests call a local `init()` that installs `env_logger`. The `[env] RUST_LOG = "debug"`
