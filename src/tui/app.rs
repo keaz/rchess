@@ -51,7 +51,7 @@ use ratatui::crossterm::event::{
 };
 use ratatui::layout::{Position as CellPosition, Rect};
 
-use super::board::{BoardGeometry, Highlights, square_at};
+use super::board::{BoardGeometry, CellSize, Highlights, square_at};
 use super::event::AppEvent;
 use super::files::{SaveError, pgn_export, resolve_path, tilde_path, today, write_file};
 use super::glyphs::{self, GlyphSet, Palette};
@@ -600,6 +600,8 @@ pub struct App {
     /// The terminal shows no colour (`NO_COLOR`): the board marks highlights with text too.
     no_color: bool,
     glyphs: GlyphSet,
+    /// The terminal's font size, which shapes the board's squares.
+    cell_size: CellSize,
     pick_side: fn() -> Side,
     today: fn() -> String,
     home: Option<PathBuf>,
@@ -673,6 +675,7 @@ impl App {
             palette: glyphs::palette(truecolor),
             no_color: false,
             glyphs,
+            cell_size: CellSize::DEFAULT,
             pick_side: random_side,
             today,
             home: std::env::var_os("HOME").map(PathBuf::from),
@@ -711,6 +714,12 @@ impl App {
     pub fn with_no_color(mut self, no_color: bool) -> App {
         self.no_color = no_color;
         self
+    }
+
+    /// Sets the terminal's font size, which is known only once the terminal has been asked
+    /// (default [`CellSize::DEFAULT`]). The next draw shapes the board's squares for it.
+    pub fn set_cell_size(&mut self, cell_size: CellSize) {
+        self.cell_size = cell_size;
     }
 
     /// Replaces the coin flip used by "Human vs Jev: random side" (tests pass a fixed side).
@@ -870,6 +879,11 @@ impl App {
     /// True when the terminal shows no colour (see [`with_no_color`](Self::with_no_color)).
     pub fn no_color(&self) -> bool {
         self.no_color
+    }
+
+    /// The terminal's font size (see [`App::set_cell_size`]).
+    pub fn cell_size(&self) -> CellSize {
+        self.cell_size
     }
 
     /// The command box text.

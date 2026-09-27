@@ -1,9 +1,13 @@
-//! Board widget and flip-aware hit-testing (spec section 6.3).
+//! Board widget and flip-aware hit-testing (spec sections 6.3 and 9.2).
 //!
 //! [`layout_board`] picks a square size and places the board inside an area;
 //! the resulting [`BoardGeometry`] is used both to draw ([`BoardView`]) and to
 //! map mouse cells back to squares ([`square_at`]), so the App must keep the
 //! geometry from its most recent draw for hit-testing.
+//!
+//! Squares are as tall as the area allows, and as wide as the font makes them
+//! look square: [`square_width`] turns a height in rows into a width in columns
+//! from the terminal's [`CellSize`].
 //!
 //! The widget draws only the 8×8 grid plus a rank-label column on the left and
 //! a file-label row underneath; any enclosing block is the caller's.
@@ -18,10 +22,63 @@ use ratatui::{
 use super::glyphs::{self, GlyphSet, Palette};
 use crate::core::{Color as Side, PieceKind, Position as ChessPosition, Square};
 
-/// Square sizes `(width, height)` in cells, largest first. Terminal cells are
-/// about twice as tall as wide, so these look roughly square, and the odd
-/// widths let the one-cell glyph sit exactly in the middle.
-pub const SQUARE_SIZES: [(u16, u16); 3] = [(7, 3), (5, 2), (3, 1)];
+/// The smallest square `(width, height)` in cells: one row, with room for the
+/// glyph and the cursor's `[` `]` on either side of it. A font so narrow that
+/// even one-row squares come out too wide for the area still gets this size.
+pub const MIN_SQUARE: (u16, u16) = (3, 1);
+
+/// A terminal cell's size in pixels, which is the font size. It makes squares
+/// look square: see [`square_width`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CellSize {
+    width: u16,
+    height: u16,
+}
+
+impl CellSize {
+    /// 10×20 pixels, assumed when the terminal does not report its font size.
+    pub const DEFAULT: CellSize = CellSize {
+        width: 10,
+        height: 20,
+    };
+
+    /// A cell `width` × `height` pixels, or [`CellSize::DEFAULT`] when either is
+    /// zero (a terminal that does not know its size reports zero).
+    pub const fn new(width: u16, height: u16) -> CellSize {
+        if width == 0 || height == 0 {
+            CellSize::DEFAULT
+        } else {
+            CellSize { width, height }
+        }
+    }
+
+    /// Width in pixels (never zero).
+    pub const fn width(self) -> u16 {
+        self.width
+    }
+
+    /// Height in pixels (never zero).
+    pub const fn height(self) -> u16 {
+        self.height
+    }
+}
+
+impl Default for CellSize {
+    fn default() -> CellSize {
+        CellSize::DEFAULT
+    }
+}
+
+/// The width in cells of a square `square_h` rows high, so that it looks square
+/// in pixels: `square_h × cell height / cell width`, rounded, at least 3, and
+/// bumped up to the next odd number so a one-cell glyph sits in the middle
+/// column. With the default 10×20 font that is `2 × square_h + 1`.
+pub fn square_width(square_h: u16, cell: CellSize) -> u16 {
+    let (cell_w, cell_h) = (u64::from(cell.width), u64::from(cell.height));
+    // Rounded to the nearest whole column, halves up; u64 cannot overflow here.
+    let columns = (2 * u64::from(square_h) * cell_h + cell_w) / (2 * cell_w);
+    u16::try_from(columns.max(3) | 1).unwrap_or(u16::MAX)
+}
 
 /// Width of the rank-label column left of the grid.
 const LABEL_COLUMNS: u16 = 1;
@@ -38,33 +95,45 @@ pub struct BoardGeometry {
     pub outer: Rect,
     /// The 8×8 squares only: `8 * square_w` by `8 * square_h` cells.
     pub grid: Rect,
-    /// Width of one square in cells (7, 5 or 3).
+    /// Width of one square in cells: odd, at least 3 (see [`square_width`]).
     pub square_w: u16,
-    /// Height of one square in cells (3, 2 or 1).
+    /// Height of one square in cells: at least 1.
     pub square_h: u16,
     /// Black at the bottom when true; White at the bottom otherwise.
     pub flipped: bool,
 }
 
-/// Lays the board out in `area` with the largest square size from
-/// [`SQUARE_SIZES`] that fits (labels included), centred in both directions.
-/// Returns `None` when even 3×1 squares do not fit (25×9 cells).
-pub fn layout_board(area: Rect, flipped: bool) -> Option<BoardGeometry> {
-    SQUARE_SIZES.into_iter().find_map(|(square_w, square_h)| {
-        let outer_w = 8 * square_w + LABEL_COLUMNS;
-        let outer_h = 8 * square_h + LABEL_ROWS;
-        if area.width < outer_w || area.height < outer_h {
-            return None;
-        }
-        let x = area.x + (area.width - outer_w) / 2;
-        let y = area.y + (area.height - outer_h) / 2;
-        Some(BoardGeometry {
-            outer: Rect::new(x, y, outer_w, outer_h),
-            grid: Rect::new(x + LABEL_COLUMNS, y, 8 * square_w, 8 * square_h),
-            square_w,
-            square_h,
-            flipped,
-        })
+/// Lays the board out in `area` with the tallest squares that fit (labels
+/// included), each [`square_width`] wide for the font `cell`, centred in both
+/// directions: a board limited by the area's width is centred vertically.
+///
+/// When even one-row squares are too wide for the area (a very narrow font),
+/// the board uses [`MIN_SQUARE`]. Returns `None` when that does not fit either
+/// (25×9 cells).
+pub fn layout_board(area: Rect, flipped: bool, cell: CellSize) -> Option<BoardGeometry> {
+    // Grid plus labels, in u32 so wide squares cannot overflow.
+    let fits = |square_w: u16, square_h: u16| {
+        8 * u32::from(square_w) + u32::from(LABEL_COLUMNS) <= u32::from(area.width)
+            && 8 * u32::from(square_h) + u32::from(LABEL_ROWS) <= u32::from(area.height)
+    };
+    // The width grows with the height, so the first height that fits is the tallest.
+    let tallest = area.height.saturating_sub(LABEL_ROWS) / 8;
+    let (square_w, square_h) = (1..=tallest)
+        .rev()
+        .map(|square_h| (square_width(square_h, cell), square_h))
+        .chain([MIN_SQUARE])
+        .find(|&(square_w, square_h)| fits(square_w, square_h))?;
+    // `fits` bounds both below the area's size, so these cannot overflow.
+    let (grid_w, grid_h) = (8 * square_w, 8 * square_h);
+    let (outer_w, outer_h) = (grid_w + LABEL_COLUMNS, grid_h + LABEL_ROWS);
+    let x = area.x + (area.width - outer_w) / 2;
+    let y = area.y + (area.height - outer_h) / 2;
+    Some(BoardGeometry {
+        outer: Rect::new(x, y, outer_w, outer_h),
+        grid: Rect::new(x + LABEL_COLUMNS, y, grid_w, grid_h),
+        square_w,
+        square_h,
+        flipped,
     })
 }
 
@@ -376,9 +445,12 @@ mod tests {
     use crate::tui::glyphs::{SOLID_PAWN, palette};
     use crate::tui::test_support::sq;
 
+    /// Square sizes the default font gives for heights 1 to 4.
+    const SIZES: [(u16, u16); 4] = [(3, 1), (5, 2), (7, 3), (9, 4)];
+
     fn geometry(square_w: u16, square_h: u16, x: u16, y: u16, flipped: bool) -> BoardGeometry {
         let area = Rect::new(x, y, 8 * square_w + 1, 8 * square_h + 1);
-        let g = layout_board(area, flipped).expect("exact-fit area");
+        let g = layout_board(area, flipped, CellSize::DEFAULT).expect("exact-fit area");
         assert_eq!((g.square_w, g.square_h), (square_w, square_h));
         g
     }
@@ -413,7 +485,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                let geometry = layout_board(area, flipped).expect("board fits");
+                let geometry = layout_board(area, flipped, CellSize::DEFAULT).expect("board fits");
                 saved = Some(geometry);
                 frame.render_widget(
                     BoardView {
@@ -436,38 +508,121 @@ mod tests {
     }
 
     #[test]
-    fn layout_picks_the_largest_size_that_fits_and_centres_it() {
+    fn cell_size_defaults_to_ten_by_twenty() {
+        assert_eq!(CellSize::default(), CellSize::DEFAULT);
+        assert_eq!(
+            (CellSize::DEFAULT.width(), CellSize::DEFAULT.height()),
+            (10, 20)
+        );
+        let font = CellSize::new(9, 19);
+        assert_eq!((font.width(), font.height()), (9, 19));
+        // A terminal that does not know its font size reports zero.
+        for (width, height) in [(0, 0), (0, 20), (10, 0)] {
+            assert_eq!(CellSize::new(width, height), CellSize::DEFAULT);
+        }
+    }
+
+    #[test]
+    fn square_width_makes_squares_look_square() {
+        // (font, widths for square heights 1 to 8)
         let cases = [
-            ((80, 24), (5, 2), Rect::new(19, 3, 41, 17)),
-            ((120, 40), (7, 3), Rect::new(31, 7, 57, 25)),
-            ((200, 60), (7, 3), Rect::new(71, 17, 57, 25)),
-            ((60, 20), (5, 2), Rect::new(9, 1, 41, 17)),
-            ((40, 16), (3, 1), Rect::new(7, 3, 25, 9)),
-            ((25, 9), (3, 1), Rect::new(0, 0, 25, 9)),
+            // Twice as tall as wide: 2h, bumped to odd.
+            ((10, 20), [3, 5, 7, 9, 11, 13, 15, 17]),
+            ((8, 16), [3, 5, 7, 9, 11, 13, 15, 17]),
+            ((16, 32), [3, 5, 7, 9, 11, 13, 15, 17]),
+            // 2.5: 2.5 rounds to 3, 7.5 to 8 and then 9.
+            ((10, 25), [3, 5, 9, 11, 13, 15, 19, 21]),
+            // 15/7 = 2.14: 4.29 rounds to 4 then 5, 8.57 to 9.
+            ((7, 15), [3, 5, 7, 9, 11, 13, 15, 17]),
+            // 1.8: 3.6 rounds to 4 then 5, 5.4 to 5, 7.2 to 7.
+            ((10, 18), [3, 5, 5, 7, 9, 11, 13, 15]),
+            // Square cells: at least 3 columns.
+            ((12, 12), [3, 3, 3, 5, 5, 7, 7, 9]),
+            // Very tall cells: one row already needs 5 columns.
+            ((5, 20), [5, 9, 13, 17, 21, 25, 29, 33]),
         ];
-        for ((width, height), size, outer) in cases {
-            let g = layout_board(Rect::new(0, 0, width, height), false)
-                .unwrap_or_else(|| panic!("{width}x{height} should fit"));
-            assert_eq!((g.square_w, g.square_h), size, "{width}x{height}");
-            assert_eq!(g.outer, outer, "{width}x{height}");
+        for ((cell_w, cell_h), widths) in cases {
+            let cell = CellSize::new(cell_w, cell_h);
+            for (square_h, width) in (1..=8).zip(widths) {
+                assert_eq!(
+                    square_width(square_h, cell),
+                    width,
+                    "{cell_w}x{cell_h} font, {square_h} rows"
+                );
+            }
+        }
+        // Huge values saturate instead of overflowing.
+        assert_eq!(square_width(u16::MAX, CellSize::new(1, u16::MAX)), u16::MAX);
+        assert_eq!(square_width(0, CellSize::DEFAULT), 3);
+    }
+
+    #[test]
+    fn layout_picks_the_tallest_square_that_fits_and_centres_it() {
+        // (area, font, square size, outer rect)
+        let cases = [
+            ((80, 24), (10, 20), (5, 2), Rect::new(19, 3, 41, 17)),
+            ((120, 40), (10, 20), (9, 4), Rect::new(23, 3, 73, 33)),
+            ((200, 60), (10, 20), (15, 7), Rect::new(39, 1, 121, 57)),
+            ((60, 20), (10, 20), (5, 2), Rect::new(9, 1, 41, 17)),
+            ((40, 16), (10, 20), (3, 1), Rect::new(7, 3, 25, 9)),
+            ((25, 9), (10, 20), (3, 1), Rect::new(0, 0, 25, 9)),
+            // Limited by width: shorter squares, centred vertically.
+            ((73, 60), (10, 20), (9, 4), Rect::new(0, 13, 73, 33)),
+            ((74, 60), (10, 20), (9, 4), Rect::new(0, 13, 73, 33)),
+            ((80, 40), (10, 25), (9, 3), Rect::new(3, 7, 73, 25)),
+            // A taller font needs more columns per square, a wider one fewer.
+            ((120, 40), (10, 25), (11, 4), Rect::new(15, 3, 89, 33)),
+            ((80, 40), (12, 12), (5, 4), Rect::new(19, 3, 41, 33)),
+        ];
+        for ((width, height), (cell_w, cell_h), size, outer) in cases {
+            let at = format!("{width}x{height} with a {cell_w}x{cell_h} font");
+            let g = layout_board(
+                Rect::new(0, 0, width, height),
+                false,
+                CellSize::new(cell_w, cell_h),
+            )
+            .unwrap_or_else(|| panic!("{at} should fit"));
+            assert_eq!((g.square_w, g.square_h), size, "{at}");
+            assert_eq!(g.outer, outer, "{at}");
             assert_eq!(
                 g.grid,
                 Rect::new(outer.x + 1, outer.y, 8 * size.0, 8 * size.1),
-                "{width}x{height}"
+                "{at}"
             );
         }
     }
 
     #[test]
+    fn a_very_narrow_font_still_gets_the_smallest_squares() {
+        // One-row squares would be 5 columns wide (41 with labels): too wide for 30.
+        let tall = CellSize::new(5, 20);
+        let g = layout_board(Rect::new(0, 0, 30, 20), false, tall).expect("fits");
+        assert_eq!((g.square_w, g.square_h), MIN_SQUARE);
+        assert_eq!(g.outer, Rect::new(2, 5, 25, 9));
+        // With the room, the font's own width wins.
+        let g = layout_board(Rect::new(0, 0, 41, 20), false, tall).expect("fits");
+        assert_eq!((g.square_w, g.square_h), (5, 1));
+    }
+
+    #[test]
     fn layout_is_none_when_too_small() {
-        for (width, height) in [(24, 9), (25, 8), (0, 0), (100, 8), (24, 100)] {
-            assert_eq!(layout_board(Rect::new(0, 0, width, height), false), None);
+        for cell in [
+            CellSize::DEFAULT,
+            CellSize::new(5, 20),
+            CellSize::new(20, 10),
+        ] {
+            for (width, height) in [(24, 9), (25, 8), (0, 0), (100, 8), (24, 100)] {
+                assert_eq!(
+                    layout_board(Rect::new(0, 0, width, height), false, cell),
+                    None
+                );
+            }
         }
     }
 
     #[test]
     fn layout_respects_the_area_origin_and_flip() {
-        let g = layout_board(Rect::new(10, 5, 26, 10), true).expect("fits");
+        let g = layout_board(Rect::new(10, 5, 26, 10), true, CellSize::DEFAULT).expect("fits");
         assert_eq!(g.outer, Rect::new(10, 5, 25, 9));
         assert_eq!(g.grid, Rect::new(11, 5, 24, 8));
         assert!(g.flipped);
@@ -475,7 +630,7 @@ mod tests {
 
     #[test]
     fn square_rect_and_square_at_round_trip() {
-        for (w, h) in SQUARE_SIZES {
+        for (w, h) in SIZES {
             for flipped in [false, true] {
                 for (x, y) in [(0, 0), (7, 4)] {
                     let g = geometry(w, h, x, y, flipped);
@@ -501,7 +656,7 @@ mod tests {
 
     #[test]
     fn white_is_at_the_bottom_unless_flipped() {
-        for (w, h) in SQUARE_SIZES {
+        for (w, h) in SIZES {
             let g = geometry(w, h, 0, 0, false);
             let bottom = g.grid.bottom() - 1;
             let right = g.grid.right() - 1;
@@ -519,7 +674,7 @@ mod tests {
 
     #[test]
     fn clicks_outside_the_grid_miss() {
-        for (w, h) in SQUARE_SIZES {
+        for (w, h) in SIZES {
             for flipped in [false, true] {
                 let g = geometry(w, h, 3, 2, flipped);
                 let grid = g.grid;

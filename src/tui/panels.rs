@@ -1,20 +1,23 @@
-//! Drawing every screen (spec sections 6.2 and 6.3).
+//! Drawing every screen (spec sections 6.2, 6.3 and 9.2).
 //!
 //! [`draw`] renders an [`App`] through its public accessors only: the menu, the playing
 //! screen's panels, the game-over overlay, the top dialog and the too-small notice. It
 //! returns the [`HitMap`] of everything clickable, which the app keeps for the next mouse
 //! event, and the move-list scroll clamped to what the list can show.
 //!
-//! Playing layout: the left column holds the Board block, sized for the largest board that
-//! fits beside the narrowest side column, with the Command box under it. The right column
-//! stacks Status, the computer's panel (titled "Jev" or "Local search", only in games
-//! against the computer), Moves and Captured with shared borders. On wide terminals the
-//! right column stops growing at [`SIDE_MAX_WIDTH`] and the whole layout is centred.
+//! Playing layout: the screen fills the terminal. The left column holds the Board block,
+//! sized for the largest board that fits beside the narrowest side column
+//! ([`SIDE_MIN_WIDTH`]) with squares shaped for the font ([`App::cell_size`]), and the
+//! Command box under it. The right column takes every column left over and stacks Status,
+//! the computer's panel (titled "Jev" or "Local search", only in games against the
+//! computer), Moves and Captured with shared borders. A board limited by the width is
+//! centred vertically in its block, which still fills the column.
 //!
-//! Status has a fixed height per mode and terminal height, so it never jumps. The Jev panel
-//! grows with its text (the source, Jev's top three, confidence, latency, model and the
-//! note) and takes the rows from Moves, which keeps at least [`MOVES_MIN_ROWS`]; when even
-//! that is not enough, only the note is cut short, ending in `…`.
+//! Status and Captured have fixed heights (Status per mode and terminal height), so they
+//! never jump. The Jev panel grows with its text (the source, Jev's top three, confidence,
+//! latency, model and the note) and takes the rows from Moves, which gets the rest and
+//! keeps at least [`MOVES_MIN_ROWS`]; when even that is not enough, only the note is cut
+//! short, ending in `…`. Menu, dialogs, help and the game-over overlay stay centred boxes.
 //!
 //! The snapshot tests at the bottom of this file render every screen; their files in
 //! `src/tui/snapshots/` (`chess__tui__panels__tests__*.snap`) show the exact output at
@@ -40,7 +43,7 @@ use super::app::{
     Message, Mode, PROMOTION_CHOICES, Question, Screen, SidePick, TOO_SMALL, WAITING_FOR_ENGINE,
     is_too_small, move_rows, outcome_text,
 };
-use super::board::{BoardGeometry, BoardView, layout_board};
+use super::board::{BoardGeometry, BoardView, CellSize, layout_board};
 use super::glyphs::{self, ELLIPSIS, GlyphSet, Palette, char_width};
 use super::input::LineEditor;
 use crate::core::{Color as Side, Game, Piece, PieceKind, Position as ChessPosition};
@@ -67,10 +70,9 @@ pub const HELP_LINES: [&str; 13] = [
 /// Width of the key column in [`HELP_LINES`].
 pub const HELP_KEY_WIDTH: usize = 10;
 
-/// Narrowest right column; the board shrinks before the column does.
+/// Narrowest right column; the board shrinks before the column does. The column takes
+/// every column the board leaves.
 pub const SIDE_MIN_WIDTH: u16 = 30;
-/// Widest right column; wider terminals centre the layout instead.
-pub const SIDE_MAX_WIDTH: u16 = 48;
 /// Height of the Command box (one text row between borders).
 const COMMAND_HEIGHT: u16 = 3;
 /// Side panel chrome across: two borders and the blank column on the left.
@@ -303,11 +305,11 @@ struct PlayingLayout {
     captured: Rect,
 }
 
-/// The playing screen's two columns in `area`: the left edge of the layout, the board
-/// column's width and the right column's width.
-fn columns(area: Rect) -> (u16, u16, u16) {
+/// The playing screen's two columns in `area`, which together take its full width: the
+/// board column's width and the right column's width.
+fn columns(area: Rect, cell: CellSize) -> (u16, u16) {
     // The largest board whose block fits beside the narrowest right column and above the
-    // command box.
+    // command box; the block is exactly as wide as that board.
     let room = Rect::new(
         0,
         0,
@@ -316,21 +318,15 @@ fn columns(area: Rect) -> (u16, u16, u16) {
         area.height
             .saturating_sub(COMMAND_HEIGHT.saturating_add(BOARD_CHROME_HEIGHT)),
     );
-    let board_width = layout_board(room, false).map_or(area.width / 2, |g| {
+    let board_width = layout_board(room, false, cell).map_or(area.width / 2, |g| {
         g.outer.width.saturating_add(BOARD_CHROME_WIDTH)
     });
-    let side_width = area.width.saturating_sub(board_width).min(SIDE_MAX_WIDTH);
-    let x = area.x
-        + area
-            .width
-            .saturating_sub(board_width.saturating_add(side_width))
-            / 2;
-    (x, board_width, side_width)
+    (board_width, area.width.saturating_sub(board_width))
 }
 
 /// Text width inside the right column's panels.
-fn side_text_width(area: Rect) -> u16 {
-    let (_, _, side_width) = columns(area);
+fn side_text_width(area: Rect, cell: CellSize) -> u16 {
+    let (_, side_width) = columns(area, cell);
     side_width.saturating_sub(SIDE_CHROME_WIDTH)
 }
 
@@ -346,14 +342,20 @@ fn status_rows(mode: Mode, height: u16) -> u16 {
     }
 }
 
-/// Lays out the playing screen in `area` (not [`is_too_small`]). The Status panel gets
-/// `status_rows` text rows; the Jev panel, when `jev_rows` is given, gets that many (at
-/// least [`JEV_MIN_ROWS`]) as long as Moves keeps [`MOVES_MIN_ROWS`]; Moves gets the rest.
-fn playing_layout(area: Rect, status_rows: u16, jev_rows: Option<u16>) -> PlayingLayout {
-    let (x, board_width, side_width) = columns(area);
+/// Lays out the playing screen in `area` (not [`is_too_small`]) for the font `cell`, using
+/// every cell of it. The Status panel gets `status_rows` text rows and Captured
+/// [`CAPTURED_ROWS`]; the Jev panel, when `jev_rows` is given, gets that many (at least
+/// [`JEV_MIN_ROWS`]) as long as Moves keeps [`MOVES_MIN_ROWS`]; Moves gets the rest.
+fn playing_layout(
+    area: Rect,
+    cell: CellSize,
+    status_rows: u16,
+    jev_rows: Option<u16>,
+) -> PlayingLayout {
+    let (board_width, side_width) = columns(area, cell);
     let command_height = COMMAND_HEIGHT.min(area.height);
-    let board = Rect::new(x, area.y, board_width, area.height - command_height);
-    let command = Rect::new(x, board.bottom(), board_width, command_height);
+    let board = Rect::new(area.x, area.y, board_width, area.height - command_height);
+    let command = Rect::new(area.x, board.bottom(), board_width, command_height);
 
     let right = Rect::new(board.right(), area.y, side_width, area.height);
     let panels: u16 = if jev_rows.is_some() { 4 } else { 3 };
@@ -389,11 +391,12 @@ fn playing_layout(area: Rect, status_rows: u16, jev_rows: Option<u16>) -> Playin
 
 /// The board, the command box and the side panels.
 fn playing(frame: &mut Frame, area: Rect, app: &App, now: Instant, drawn: &mut Drawn) {
-    let text_width = side_text_width(area);
+    let text_width = side_text_width(area, app.cell_size());
     let jev = (app.mode() != Mode::HumanVsHuman)
         .then(|| JevText::new(app.last_computer(), app.engine_status(), text_width));
     let layout = playing_layout(
         area,
+        app.cell_size(),
         status_rows(app.mode(), area.height),
         jev.as_ref().map(JevText::rows),
     );
@@ -433,7 +436,7 @@ fn board_panel(frame: &mut Frame, area: Rect, app: &App) -> Option<BoardGeometry
         .padding(Padding::horizontal(1));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let geometry = layout_board(inner, app.flipped())?;
+    let geometry = layout_board(inner, app.flipped(), app.cell_size())?;
     let highlights = app.highlights();
     frame.render_widget(
         BoardView {
@@ -1296,7 +1299,8 @@ mod tests {
     use ratatui::widgets::Widget;
 
     use super::*;
-    use crate::core::START_FEN;
+    use crate::core::{START_FEN, Square};
+    use crate::tui::board::{square_at, square_rect};
     use crate::tui::event::AppEvent;
     use crate::tui::glyphs::initial_glyphs;
     use crate::tui::test_support::engine::{FakeEngine, JEV_STATUS};
@@ -1313,7 +1317,12 @@ mod tests {
     fn panel_rows(h: &Harness, title: &str) -> Vec<String> {
         let buffer = h.buffer();
         let area = buffer.area;
-        let layout = playing_layout(area, status_rows(h.app.mode(), area.height), None);
+        let layout = playing_layout(
+            area,
+            h.app.cell_size(),
+            status_rows(h.app.mode(), area.height),
+            None,
+        );
         let (left, right) = (layout.status.x, layout.status.right());
         let rows: Vec<String> = (0..area.height)
             .map(|y| (left..right).map(|x| buffer[(x, y)].symbol()).collect())
@@ -1394,80 +1403,238 @@ mod tests {
         h
     }
 
+    /// Terminal sizes the layout is checked at, from the minimum up.
+    const SIZES: [(u16, u16); 5] = [(60, 20), (80, 24), (120, 40), (200, 60), (300, 100)];
+    /// Font sizes (cell width × height in pixels) the layout is checked with.
+    const FONTS: [(u16, u16); 3] = [(10, 20), (8, 16), (16, 32)];
+
+    /// An app with a `cell_w`×`cell_h` pixel font in a `width`×`height` terminal, started
+    /// from the menu with `key` (against Jev for '2' to '5').
+    fn with_font((width, height): (u16, u16), (cell_w, cell_h): (u16, u16), key: char) -> Harness {
+        let mut h = Harness::build(FakeEngine::jev(), (width, height), Vec::new(), |mut app| {
+            app.set_cell_size(CellSize::new(cell_w, cell_h));
+            app
+        });
+        h.char(key);
+        h
+    }
+
     #[test]
-    fn playing_layout_fits_every_size() {
-        let sizes = [
+    fn the_board_takes_the_tallest_squares_that_fit() {
+        // (terminal, font, square width and height). The three fonts are all twice as tall
+        // as wide, so they agree; other shapes follow.
+        let cases = [
             ((60, 20), (3, 1)),
             ((80, 24), (5, 2)),
-            ((100, 30), (7, 3)),
-            ((120, 40), (7, 3)),
-            ((200, 60), (7, 3)),
-            ((70, 50), (3, 1)),
+            ((120, 40), (9, 4)),
+            ((200, 60), (13, 6)),
+            ((300, 100), (23, 11)),
         ];
-        for ((width, height), square) in sizes {
-            let area = Rect::new(0, 0, width, height);
-            for with_jev in [false, true] {
-                let mode = if with_jev {
-                    Mode::JevVsJev
-                } else {
-                    Mode::HumanVsHuman
-                };
-                let jev_rows = with_jev.then_some(40);
-                let l = playing_layout(area, status_rows(mode, height), jev_rows);
-                let at = format!("{width}x{height} jev={with_jev}");
-                let inner = Block::bordered()
-                    .padding(Padding::horizontal(1))
-                    .inner(l.board);
-                let board = layout_board(inner, false).expect("board fits");
-                assert_eq!((board.square_w, board.square_h), square, "{at}");
-                assert_eq!(board.outer.width, inner.width, "no spare columns: {at}");
-                assert_eq!(
-                    (l.command.x, l.command.y, l.command.width, l.command.height),
-                    (l.board.x, l.board.bottom(), l.board.width, COMMAND_HEIGHT),
-                    "{at}"
-                );
-                assert_eq!(l.command.bottom(), area.bottom(), "{at}");
-                let side = l.status.width;
-                assert!((SIDE_MIN_WIDTH..=SIDE_MAX_WIDTH).contains(&side), "{at}");
-                assert_eq!(l.status.x, l.board.right(), "{at}");
-                // Centred: the margins differ by at most one column.
-                let left = l.board.x - area.x;
-                let right = area.right() - l.status.right();
-                assert!(left.abs_diff(right) <= 1, "{at}");
-                // The right column: full height, one shared border row between panels.
-                let column: Vec<Rect> = [Some(l.status), l.jev, Some(l.moves), Some(l.captured)]
-                    .into_iter()
-                    .flatten()
-                    .collect();
-                assert_eq!(column.len(), if with_jev { 4 } else { 3 }, "{at}");
-                assert_eq!(column[0].y, area.y, "{at}");
-                for pair in column.windows(2) {
-                    assert_eq!(pair[1].y, pair[0].bottom() - 1, "{at}");
-                    assert_eq!((pair[1].x, pair[1].width), (l.status.x, side), "{at}");
-                }
-                assert_eq!(l.captured.bottom(), area.bottom(), "{at}");
-                assert!(
-                    l.moves.height >= MOVES_MIN_ROWS + 2,
-                    "room for three moves: {at}"
-                );
-                assert_eq!(l.status.height, status_rows(mode, height) + 2, "{at}");
-                if let Some(jev) = l.jev {
-                    assert!(jev.height >= JEV_MIN_ROWS + 2, "{at}");
+        for ((width, height), square) in cases {
+            for font in FONTS {
+                let h = with_font((width, height), font, '1');
+                let g = h.app.hit_map().board.expect("board drawn");
+                let at = format!("{width}x{height} with a {font:?} font");
+                assert_eq!((g.square_w, g.square_h), square, "{at}");
+            }
+        }
+        // A 10x25 font makes squares wider: at 120x40 four rows would need 11 columns,
+        // which leave the side column too narrow, so the board is limited by the width.
+        let cases = [
+            ((60, 20), (3, 1)),
+            ((80, 24), (5, 2)),
+            ((120, 40), (9, 3)),
+            ((200, 60), (15, 6)),
+            ((300, 100), (29, 11)),
+        ];
+        for ((width, height), square) in cases {
+            let h = with_font((width, height), (10, 25), '1');
+            let g = h.app.hit_map().board.expect("board drawn");
+            assert_eq!((g.square_w, g.square_h), square, "{width}x{height}");
+        }
+    }
+
+    #[test]
+    fn the_playing_screen_uses_every_cell() {
+        for (width, height) in SIZES {
+            for font in FONTS.into_iter().chain([(10, 25), (5, 20)]) {
+                for with_jev in [false, true] {
+                    let at = format!("{width}x{height} font={font:?} jev={with_jev}");
+                    let area = Rect::new(0, 0, width, height);
+                    let (mode, jev_rows) = if with_jev {
+                        (Mode::JevVsJev, Some(40))
+                    } else {
+                        (Mode::HumanVsHuman, None)
+                    };
+                    let cell = CellSize::new(font.0, font.1);
+                    let l = playing_layout(area, cell, status_rows(mode, height), jev_rows);
+
+                    // Left column: the board block over the command box, full height.
+                    assert_eq!((l.board.x, l.board.y), (area.x, area.y), "{at}");
+                    assert_eq!(
+                        l.command,
+                        Rect::new(l.board.x, l.board.bottom(), l.board.width, COMMAND_HEIGHT),
+                        "{at}"
+                    );
+                    assert_eq!(l.command.bottom(), area.bottom(), "{at}");
+                    // The board block is exactly as wide as its board: no spare columns.
+                    let inner = Block::bordered()
+                        .padding(Padding::horizontal(1))
+                        .inner(l.board);
+                    let board = layout_board(inner, false, cell).expect("board fits");
+                    assert_eq!(board.outer.width, inner.width, "{at}");
+
+                    // Right column: every column left, at least the minimum, full height,
+                    // one shared border row between panels.
+                    let column: Vec<Rect> =
+                        [Some(l.status), l.jev, Some(l.moves), Some(l.captured)]
+                            .into_iter()
+                            .flatten()
+                            .collect();
+                    assert_eq!(column.len(), if with_jev { 4 } else { 3 }, "{at}");
+                    for rect in &column {
+                        assert_eq!(rect.x, l.board.right(), "{at}");
+                        assert_eq!(rect.right(), area.right(), "{at}");
+                    }
+                    assert!(l.status.width >= SIDE_MIN_WIDTH, "{at}");
+                    assert_eq!(column[0].y, area.y, "{at}");
+                    for pair in column.windows(2) {
+                        assert_eq!(pair[1].y, pair[0].bottom() - 1, "{at}");
+                    }
+                    assert_eq!(l.captured.bottom(), area.bottom(), "{at}");
+
+                    // Status and Captured keep their heights; Moves takes what Jev leaves.
+                    assert_eq!(l.status.height, status_rows(mode, height) + 2, "{at}");
+                    assert_eq!(l.captured.height, CAPTURED_ROWS + 2, "{at}");
+                    assert!(l.moves.height >= MOVES_MIN_ROWS + 2, "{at}");
+                    if let Some(jev) = l.jev {
+                        assert!(jev.height >= JEV_MIN_ROWS + 2, "{at}");
+                    }
                 }
             }
         }
     }
 
     #[test]
+    fn the_drawn_screen_reaches_every_edge() {
+        for size in SIZES {
+            for font in FONTS {
+                for key in ['1', '2'] {
+                    let h = with_font(size, font, key);
+                    let at = format!("{size:?} font={font:?} key={key}");
+                    let buffer = h.buffer();
+                    let (right, bottom) = (size.0 - 1, size.1 - 1);
+                    assert_eq!(buffer[(0, 0)].symbol(), "┌", "{at}");
+                    assert_eq!(buffer[(right, 0)].symbol(), "┐", "{at}");
+                    assert_eq!(buffer[(0, bottom)].symbol(), "└", "{at}");
+                    assert_eq!(buffer[(right, bottom)].symbol(), "┘", "{at}");
+                    for y in 1..bottom {
+                        assert_ne!(buffer[(0, y)].symbol(), " ", "{at} row {y}");
+                        assert_ne!(buffer[(right, y)].symbol(), " ", "{at} row {y}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_right_column_panels_stretch() {
+        // Jev's text needs a few rows; Moves takes the rest of a tall terminal.
+        let h = with_font((300, 100), (10, 20), '2');
+        let area = h.buffer().area;
+        let rows = status_rows(h.app.mode(), area.height);
+        let jev = JevText::new(
+            None,
+            h.app.engine_status(),
+            side_text_width(area, h.app.cell_size()),
+        );
+        let l = playing_layout(area, h.app.cell_size(), rows, Some(jev.rows()));
+        let jev_rect = l.jev.expect("jev panel");
+        assert_eq!(jev_rect.height, JEV_MIN_ROWS + 2);
+        // Four panels share three border rows.
+        assert_eq!(
+            l.moves.height,
+            area.height - (rows + 2) - (JEV_MIN_ROWS + 2) - (CAPTURED_ROWS + 2) + 3
+        );
+        assert_eq!(
+            panel_rows(&h, "Moves").len(),
+            usize::from(l.moves.height - 2)
+        );
+    }
+
+    #[test]
+    fn a_board_limited_by_width_is_centred_in_a_full_height_block() {
+        // Tall and narrow: the side column's minimum width limits the board.
+        for (size, font) in [
+            ((70, 50), (10, 20)),
+            ((120, 40), (10, 25)),
+            ((60, 40), (8, 16)),
+        ] {
+            let h = with_font(size, font, '1');
+            let at = format!("{size:?} font={font:?}");
+            let g = h.app.hit_map().board.expect("board drawn");
+            let block = playing_layout(
+                h.buffer().area,
+                h.app.cell_size(),
+                status_rows(h.app.mode(), size.1),
+                None,
+            )
+            .board;
+            assert_eq!(block.height, size.1 - COMMAND_HEIGHT, "{at}");
+            let inner = Rect::new(block.x + 2, block.y + 1, block.width - 4, block.height - 2);
+            assert_eq!(g.outer.width, inner.width, "{at}");
+            let (above, below) = (g.outer.y - inner.y, inner.bottom() - g.outer.bottom());
+            assert!(above + below >= 8, "width-limited: {at}");
+            assert!(above.abs_diff(below) <= 1, "centred: {at}");
+        }
+    }
+
+    #[test]
+    fn every_square_is_hit_at_every_size() {
+        for size in SIZES {
+            for font in FONTS.into_iter().chain([(10, 25)]) {
+                // Human vs Human (White at the bottom), then flipped with `f`.
+                let mut h = with_font(size, font, '1');
+                for flipped in [false, true] {
+                    if flipped {
+                        h.char('f');
+                    }
+                    let at = format!("{size:?} font={font:?} flipped={flipped}");
+                    let g = h.app.hit_map().board.expect("board drawn");
+                    assert_eq!(g.flipped, flipped, "{at}");
+                    let mut covered = 0;
+                    for sq in Square::all() {
+                        let rect = square_rect(&g, sq);
+                        assert_eq!(rect.intersection(g.grid), rect, "{at}: {sq}");
+                        for pos in rect.positions() {
+                            assert_eq!(square_at(&g, pos.x, pos.y), Some(sq), "{at}: {pos:?}");
+                            covered += 1;
+                        }
+                    }
+                    assert_eq!(covered, g.grid.area(), "{at}");
+                }
+            }
+        }
+        // And clicks land: a move by mouse on the largest board, flipped.
+        let mut h = with_font((300, 100), (10, 20), '1');
+        h.char('f');
+        h.click_square(sq("e2"));
+        h.click_square(sq("e4"));
+        assert_eq!(h.uci(), ["e2e4"]);
+        h.drag_square(sq("g8"), sq("f6"));
+        assert_eq!(h.uci(), ["e2e4", "g8f6"]);
+    }
+
+    #[test]
     fn the_jev_panel_grows_with_its_text_and_moves_gives_way() {
         let area = Rect::new(0, 0, 80, 24);
         let rows = status_rows(Mode::HumanVsJev { human: Side::White }, 24);
-        let short = playing_layout(area, rows, Some(1));
-        let long = playing_layout(area, rows, Some(6));
+        let short = playing_layout(area, CellSize::DEFAULT, rows, Some(1));
+        let long = playing_layout(area, CellSize::DEFAULT, rows, Some(6));
         assert_eq!(short.jev.expect("jev").height, JEV_MIN_ROWS + 2);
         assert_eq!(long.jev.expect("jev").height, 6 + 2);
         assert_eq!(short.moves.height - long.moves.height, 6 - JEV_MIN_ROWS);
-        let huge = playing_layout(area, rows, Some(100));
+        let huge = playing_layout(area, CellSize::DEFAULT, rows, Some(100));
         assert_eq!(
             huge.moves.height,
             MOVES_MIN_ROWS + 2,
@@ -1556,7 +1723,13 @@ mod tests {
     fn status_title(h: &Harness) -> String {
         let buffer = h.buffer();
         let area = buffer.area;
-        let status = playing_layout(area, status_rows(h.app.mode(), area.height), None).status;
+        let status = playing_layout(
+            area,
+            h.app.cell_size(),
+            status_rows(h.app.mode(), area.height),
+            None,
+        )
+        .status;
         (status.x..status.right())
             .map(|x| buffer[(x, status.y)].symbol())
             .collect()
