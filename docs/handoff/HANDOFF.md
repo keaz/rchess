@@ -4,10 +4,10 @@ Read this first. Follow the protocol in section 8 of
 `docs/superpowers/specs/2026-09-26-rchess-redesign-design.md`.
 
 ## Current
-Sub-project: tui (not started) | Plan: to be written — docs/superpowers/plans/2026-09-26-tui.md
-Branch: fix/engine-pin-and-endpoint (from main @ 86e1ed5; head is the commit after 6a520fc, "fix(engine): let kings respect pinned guards in SEE and tidy follow-up tests") — ready for the user to merge into main
-Last completed task: engine follow-up — SEE pin release fixed, `new_attack` pin-aware, Jev endpoint fixed (no `JEV_*` URL variable)
-Next task: TUI brainstorming, then plan, from spec section 6 (read "Core API caveats", the engine caveats and "Known open issues" first)
+Sub-project: tui (not started) | Plan: to be written — docs/superpowers/plans/2026-09-27-tui.md
+Branch: main @ e768bfc (fix/engine-pin-and-endpoint fast-forward merged, then deleted)
+Last completed task: engine follow-up merged (SEE pin release fixed, Jev endpoint fixed to the quickstart URL)
+Next task: brainstorm/plan the TUI from spec section 6 (read "Core API caveats", the engine caveats and "Known open issues" first)
 State: green (except 3 pre-existing old-code test failures)
 
 ## Verify before continuing
@@ -63,12 +63,16 @@ cargo test --lib engine:: && cargo test --lib core:: && cargo test --test core_p
 - Final-review fix wave: a mate on the 100th half-move now outranks the fifty-move rule; SEE ignores pinned pieces off their pin line; annotation facts corrected ("exposed to capture" wording, no such fact for the capturing piece, a king only attacks undefended pieces); base-URL variable validated (since removed by the engine follow-up); transport errors classified (new `JevError::Request`), 1 MiB body cap and offline TcpListener tests; notes stripped of control characters; public docs, `ComputerPlayer` Debug and `MoveSource` Display; harness `jev pick` column and answered-only latency.
 
 ## Known open issues
-- Engine minor follow-ups: `ComputerMove.model` and Transport/Request error text skip the control-character sanitiser; the historical engine plan still uses the old "undefended against capture" wording.
+- Engine minor: annotate's "undefended" qualifier (annotate.rs, capture branch) counts a king as a recapturer even when the recapture would be illegal, e.g. `8/8/8/2k5/3n4/5B2/3QK3/8 w - - 0 1` Qxd4 reads "wins material in the exchange" instead of "undefended". SEE values are correct.
+- Engine minor: `ComputerMove.model` and Transport/Request error text skip the control-character sanitiser.
+- Docs nit: the spec (5.2) and older Notes lines name the endpoint `jev::JEV_ENDPOINT`; the public path is `chess::engine::JEV_ENDPOINT`.
+- Historical engine plan text still uses the old "undefended against capture" wording and mentions `JEV_BASE_URL`.
 
 ## Open questions for user
 - None.
 
 ## Log (newest first)
+- 2026-09-27 fix/engine-pin-and-endpoint merged into main: SEE pins recomputed after the first capture, kings respect pinned guards, fixed Jev endpoint (JEV_BASE_URL removed), wire format pinned to the quickstart.
 - 2026-09-27 engine follow-up on fix/engine-pin-and-endpoint: SEE pin release fixed, pin-aware `new_attack`, fixed Jev endpoint (base-URL variable removed); ready to merge; next: TUI brainstorming.
 - 2026-09-27 feat/jev-engine fast-forward merged into main (engine DONE); SEE pin-release issue left open by user choice, recorded under Known open issues.
 - 2026-09-26 engine final-review fix wave (F1–F18): mate before fifty-move rule, pin-aware SEE, annotation fixes, transport hardening and offline tests, API polish, harness columns, docs
