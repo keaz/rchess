@@ -15,7 +15,7 @@ expression: h.terminal.backend()
 "│ 4                      ♟︎                  ││ Jev picked Qh4, which the search│"
 "│                                           ││ rates much worse; played Nf6    │"
 "│ 3                                         │├ Moves ──────────────────────────┤"
-"│                                           ││ 1. e4 Nf6                       │"
+"│                                           ││ 1. e4   Nf6                     │"
 "│ 2  ♟︎    ♟︎    ♟︎    ♟︎         ♟︎    ♟︎    ♟︎   ││                                 │"
 "│                                           ││                                 │"
 "│ 1  ♜    ♞    ♝    ♛    ♚    ♝    ♞    ♜   ││                                 │"

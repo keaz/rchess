@@ -2866,8 +2866,17 @@ mod tests {
         assert!(rows.len() > visible, "the list overflows at 60x20");
         let (first, last) = (rows[0].as_str(), rows[rows.len() - 1].as_str());
         assert_eq!(first, "1. e4 e5");
-        assert!(h.screen().contains(last));
-        assert!(!h.screen().contains(first), "the latest rows are shown");
+        // The list pads White's moves into a column; compare with the spaces collapsed.
+        let shows = |h: &Harness, row: &str| {
+            h.screen().lines().any(|line| {
+                line.split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .contains(row)
+            })
+        };
+        assert!(shows(&h, last));
+        assert!(!shows(&h, first), "the latest rows are shown");
         // The wheel works only over the move list.
         let board = h.app.hit_map().board.expect("board").outer;
         h.mouse(MouseEventKind::ScrollUp, board.x + 1, board.y + 1);
@@ -2878,13 +2887,13 @@ mod tests {
         }
         let most = rows.len() - visible;
         assert_eq!(h.app.move_scroll(), most, "clamped to what does not fit");
-        assert!(h.screen().contains(first));
-        assert!(!h.screen().contains(last));
+        assert!(shows(&h, first));
+        assert!(!shows(&h, last));
         for _ in 0..most {
             h.mouse(MouseEventKind::ScrollDown, x, y);
         }
         assert_eq!(h.app.move_scroll(), 0);
-        assert!(h.screen().contains(last));
+        assert!(shows(&h, last));
     }
 
     // ----- command box -----

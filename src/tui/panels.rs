@@ -755,8 +755,28 @@ fn cut_to_fit(text: &str, width: u16, rows: u16) -> String {
         .unwrap_or_else(|| ELLIPSIS.to_string())
 }
 
+/// Narrowest column for White's moves: `e4` or `Nf3` and at least two spaces, as in the
+/// spec's `1. e4   e5` / `2. Nf3  Nc6`.
+const WHITE_MOVE_COLUMN: usize = 5;
+
+/// A [`move_rows`] row as its move number, White's move (`...` when the game starts with
+/// Black to move) and Black's move: `12... Kd7` gives `("12", "...", Some("Kd7"))`.
+fn split_move_row(row: &str) -> (&str, &str, Option<&str>) {
+    let (number, moves) = row.split_once(' ').unwrap_or((row, ""));
+    if let Some(number) = number.strip_suffix("...") {
+        return (number, "...", Some(moves));
+    }
+    let number = number.strip_suffix('.').unwrap_or(number);
+    match moves.split_once(' ') {
+        Some((white, black)) => (number, white, Some(black)),
+        None => (number, moves, None),
+    }
+}
+
 /// The move list, scrolled `scroll` rows up from the latest (clamped and returned). Move
-/// numbers are right-aligned and the latest row is bold.
+/// numbers are right-aligned, White's moves are padded to one width (at least
+/// [`WHITE_MOVE_COLUMN`], wider when a long move needs it) so Black's line up, and the
+/// latest row is bold.
 fn moves_panel(frame: &mut Frame, area: Rect, rows: &[String], scroll: usize) -> usize {
     let mut block = side_block("Moves");
     let visible = usize::from(block.inner(area).height);
@@ -768,16 +788,25 @@ fn moves_panel(frame: &mut Frame, area: Rect, rows: &[String], scroll: usize) ->
         side_panel(frame, area, block, vec![Line::from("no moves yet").dim()]);
         return 0;
     }
-    let number_width = |row: &str| row.find('.').unwrap_or(0);
-    let widest = rows.iter().map(|row| number_width(row)).max().unwrap_or(0);
+    let split: Vec<_> = rows.iter().map(|row| split_move_row(row)).collect();
+    let number_width = split.iter().map(|(n, _, _)| n.len()).max().unwrap_or(0);
+    let white_width = split
+        .iter()
+        .map(|(_, white, _)| Span::raw(*white).width() + 2)
+        .max()
+        .unwrap_or(0)
+        .max(WHITE_MOVE_COLUMN);
     let end = rows.len() - scroll;
     let start = end.saturating_sub(visible);
-    let lines: Vec<Line> = rows[start..end]
+    let lines: Vec<Line> = split[start..end]
         .iter()
         .zip(start..)
-        .map(|(row, index)| {
-            let pad = " ".repeat(widest - number_width(row));
-            let line = Line::from(format!("{pad}{row}"));
+        .map(|(&(number, white, black), index)| {
+            let text = match black {
+                Some(black) => format!("{number:>number_width$}. {white:<white_width$}{black}"),
+                None => format!("{number:>number_width$}. {white}"),
+            };
+            let line = Line::from(text);
             if index + 1 == rows.len() {
                 line.bold()
             } else {
@@ -1944,10 +1973,10 @@ mod tests {
         let screen = terminal.backend().to_string();
         assert!(screen.contains("+7 below"), "{screen}");
         assert!(
-            screen.contains("  1. a3 a6"),
+            screen.contains("  1. a3   a6"),
             "numbers right-aligned: {screen}"
         );
-        assert!(!screen.contains("6. a3 a6"), "{screen}");
+        assert!(!screen.contains("6. a3"), "{screen}");
 
         terminal
             .draw(|frame| scroll = moves_panel(frame, frame.area(), &rows, 0))
@@ -1955,10 +1984,49 @@ mod tests {
         assert_eq!(scroll, 0);
         let screen = terminal.backend().to_string();
         assert!(
-            screen.contains("12. a3 a6") && screen.contains(" 8. a3 a6"),
+            screen.contains("12. a3   a6") && screen.contains(" 8. a3   a6"),
             "{screen}"
         );
         assert!(!screen.contains("below"), "{screen}");
+    }
+
+    #[test]
+    fn the_move_list_lines_up_blacks_moves() {
+        let rows = |list: &[&str]| -> Vec<String> {
+            let rows: Vec<String> = list.iter().map(|row| (*row).to_string()).collect();
+            let mut terminal = Terminal::new(TestBackend::new(24, 7)).expect("test terminal");
+            terminal
+                .draw(|frame| {
+                    moves_panel(frame, frame.area(), &rows, 0);
+                })
+                .expect("draw");
+            let buffer = terminal.backend().buffer();
+            (1..buffer.area.height - 1)
+                .map(|y| {
+                    (2..buffer.area.width - 1)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .filter(|row| !row.is_empty())
+                .collect()
+        };
+        // As in the spec's layout: White's moves padded, Black's in one column.
+        assert_eq!(
+            rows(&["1. e4 e5", "2. Nf3 Nc6", "3. Bb5"]),
+            ["1. e4   e5", "2. Nf3  Nc6", "3. Bb5"]
+        );
+        // A longer move widens the column for every row; numbers stay right-aligned.
+        assert_eq!(
+            rows(&["9. e4 e5", "10. exd8=Q+ Kxd8"]),
+            [" 9. e4       e5", "10. exd8=Q+  Kxd8"]
+        );
+        // A game from a FEN with Black to move starts in Black's column.
+        assert_eq!(
+            rows(&["12... Kd7", "13. e4 Ke6"]),
+            ["12. ...  Kd7", "13. e4   Ke6"]
+        );
     }
 
     #[test]
