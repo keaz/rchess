@@ -258,7 +258,9 @@ pub fn parse_command(line: &str) -> Result<Command, String> {
 }
 
 /// Removes one pair of matching surrounding `"` or `'` quotes, then trims inside them.
-fn unquote(arg: &str) -> &str {
+/// `arg` is expected trimmed. Used for the paths of `:savefen`, `:savepgn` and the save
+/// dialog alike.
+pub fn unquote(arg: &str) -> &str {
     for quote in ['"', '\''] {
         if let Some(inner) = arg
             .strip_prefix(quote)

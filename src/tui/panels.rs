@@ -36,9 +36,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Padding, Paragraph, Wrap};
 
 use super::app::{
-    App, Button, Dialog, GAME_OVER_BUTTONS, Hit, HitMap, InputPurpose, MENU_ITEMS, MenuItem, Mode,
-    PROMOTION_CHOICES, Question, Screen, SidePick, TOO_SMALL, WAITING_FOR_ENGINE, is_too_small,
-    move_rows, outcome_text,
+    App, Button, Dialog, GAME_OVER_BUTTONS, Hit, HitMap, InputPurpose, MENU_ITEMS, MenuItem,
+    Message, Mode, PROMOTION_CHOICES, Question, Screen, SidePick, TOO_SMALL, WAITING_FOR_ENGINE,
+    is_too_small, move_rows, outcome_text,
 };
 use super::board::{BoardGeometry, BoardView, layout_board};
 use super::glyphs::{self, ELLIPSIS, GlyphSet, Palette, char_width};
@@ -484,7 +484,7 @@ fn command_panel(frame: &mut Frame, area: Rect, editor: &LineEditor, focused: bo
 fn status_panel(frame: &mut Frame, area: Rect, app: &App, now: Instant) {
     const TITLE: &str = " Status ";
     let block = side_block("Status");
-    let width = block.inner(area).width;
+    let inner = block.inner(area);
     // Two corners and at least two border cells between the titles.
     let room = usize::from(area.width).saturating_sub(TITLE.len() + 4);
     let mode = app
@@ -496,7 +496,8 @@ fn status_panel(frame: &mut Frame, area: Rect, app: &App, now: Instant) {
         Some(mode) => block.title_top(Line::from(mode).right_aligned()),
         None => block,
     };
-    side_panel(frame, area, block, status_lines(app, now, width));
+    let lines = status_lines(app, now, inner.width, inner.height);
+    side_panel(frame, area, block, lines);
 }
 
 /// `full` when it fits on one row of `width` cells, else `brief`.
@@ -508,12 +509,13 @@ fn fitted(full: String, brief: String, width: u16) -> String {
     }
 }
 
-/// The Status panel's text for rows `width` cells wide, steadiest first, so a long message
-/// is what gets cut when the panel is full: whose turn it is, the Jev vs Jev pace (the only
-/// place the pause and step delay are shown), the thinking spinner (or the wait for an
-/// earlier request), and the latest message. The turn and thinking lines drop words rather
-/// than wrap (the computer's name "Local search" is long), so they keep one row each.
-fn status_lines(app: &App, now: Instant, width: u16) -> Vec<Line<'static>> {
+/// The Status panel's text for `rows` rows `width` cells wide, steadiest first, so a long
+/// message is what gets cut when the panel is full: whose turn it is, the Jev vs Jev pace
+/// (the only place the pause and step delay are shown), the thinking spinner (or the wait
+/// for an earlier request), and the latest message in the rows left ([`fit_message`]). The
+/// turn and thinking lines drop words rather than wrap (the computer's name "Local search"
+/// is long), so they keep one row each.
+fn status_lines(app: &App, now: Instant, width: u16, rows: u16) -> Vec<Line<'static>> {
     let game = app.game();
     let in_check = game.outcome().is_none() && game.position().is_check();
     let turn = Line::from(fitted(app.turn_text(), app.turn_text_brief(), width)).bold();
@@ -538,11 +540,71 @@ fn status_lines(app: &App, now: Instant, width: u16) -> Vec<Line<'static>> {
     } else if app.waiting_for_engine(now) {
         lines.push(Line::from(WAITING_FOR_ENGINE).yellow());
     }
-    if let Some(message) = app.message() {
-        let line = Line::from(message.text.clone());
+    let used = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    if let Some(message) = app.message()
+        && rows > used
+    {
+        let text = fit_message(&message.text, message.path.as_deref(), width, rows - used);
+        let line = Line::from(text);
         lines.push(if message.is_error { line.red() } else { line });
     }
     lines
+}
+
+/// `text` followed by `path` if they wrap into `rows` rows of `width` cells. Otherwise the
+/// path loses folders from the middle of its folder part first (`~/…/chess/game.pgn`, then
+/// `~/…/game.pgn`, then `…/game.pgn`), so its start and file name stay; only when even that
+/// does not fit is the end cut, marked with [`ELLIPSIS`]. Without a path, [`fit_rows`].
+fn fit_message(text: &str, path: Option<&str>, width: u16, rows: u16) -> String {
+    let Some(path) = path else {
+        return fit_rows(text, width, rows);
+    };
+    let fits = |candidate: &String| wrapped_height(candidate, width) <= rows;
+    let full = format!("{text}{path}");
+    if fits(&full) {
+        return full;
+    }
+    let shorter: Vec<String> = elided_paths(path)
+        .into_iter()
+        .map(|short| format!("{text}{short}"))
+        .collect();
+    match shorter.iter().find(|candidate| fits(candidate)) {
+        Some(fitting) => fitting.clone(),
+        None => cut_to_fit(shorter.last().unwrap_or(&full), width, rows),
+    }
+}
+
+/// Shorter forms of `path`, longest first: the folders after its first one (`~`, `/tmp`,
+/// `games`) are replaced by `…` from the left, a folder at a time, down to none; then the
+/// first one goes too. The file name is always kept.
+fn elided_paths(path: &str) -> Vec<String> {
+    let Some((folders, name)) = path.rsplit_once('/') else {
+        return Vec::new();
+    };
+    let mut parts: Vec<&str> = folders.split('/').collect();
+    // An absolute path's first folder keeps its leading slash: `/tmp`, not ``.
+    let head = if parts.first() == Some(&"") && parts.len() > 1 {
+        parts.remove(0);
+        format!("/{}", parts.remove(0))
+    } else {
+        parts.remove(0).to_string()
+    };
+    let mut shorter: Vec<String> = (0..parts.len())
+        .rev()
+        .map(|kept| {
+            let tail = &parts[parts.len() - kept..];
+            let mut short = format!("{head}/{ELLIPSIS}");
+            for part in tail {
+                short.push('/');
+                short.push_str(part);
+            }
+            short.push('/');
+            short.push_str(name);
+            short
+        })
+        .collect();
+    shorter.push(format!("{ELLIPSIS}/{name}"));
+    shorter
 }
 
 /// The Jev panel's text, laid out for one width: lines that always show (what was played
@@ -674,12 +736,22 @@ fn fit_rows(text: &str, width: u16, rows: u16) -> String {
         return text.to_string();
     }
     let cut_at = |end: usize| format!("{}{ELLIPSIS}", text[..end].trim_end());
-    let ends = || text.char_indices().rev();
-    ends()
+    text.char_indices()
+        .rev()
         .filter(|&(_, c)| c.is_whitespace())
         .map(|(end, _)| cut_at(end))
         .find(fits)
-        .or_else(|| ends().map(|(end, _)| cut_at(end)).find(fits))
+        .unwrap_or_else(|| cut_to_fit(text, width, rows))
+}
+
+/// The longest start of `text` that wraps into `rows` rows of `width` cells with
+/// [`ELLIPSIS`] appended, cut between any two characters.
+fn cut_to_fit(text: &str, width: u16, rows: u16) -> String {
+    let cut_at = |end: usize| format!("{}{ELLIPSIS}", text[..end].trim_end());
+    text.char_indices()
+        .rev()
+        .map(|(end, _)| cut_at(end))
+        .find(|cut| wrapped_height(cut, width) <= rows)
         .unwrap_or_else(|| ELLIPSIS.to_string())
 }
 
@@ -866,7 +938,7 @@ fn dialog(frame: &mut Frame, area: Rect, app: &App, top: &Dialog, hits: &mut Hit
             top.title(),
             *purpose,
             editor,
-            error.as_deref(),
+            error.as_ref(),
             hits,
         ),
         Dialog::Confirm { question, yes } => {
@@ -936,7 +1008,7 @@ fn input(
     title: &str,
     purpose: InputPurpose,
     editor: &LineEditor,
-    error: Option<&str>,
+    error: Option<&Message>,
     hits: &mut HitMap,
 ) {
     let inner = dialog_frame(frame, centered(area, 66, 8), title);
@@ -960,7 +1032,8 @@ fn input(
     if let Some(error) = error {
         let rows =
             Rect::new(inner.x, inner.y.saturating_add(3), inner.width, 2).intersection(inner);
-        frame.render_widget(Paragraph::new(error).red().wrap(Wrap { trim: true }), rows);
+        let text = fit_message(&error.text, error.path.as_deref(), rows.width, rows.height);
+        frame.render_widget(Paragraph::new(text).red().wrap(Wrap { trim: true }), rows);
     }
     let buttons = vec![
         (Hit::Button(Button::Confirm), text_button(action, false)),
@@ -1512,6 +1585,92 @@ mod tests {
         for (text, width, rows) in [("a b c d e f g h", 3, 2), ("x".repeat(50).as_str(), 7, 3)] {
             assert!(wrapped_height(&fit_rows(text, width, rows), width) <= rows);
         }
+    }
+
+    #[test]
+    fn a_message_that_does_not_fit_its_rows_ends_in_an_ellipsis() {
+        assert_eq!(fit_message("glyphs: ascii", None, 28, 1), "glyphs: ascii");
+        assert_eq!(
+            fit_message("nothing to resign while watching", None, 28, 1),
+            "nothing to resign while…"
+        );
+        // Watching at 60x20 leaves the message one row under the turn, pace and thinking.
+        let mut h = Harness::sized(FakeEngine::local(), 60, 20);
+        h.char('5');
+        h.command(":resign");
+        let status = panel_rows(&h, "Status");
+        assert_eq!(status.len(), 4, "{status:?}");
+        assert_eq!(status[3], "nothing to resign while…");
+    }
+
+    #[test]
+    fn paths_in_messages_lose_folders_before_the_file_name() {
+        let path = "~/Projects/Rust/rchess/chess/game.pgn";
+        assert_eq!(
+            fit_message("saved ", Some(path), 60, 1),
+            format!("saved {path}")
+        );
+        // The middle of the folder part goes first, a folder at a time.
+        assert_eq!(
+            fit_message("saved ", Some(path), 28, 1),
+            "saved ~/…/chess/game.pgn"
+        );
+        assert_eq!(
+            fit_message("saved ", Some(path), 20, 1),
+            "saved ~/…/game.pgn"
+        );
+        assert_eq!(
+            fit_message("saved ", Some("/tmp/rchess-save/deep/game.pgn"), 22, 1),
+            "saved /tmp/…/game.pgn"
+        );
+        // The reason stays in front of the path.
+        assert_eq!(
+            fit_message(
+                "cannot save (folder does not exist): ",
+                Some("~/one/two/three/four/game.pgn"),
+                28,
+                2
+            ),
+            "cannot save (folder does not exist): ~/…/four/game.pgn"
+        );
+        // A long file name is kept whole while the folders can go instead.
+        let long = "~/games/a-very-long-file-name-for-a-game.pgn";
+        assert_eq!(
+            fit_message("saved ", Some(long), 40, 2),
+            "saved ~/…/a-very-long-file-name-for-a-game.pgn"
+        );
+        // Only a name that cannot fit at all is cut, and the cut is marked.
+        let cut = fit_message("saved ", Some(long), 20, 1);
+        assert_eq!(cut, "saved …/a-very-long…");
+        assert!(cut.ends_with('…'), "{cut}");
+        assert!(wrapped_height(&cut, 20) <= 1, "{cut}");
+    }
+
+    #[test]
+    fn a_save_message_names_the_file_at_the_minimum_size() {
+        let dir = crate::tui::test_support::TempDir::new("a-home-folder-with-a-long-name");
+        let home = dir.path().to_path_buf();
+        let mut h = Harness::build(FakeEngine::local(), (60, 20), Vec::new(), move |app| {
+            app.with_home(Some(home))
+        });
+        h.char('1');
+        h.command(":savepgn ~/game");
+        assert_eq!(h.app.status_line(), "saved ~/game.pgn");
+        assert!(panel_text(&h, "Status").ends_with("saved ~/game.pgn"));
+
+        let deep = dir
+            .path()
+            .join("a")
+            .join("rather")
+            .join("deep")
+            .join("folder");
+        std::fs::create_dir_all(&deep).expect("folders");
+        h.command(":savepgn ~/a/rather/deep/folder/game");
+        let status = panel_rows(&h, "Status");
+        assert!(
+            status.iter().any(|row| row.ends_with("/folder/game.pgn")),
+            "{status:?}"
+        );
     }
 
     #[test]

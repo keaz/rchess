@@ -40,7 +40,8 @@
 //! Actions that throw away a game in progress (quit, new game, menu, resign) ask first, and
 //! their confirmation defaults to No, so a stray Enter never confirms one.
 
-use std::path::PathBuf;
+use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -52,9 +53,9 @@ use ratatui::layout::{Position as CellPosition, Rect};
 
 use super::board::{BoardGeometry, Highlights, square_at};
 use super::event::AppEvent;
-use super::files::{SaveError, pgn_export, resolve_path, today, write_file};
+use super::files::{SaveError, pgn_export, resolve_path, tilde_path, today, write_file};
 use super::glyphs::{self, GlyphSet, Palette};
-use super::input::{Command, LineEditor, parse_command};
+use super::input::{Command, LineEditor, parse_command, unquote};
 use super::movetext::{MoveTextError, parse_move};
 use super::panels;
 use super::worker::{
@@ -368,6 +369,9 @@ pub enum Dialog {
         to: Square,
         /// Index into [`PROMOTION_CHOICES`] highlighted for Enter.
         choice: usize,
+        /// The move text typed without its piece (`e8`), given back to the command box
+        /// when the picker is cancelled; `None` for a move made on the board.
+        typed: Option<String>,
     },
     /// A one-line text field (FEN or save path).
     Input {
@@ -376,7 +380,7 @@ pub enum Dialog {
         /// The text being typed.
         editor: LineEditor,
         /// Why the last submission failed; shown under the field.
-        error: Option<String>,
+        error: Option<Message>,
     },
     /// A yes/no question.
     Confirm {
@@ -499,13 +503,66 @@ impl HitMap {
     }
 }
 
-/// A status message.
+/// A status message, or the error under a text dialog's field. Its [`Display`](fmt::Display)
+/// is `text` followed by `path`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
-    /// One line of text.
+    /// The text, or the part before `path`.
     pub text: String,
+    /// A file the message ends with, `~` standing for the home folder. When the message
+    /// does not fit, the middle of its folder part is shortened first, never the file name.
+    pub path: Option<String>,
     /// Errors are drawn in red.
     pub is_error: bool,
+    /// About the turn being played (a rejected move, an undo, a retry): the computer's
+    /// next move clears it. Other messages (a save's result, a glyph change, a mistyped
+    /// command) stay until something replaces them.
+    pub turn: bool,
+}
+
+impl Message {
+    /// A message that outlasts the computer's next move.
+    pub fn info(text: impl Into<String>) -> Message {
+        Message {
+            text: text.into(),
+            path: None,
+            is_error: false,
+            turn: false,
+        }
+    }
+
+    /// An error that outlasts the computer's next move.
+    pub fn error(text: impl Into<String>) -> Message {
+        Message {
+            is_error: true,
+            ..Message::info(text)
+        }
+    }
+
+    /// The same message, cleared by the computer's next move.
+    #[must_use]
+    pub fn about_turn(self) -> Message {
+        Message { turn: true, ..self }
+    }
+
+    /// The same message followed by `path` (see [`Message::path`]).
+    #[must_use]
+    pub fn with_path(self, path: String) -> Message {
+        Message {
+            path: Some(path),
+            ..self
+        }
+    }
+}
+
+impl fmt::Display for Message {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.text)?;
+        match &self.path {
+            Some(path) => f.write_str(path),
+            None => Ok(()),
+        }
+    }
 }
 
 /// The engine is working on a move.
@@ -758,9 +815,11 @@ impl App {
         self.message.as_ref()
     }
 
-    /// The latest status message's text, or `""`.
-    pub fn status_line(&self) -> &str {
-        self.message.as_ref().map_or("", |m| m.text.as_str())
+    /// The latest status message in full (text and path), or `""`.
+    pub fn status_line(&self) -> String {
+        self.message
+            .as_ref()
+            .map_or_else(String::new, Message::to_string)
     }
 
     /// Whose turn it is, with `· Check`, or the result when the game is over:
@@ -1214,7 +1273,15 @@ impl App {
                         self.promote(kind);
                     }
                     KeyCode::Esc => {
-                        self.dialogs.pop();
+                        if let Some(Dialog::Promotion {
+                            typed: Some(typed), ..
+                        }) = self.dialogs.pop()
+                        {
+                            // Back in the box, ready to finish (`e8=N`) or change.
+                            self.command.clear();
+                            self.command.insert_str(&typed);
+                            self.command_focused = true;
+                        }
                     }
                     _ => {
                         let kind = typed_char(&key)
@@ -1386,7 +1453,9 @@ impl App {
                 }
                 let recovered = computer.note.as_deref() == Some(ENGINE_ERROR_NOTE);
                 self.last_computer = Some((self.game.moves().len(), computer));
-                self.message = None;
+                // Notes about the turn just played (a move typed too early, an undo) are
+                // stale now; a save's result or a glyph change is not.
+                self.message.take_if(|message| message.turn);
                 self.after_engine_move(now);
                 if recovered {
                     self.error(ENGINE_ERROR_NOTE);
@@ -1594,6 +1663,7 @@ impl App {
                     from,
                     to,
                     choice: 0,
+                    typed: Some(text.to_string()),
                 });
                 Ok(())
             }
@@ -1652,7 +1722,7 @@ impl App {
 
     fn cycle_glyphs(&mut self) {
         self.glyphs = self.glyphs.next();
-        self.info(format!("glyphs: {}", self.glyphs));
+        self.show(Message::info(format!("glyphs: {}", self.glyphs)));
     }
 
     fn change_step_delay(&mut self, direction: i8) {
@@ -1679,7 +1749,7 @@ impl App {
 
     fn open_resign(&mut self) {
         if self.mode == Mode::JevVsJev {
-            self.error(NOTHING_TO_RESIGN);
+            self.show(Message::error(NOTHING_TO_RESIGN));
         } else if self.game.outcome().is_some() {
             self.error(GAME_IS_OVER);
         } else {
@@ -1711,10 +1781,11 @@ impl App {
             Question::NewGame if yes => self.new_game(),
             Question::Menu if yes => self.go_to_menu(),
             Question::Overwrite { path, contents, .. } if yes => {
-                match write_file(&path, &contents, true) {
-                    Ok(()) => self.info(format!("saved {}", path.display())),
-                    Err(error) => self.error(error.to_string()),
-                }
+                let message = match write_file(&path, &contents, true) {
+                    Ok(()) => self.saved(&path),
+                    Err(error) => self.save_failed(&error),
+                };
+                self.show(message);
             }
             Question::Overwrite {
                 kind,
@@ -1722,7 +1793,7 @@ impl App {
                 origin,
                 ..
             } => {
-                self.info(NOT_SAVED);
+                self.show(Message::info(NOT_SAVED));
                 self.retype_save(kind, &typed, origin);
             }
             Question::Quit | Question::Resign | Question::NewGame | Question::Menu => {}
@@ -1806,6 +1877,7 @@ impl App {
                 from,
                 to,
                 choice: 0,
+                typed: None,
             }),
         }
     }
@@ -1934,23 +2006,28 @@ impl App {
             self.open_input(purpose);
             return;
         }
-        let result = parse_command(&line).and_then(|command| self.run_command(command));
-        if let Err(reason) = result {
+        let result = match parse_command(&line) {
+            Ok(command) => self.run_command(command),
+            Err(reason) => Err(Message::error(reason)),
+        };
+        if let Err(message) = result {
             // Keep the text so a typo can be fixed.
             self.command.insert_str(&line);
-            self.error(reason);
+            self.show(message);
         }
     }
 
     /// Runs a submitted command. Errors worth editing the text for are returned; other
     /// outcomes set their own message.
-    fn run_command(&mut self, command: Command) -> Result<(), String> {
+    fn run_command(&mut self, command: Command) -> Result<(), Message> {
         match command {
-            Command::Move(text) => self.play_text(&text)?,
+            Command::Move(text) => self
+                .play_text(&text)
+                .map_err(|reason| Message::error(reason).about_turn())?,
             Command::Undo => self.undo(),
             Command::Flip => self.flipped = !self.flipped,
             Command::New => self.ask_new_game(),
-            Command::Fen(fen) => self.load_fen(&fen, self.mode)?,
+            Command::Fen(fen) => self.load_fen(&fen, self.mode).map_err(Message::error)?,
             Command::SaveFen(path) => self.save(SaveKind::Fen, &path, SaveOrigin::Command)?,
             Command::SavePgn(path) => self.save(SaveKind::Pgn, &path, SaveOrigin::Command)?,
             Command::Resign => self.open_resign(),
@@ -1986,9 +2063,13 @@ impl App {
                 } else {
                     self.mode
                 };
-                self.load_fen(editor.text(), mode)
+                self.load_fen(editor.text(), mode).map_err(Message::error)
             }
-            InputPurpose::Save(kind) => self.save(kind, editor.text(), SaveOrigin::Dialog),
+            InputPurpose::Save(kind) => {
+                // Quotes around a path are stripped as in `:savepgn "..."`.
+                let raw = unquote(editor.text().trim());
+                self.save(kind, raw, SaveOrigin::Dialog)
+            }
         };
         if let Err(error) = result {
             self.dialogs.push(Dialog::Input {
@@ -2011,12 +2092,14 @@ impl App {
     }
 
     /// Saves to the typed path, asking before replacing an existing file.
-    fn save(&mut self, kind: SaveKind, raw: &str, origin: SaveOrigin) -> Result<(), String> {
-        let path = resolve_path(raw, kind.extension(), self.home.as_deref())?;
+    fn save(&mut self, kind: SaveKind, raw: &str, origin: SaveOrigin) -> Result<(), Message> {
+        let path =
+            resolve_path(raw, kind.extension(), self.home.as_deref()).map_err(Message::error)?;
         let contents = self.export(kind);
         match write_file(&path, &contents, false) {
             Ok(()) => {
-                self.info(format!("saved {}", path.display()));
+                let saved = self.saved(&path);
+                self.show(saved);
                 Ok(())
             }
             Err(SaveError::Exists) => {
@@ -2029,7 +2112,21 @@ impl App {
                 });
                 Ok(())
             }
-            Err(error) => Err(error.to_string()),
+            Err(error) => Err(self.save_failed(&error)),
+        }
+    }
+
+    /// `saved <path>`, with `~` for the home folder.
+    fn saved(&self, path: &Path) -> Message {
+        Message::info("saved ").with_path(tilde_path(path, self.home.as_deref()))
+    }
+
+    /// Why a save failed, the reason before the path: `cannot save (<reason>): <path>`.
+    fn save_failed(&self, error: &SaveError) -> Message {
+        match error {
+            SaveError::Io { path, reason } => Message::error(format!("cannot save ({reason}): "))
+                .with_path(tilde_path(path, self.home.as_deref())),
+            SaveError::Exists => Message::error(error.to_string()),
         }
     }
 
@@ -2043,18 +2140,18 @@ impl App {
         }
     }
 
+    /// Shows a note about the turn being played (see [`Message::turn`]).
     fn info(&mut self, text: impl Into<String>) {
-        self.message = Some(Message {
-            text: text.into(),
-            is_error: false,
-        });
+        self.show(Message::info(text).about_turn());
     }
 
+    /// Shows an error about the turn being played (see [`Message::turn`]).
     fn error(&mut self, text: impl Into<String>) {
-        self.message = Some(Message {
-            text: text.into(),
-            is_error: true,
-        });
+        self.show(Message::error(text).about_turn());
+    }
+
+    fn show(&mut self, message: Message) {
+        self.message = Some(message);
     }
 
     // ----- rendering -----
@@ -2325,13 +2422,14 @@ mod tests {
         h.press(KeyCode::Enter);
         assert!(matches!(
             h.app.dialog(),
-            Some(Dialog::Input { error: Some(e), .. }) if e == "type a FEN"
+            Some(Dialog::Input { error: Some(e), .. }) if e.to_string() == "type a FEN"
         ));
         h.type_text("hello world");
         h.press(KeyCode::Enter);
         assert!(matches!(
             h.app.dialog(),
-            Some(Dialog::Input { error: Some(e), .. }) if e == "invalid FEN: expected 4 to 6 fields"
+            Some(Dialog::Input { error: Some(e), .. })
+                if e.to_string() == "invalid FEN: expected 4 to 6 fields"
         ));
         assert!(h.screen().contains("invalid FEN: expected 4 to 6 fields"));
         h.press(KeyCode::Esc);
@@ -2554,6 +2652,31 @@ mod tests {
         h.char('r');
         assert_eq!(h.uci(), ["e7e8r"]);
         assert!(h.app.command_has_focus(), "typing goes on in the box");
+    }
+
+    #[test]
+    fn cancelling_the_picker_gives_the_typed_move_back() {
+        let mut h = hvh();
+        h.command(&format!(":fen {PROMOTION_FEN}"));
+        h.command("e8");
+        assert_eq!(h.app.dialog_name(), Some("promotion"));
+        assert_eq!(h.app.command_text(), "");
+        h.press(KeyCode::Esc);
+        assert_eq!(h.app.dialog_name(), None);
+        assert_eq!(h.app.command_text(), "e8", "ready to finish, e.g. e8=N");
+        assert!(h.app.command_has_focus());
+        h.type_text("=N");
+        h.press(KeyCode::Enter);
+        assert_eq!(h.uci(), ["e7e8n"]);
+
+        // A picker opened from the board gives nothing back.
+        let mut h = hvh();
+        h.command(&format!(":fen {PROMOTION_FEN}"));
+        h.press(KeyCode::Esc);
+        h.drag_square(sq("e7"), sq("e8"));
+        h.press(KeyCode::Esc);
+        assert_eq!(h.app.command_text(), "");
+        assert!(!h.app.command_focused());
     }
 
     #[test]
@@ -3644,10 +3767,13 @@ mod tests {
     fn save_errors_are_reported_where_the_path_was_typed() {
         let dir = TempDir::new("save-errors");
         let missing = dir.path().join("missing").join("game");
+        let expected = format!(
+            "cannot save (folder does not exist): {}.pgn",
+            missing.display()
+        );
         let mut h = hvh();
         h.command(&format!(":savepgn {}", missing.display()));
-        assert!(h.app.status_line().starts_with("cannot save "));
-        assert!(h.app.status_line().ends_with(": folder does not exist"));
+        assert_eq!(h.app.status_line(), expected);
         assert!(
             h.app.command_text().starts_with(":savepgn "),
             "kept for fixing"
@@ -3659,17 +3785,68 @@ mod tests {
         h.press(KeyCode::Enter);
         assert!(matches!(
             h.app.dialog(),
-            Some(Dialog::Input { error: Some(e), .. }) if e.ends_with(": folder does not exist")
+            Some(Dialog::Input { error: Some(e), .. }) if e.to_string() == expected
         ));
+        // The reason is on screen however long the path is; the file name too.
+        let screen = h.screen();
+        assert!(
+            screen.contains("cannot save (folder does not exist):"),
+            "{screen}"
+        );
+        assert!(screen.contains("/missing/game.pgn"), "{screen}");
         h.ctrl('u');
         h.press(KeyCode::Enter);
         assert!(matches!(
             h.app.dialog(),
-            Some(Dialog::Input { error: Some(e), .. }) if e == "type a file name"
+            Some(Dialog::Input { error: Some(e), .. }) if e.to_string() == "type a file name"
         ));
         h.click_hit(Hit::Button(Button::Cancel));
         assert_eq!(h.app.dialog_name(), None);
         assert_eq!(fs::read_dir(dir.path()).expect("temp dir").count(), 0);
+    }
+
+    #[test]
+    fn the_save_dialog_strips_quotes_like_the_commands() {
+        let dir = TempDir::new("save-quoted");
+        let mut h = hvh();
+        h.ctrl('s');
+        h.type_text(&format!("\"{}\"", dir.path().join("quoted").display()));
+        h.press(KeyCode::Enter);
+        assert_eq!(h.app.dialog_name(), None, "{:?}", h.app.dialog());
+        assert!(dir.path().join("quoted.pgn").exists());
+        h.ctrl('s');
+        h.type_text(&format!("'{}'", dir.path().join("single").display()));
+        h.press(KeyCode::Enter);
+        assert!(dir.path().join("single.pgn").exists());
+    }
+
+    #[test]
+    fn a_save_result_outlasts_the_computers_move() {
+        // Messages about the turn go when the computer moves; a save's result does not.
+        let dir = TempDir::new("save-while-thinking");
+        let path = dir.path().join("game.pgn");
+        let mut h = Harness::new();
+        h.char('2');
+        let first = request(&h.command("e4"));
+        h.command(&format!(":savepgn {}", path.display()));
+        let saved = format!("saved {}", path.display());
+        assert_eq!(h.app.status_line(), saved);
+        h.respond(&first);
+        assert_eq!(h.uci().len(), 2);
+        assert_eq!(h.app.status_line(), saved);
+
+        // So do a glyph change and a command error.
+        let second = request(&h.command("d4"));
+        h.command(":glyphs");
+        h.respond(&second);
+        assert_eq!(h.app.status_line(), "glyphs: outline");
+        let third = request(&h.command("c4"));
+        h.command(":frobnicate");
+        h.respond(&third);
+        assert_eq!(
+            h.app.status_line(),
+            "unknown command: :frobnicate (try :help)"
+        );
     }
 
     #[test]

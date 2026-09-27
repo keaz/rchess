@@ -79,15 +79,24 @@ pub fn resolve_path(raw: &str, ext: &str, home: Option<&Path>) -> Result<PathBuf
 pub enum SaveError {
     /// The target exists and `overwrite` was false: ask the user, then retry with `overwrite`.
     Exists,
-    /// The write failed. The message names the path and the reason, ready for the status line.
-    Io(String),
+    /// The write failed.
+    Io {
+        /// The file that was not written.
+        path: PathBuf,
+        /// A short reason for the status line, such as `folder does not exist`.
+        reason: String,
+    },
 }
 
 impl fmt::Display for SaveError {
+    /// `cannot save (<reason>): <path>`: the reason first, so a path cut short on screen
+    /// never hides it.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SaveError::Exists => f.write_str("file already exists"),
-            SaveError::Io(message) => f.write_str(message),
+            SaveError::Io { path, reason } => {
+                write!(f, "cannot save ({reason}): {}", path.display())
+            }
         }
     }
 }
@@ -108,25 +117,19 @@ impl std::error::Error for SaveError {}
 /// [`SaveError::Exists`] when `path` exists and `overwrite` is false (nothing is written), and
 /// [`SaveError::Io`] when `path` is a folder or any file operation fails.
 pub fn write_file(path: &Path, contents: &str, overwrite: bool) -> Result<(), SaveError> {
-    let fail = |err: io::Error| {
-        SaveError::Io(format!(
-            "cannot save {}: {}",
-            path.display(),
-            describe(&err)
-        ))
+    let fail = |reason: String| SaveError::Io {
+        path: path.to_path_buf(),
+        reason,
     };
     let Some(name) = path.file_name() else {
-        return Err(SaveError::Io(format!(
-            "cannot save {}: not a file name",
-            path.display()
-        )));
+        return Err(fail("not a file name".to_string()));
     };
     let replacing = match fs::symlink_metadata(path) {
-        Ok(meta) if meta.is_dir() => return Err(fail(ErrorKind::IsADirectory.into())),
+        Ok(meta) if meta.is_dir() => return Err(fail(describe(&ErrorKind::IsADirectory.into()))),
         Ok(_) if !overwrite => return Err(SaveError::Exists),
         Ok(meta) => Some(meta),
         Err(err) if err.kind() == ErrorKind::NotFound => None,
-        Err(err) => return Err(fail(err)),
+        Err(err) => return Err(fail(describe(&err))),
     };
 
     let mut tmp_name = OsString::from(".");
@@ -139,7 +142,7 @@ pub fn write_file(path: &Path, contents: &str, overwrite: bool) -> Result<(), Sa
     {
         // Best effort: the temp file may never have been created.
         let _ = fs::remove_file(&tmp);
-        return Err(fail(err));
+        return Err(fail(describe(&err)));
     }
     sync_parent(path);
     Ok(())
@@ -187,6 +190,20 @@ fn describe(err: &io::Error) -> String {
         ErrorKind::ReadOnlyFilesystem => "read-only file system".to_string(),
         ErrorKind::StorageFull => "disk is full".to_string(),
         _ => err.to_string(),
+    }
+}
+
+/// `path` for a message, with the `home` folder written as `~` (`~/games/one.pgn`). Only
+/// whole folder names match: `/home/anabel` is not under `/home/ana`.
+#[must_use]
+pub fn tilde_path(path: &Path, home: Option<&Path>) -> String {
+    let rest = home
+        .filter(|home| !home.as_os_str().is_empty())
+        .and_then(|home| path.strip_prefix(home).ok());
+    match rest {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
     }
 }
 
@@ -461,10 +478,14 @@ mod tests {
         let err = write_file(&target, "x", false).unwrap_err();
         assert_eq!(
             err,
-            SaveError::Io(format!(
-                "cannot save {}: folder does not exist",
-                target.display()
-            ))
+            SaveError::Io {
+                path: target.clone(),
+                reason: "folder does not exist".to_string(),
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            format!("cannot save (folder does not exist): {}", target.display())
         );
         assert!(dir.entries().is_empty());
     }
@@ -478,7 +499,10 @@ mod tests {
             let err = write_file(&target, "x", overwrite).unwrap_err();
             assert_eq!(
                 err,
-                SaveError::Io(format!("cannot save {}: it is a folder", target.display()))
+                SaveError::Io {
+                    path: target.clone(),
+                    reason: "it is a folder".to_string(),
+                }
             );
         }
         assert_eq!(dir.entries(), ["sub"]);
@@ -511,9 +535,33 @@ mod tests {
     #[test]
     fn save_error_display() {
         assert_eq!(SaveError::Exists.to_string(), "file already exists");
+        let denied = SaveError::Io {
+            path: PathBuf::from("games/x.pgn"),
+            reason: "permission denied".to_string(),
+        };
+        // The reason comes first, so a path cut short on screen never hides it.
         assert_eq!(
-            SaveError::Io("cannot save x: permission denied".to_string()).to_string(),
-            "cannot save x: permission denied"
+            denied.to_string(),
+            "cannot save (permission denied): games/x.pgn"
+        );
+    }
+
+    #[test]
+    fn tilde_path_writes_the_home_folder_as_a_tilde() {
+        let home = Some(Path::new("/home/ana"));
+        let tilde = |path: &str, home| tilde_path(Path::new(path), home);
+        assert_eq!(tilde("/home/ana/games/x.pgn", home), "~/games/x.pgn");
+        assert_eq!(tilde("/home/ana/x.pgn", home), "~/x.pgn");
+        assert_eq!(
+            tilde("/home/anabel/x.pgn", home),
+            "/home/anabel/x.pgn",
+            "whole folder names only"
+        );
+        assert_eq!(tilde("games/x.pgn", home), "games/x.pgn");
+        assert_eq!(tilde("/home/ana/x.pgn", None), "/home/ana/x.pgn");
+        assert_eq!(
+            tilde("/home/ana/x.pgn", Some(Path::new(""))),
+            "/home/ana/x.pgn"
         );
     }
 
