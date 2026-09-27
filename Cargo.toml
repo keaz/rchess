@@ -35,9 +35,11 @@ harness = false
 opt-level = 3
 
 # The Image glyph style (src/tui/pieces.rs, src/tui/board.rs) leans on these crates for
-# resizing, sixel/PNG encoding and base64: at the default opt-level 0 building one board's
-# worth of pictures can stall the UI thread for seconds under `cargo run`. Optimise them
-# in the dev profile too; a release build already pays only their optimised cost.
+# resizing, sixel encoding (icy_sixel quantises colours with quantette), PNG encoding and
+# the base64 of Kitty and iTerm2 pictures (base64-simd, on vsimd): at the default
+# opt-level 0 building one board's worth of pictures can stall the UI thread for seconds
+# under `cargo run`. Optimise them in the dev profile too; a release build already pays
+# only their optimised cost.
 [profile.dev.package.image]
 opt-level = 3
 
@@ -59,7 +61,13 @@ opt-level = 3
 [profile.dev.package.flate2]
 opt-level = 3
 
-[profile.dev.package.base64]
+[profile.dev.package.quantette]
+opt-level = 3
+
+[profile.dev.package.base64-simd]
+opt-level = 3
+
+[profile.dev.package.vsimd]
 opt-level = 3
 
 [profile.dev.package.crc32fast]

@@ -2122,8 +2122,8 @@ mod tests {
         assert_eq!(images.len(), 3);
     }
 
-    /// The image-encoding crates [`PieceImages::picture`] calls into (resize, sixel, PNG
-    /// and base64) run at the default `opt-level = 0` under `cargo build`/`cargo run`
+    /// The image-encoding crates [`PieceImages::picture`] calls into (resize, sixel and
+    /// its colour quantiser, PNG, and the SIMD base64 of the Kitty and iTerm2 encoders) run at the default `opt-level = 0` under `cargo build`/`cargo run`
     /// unless the dev profile optimises them, which can stall the UI thread for seconds
     /// while a board's worth of pictures is built. This does not run the encoders (that
     /// needs a real build, not `cargo test`); it only guards the profile override that
@@ -2141,7 +2141,9 @@ mod tests {
             "fdeflate",
             "miniz_oxide",
             "flate2",
-            "base64",
+            "quantette",
+            "base64-simd",
+            "vsimd",
         ] {
             let heading = format!("[profile.dev.package.{pkg}]");
             let after = manifest
