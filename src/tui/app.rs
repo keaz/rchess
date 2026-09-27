@@ -3386,6 +3386,7 @@ mod tests {
             latency: Duration::from_millis(300),
             input_tokens: None,
             note: Some(ENGINE_ERROR_NOTE.to_string()),
+            exchange: None,
         };
         h.send(AppEvent::Engine(EngineReply {
             generation: request.generation,

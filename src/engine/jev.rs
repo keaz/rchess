@@ -1,6 +1,8 @@
 //! TypeSafe Jev client: request/response types, the retry policy and the HTTP
 //! transport (spec 5.1, 5.7). Everything is tested offline; the transport tests
-//! talk to a scripted HTTP server on 127.0.0.1.
+//! talk to a scripted HTTP server on 127.0.0.1. For debug mode the client can also
+//! record each request and its responses as a [`JevExchange`], with the API key
+//! redacted (spec 9.5).
 //!
 //! Never enable TRACE-level logging for `ureq` or `ureq_proto`: it prints request
 //! headers, including the `Authorization` bearer key.
@@ -8,7 +10,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -29,6 +31,10 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(2);
 const ERROR_SNIPPET_CHARS: usize = 200;
 /// Largest response body read, in bytes; a real answer is a few kilobytes.
 const MAX_BODY_BYTES: u64 = 1 << 20;
+/// The request's `Content-Type`, as the TypeSafe quickstart sends it.
+const CONTENT_TYPE: &str = "application/json";
+/// What a recorded exchange shows in place of the API key.
+const REDACTED: &str = "<redacted>";
 
 /// One candidate move offered to Jev.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -98,7 +104,8 @@ pub struct ChoiceAnswer {
     pub input_tokens: u32,
 }
 
-/// Why a Jev request failed. Messages never contain the API key.
+/// Why a Jev request failed. Messages never contain the API key: `JevClient`
+/// replaces any occurrence of it with `<redacted>`.
 #[derive(Debug, Error, Clone, PartialEq)]
 pub enum JevError {
     /// The API answered with a status other than 200.
@@ -126,10 +133,54 @@ pub enum JevError {
     Request(String),
 }
 
+/// One HTTP request to Jev and every attempt made for it, for debug mode (spec 9.5).
+/// The API key never appears in it: the `Authorization` header reads
+/// `Bearer <redacted>`, and any occurrence of the key in the body, a response or
+/// an error is replaced by `<redacted>`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct JevExchange {
+    /// The HTTP method, `POST`.
+    pub method: String,
+    /// The endpoint the request went to.
+    pub url: String,
+    /// The headers the client sets, in the order it sets them.
+    pub headers: Vec<(String, String)>,
+    /// The JSON body sent with every attempt.
+    pub body: Value,
+    /// Every attempt in order, including the ones that were retried.
+    pub attempts: Vec<JevAttempt>,
+}
+
+/// One attempt of a [`JevExchange`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JevAttempt {
+    /// The HTTP status, or `None` when no response arrived.
+    pub status: Option<u16>,
+    /// The response body as text (read under the 1 MiB cap), or `None` when no
+    /// response arrived or its body could not be read.
+    pub response: Option<String>,
+    /// Why the attempt failed, as the `JevError` message; `None` for an answer.
+    pub error: Option<String>,
+    /// Time from sending the request to reading the whole response, without the
+    /// backoff before the next attempt.
+    pub elapsed: Duration,
+}
+
 /// Something that can answer a `choice` question: `JevClient`, or a mock in tests.
 pub trait MoveChooser: Send + Sync {
     /// Answers one `choice` question. An error is final: retries happen inside.
     fn choose(&self, request: &ChoiceRequest) -> Result<ChoiceAnswer, JevError>;
+
+    /// Like [`choose`](MoveChooser::choose), and records the HTTP exchange in
+    /// `trace`, whether it succeeded or not. The default calls `choose` and records
+    /// nothing, leaving `trace` as it was (callers pass `None`).
+    fn choose_traced(
+        &self,
+        request: &ChoiceRequest,
+        _trace: &mut Option<JevExchange>,
+    ) -> Result<ChoiceAnswer, JevError> {
+        self.choose(request)
+    }
 }
 
 #[derive(Deserialize)]
@@ -212,6 +263,59 @@ pub fn retry_delay(error: &JevError, attempt: u32) -> Option<Duration> {
     }
 }
 
+/// `text` with every occurrence of `secret` replaced by `<redacted>`. An empty
+/// secret redacts nothing.
+fn redact(text: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        text.to_string()
+    } else {
+        text.replace(secret, REDACTED)
+    }
+}
+
+/// `value` with [`redact`] applied to every string and object key in it.
+fn redact_value(value: &Value, secret: &str) -> Value {
+    match value {
+        Value::String(text) => Value::String(redact(text, secret)),
+        Value::Array(items) => {
+            Value::Array(items.iter().map(|v| redact_value(v, secret)).collect())
+        }
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (redact(k, secret), redact_value(v, secret)))
+                .collect(),
+        ),
+        Value::Null | Value::Bool(_) | Value::Number(_) => value.clone(),
+    }
+}
+
+/// `error` with [`redact`] applied to its text.
+fn redact_error(error: JevError, secret: &str) -> JevError {
+    match error {
+        JevError::Http {
+            status,
+            message,
+            retry_after,
+        } => JevError::Http {
+            status,
+            message: redact(&message, secret),
+            retry_after,
+        },
+        JevError::Transport(text) => JevError::Transport(redact(&text, secret)),
+        JevError::InvalidResponse(text) => JevError::InvalidResponse(redact(&text, secret)),
+        JevError::Request(text) => JevError::Request(redact(&text, secret)),
+        JevError::Timeout => JevError::Timeout,
+    }
+}
+
+/// What one attempt produced: the answer or error, plus the status and the
+/// redacted response body when they arrived.
+struct Attempt {
+    result: Result<ChoiceAnswer, JevError>,
+    status: Option<u16>,
+    response: Option<String>,
+}
+
 /// Classifies a `ureq` failure: timeouts and connection problems are worth
 /// retrying; anything else (a bad URL, a protocol error, an oversized body) is final.
 fn request_error(error: ureq::Error) -> JevError {
@@ -270,16 +374,78 @@ impl JevClient {
         })
     }
 
-    fn post_once(&self, body: &Value) -> Result<ChoiceAnswer, JevError> {
-        let mut response = self
+    /// The exchange record for `body` before any attempt: the redacted headers the
+    /// client sends and the body with the key redacted.
+    fn exchange(&self, body: &Value) -> JevExchange {
+        JevExchange {
+            method: "POST".to_string(),
+            url: self.url.clone(),
+            headers: vec![
+                ("Authorization".to_string(), format!("Bearer {REDACTED}")),
+                ("Content-Type".to_string(), CONTENT_TYPE.to_string()),
+            ],
+            body: redact_value(body, &self.api_key),
+            attempts: Vec::new(),
+        }
+    }
+
+    /// Posts `body` up to [`MAX_ATTEMPTS`] times, retrying as [`retry_delay`] says,
+    /// and pushes each attempt to `attempts` when it is given.
+    fn post(
+        &self,
+        body: &Value,
+        mut attempts: Option<&mut Vec<JevAttempt>>,
+    ) -> Result<ChoiceAnswer, JevError> {
+        let mut attempt = 1;
+        loop {
+            let started = Instant::now();
+            let Attempt {
+                result,
+                status,
+                response,
+            } = self.post_once(body);
+            if let Some(attempts) = attempts.as_deref_mut() {
+                attempts.push(JevAttempt {
+                    status,
+                    response,
+                    error: result.as_ref().err().map(JevError::to_string),
+                    elapsed: started.elapsed(),
+                });
+            }
+            match result {
+                Ok(answer) => return Ok(answer),
+                Err(error) => match retry_delay(&error, attempt) {
+                    Some(delay) => {
+                        thread::sleep(delay);
+                        attempt += 1;
+                    }
+                    None => return Err(error),
+                },
+            }
+        }
+    }
+
+    /// One HTTP attempt. The response body is redacted before it is parsed or cut
+    /// into an error snippet, so no error can carry part of the key.
+    fn post_once(&self, body: &Value) -> Attempt {
+        let sent = self
             .agent
             .post(&self.url)
             .header("Authorization", &format!("Bearer {}", self.api_key))
             // `send_json` alone would send `application/json; charset=utf-8`; the
             // TypeSafe quickstart sends plain `application/json`.
-            .content_type("application/json")
-            .send_json(body)
-            .map_err(request_error)?;
+            .content_type(CONTENT_TYPE)
+            .send_json(body);
+        let mut response = match sent {
+            Ok(response) => response,
+            Err(error) => {
+                return Attempt {
+                    result: Err(redact_error(request_error(error), &self.api_key)),
+                    status: None,
+                    response: None,
+                };
+            }
+        };
         let status = response.status().as_u16();
         let retry_after = response
             .headers()
@@ -291,38 +457,45 @@ impl JevClient {
             .body_mut()
             .with_config()
             .limit(MAX_BODY_BYTES)
-            .read_to_string();
-        if status != 200 {
+            .read_to_string()
+            .map(|text| redact(&text, &self.api_key));
+        let (result, response) = match text {
+            Ok(text) if status == 200 => (parse_answer(&text), Some(text)),
+            Ok(text) => (Err(http_error(status, &text, retry_after)), Some(text)),
             // Keep the status and Retry-After even when the body cannot be read.
-            return Err(match text {
-                Ok(text) => http_error(status, &text, retry_after),
-                Err(_) => JevError::Http {
+            Err(_) if status != 200 => (
+                Err(JevError::Http {
                     status,
                     message: "<unreadable body>".into(),
                     retry_after,
-                },
-            });
+                }),
+                None,
+            ),
+            Err(error) => (Err(request_error(error)), None),
+        };
+        Attempt {
+            result: result.map_err(|error| redact_error(error, &self.api_key)),
+            status: Some(status),
+            response,
         }
-        parse_answer(&text.map_err(request_error)?)
     }
 }
 
 impl MoveChooser for JevClient {
     fn choose(&self, request: &ChoiceRequest) -> Result<ChoiceAnswer, JevError> {
+        self.post(&request.to_body(&self.model), None)
+    }
+
+    /// Records the method, URL, redacted headers, the body and every attempt,
+    /// including retried ones; `trace` is `Some` afterwards, answer or error.
+    fn choose_traced(
+        &self,
+        request: &ChoiceRequest,
+        trace: &mut Option<JevExchange>,
+    ) -> Result<ChoiceAnswer, JevError> {
         let body = request.to_body(&self.model);
-        let mut attempt = 1;
-        loop {
-            match self.post_once(&body) {
-                Ok(answer) => return Ok(answer),
-                Err(error) => match retry_delay(&error, attempt) {
-                    Some(delay) => {
-                        thread::sleep(delay);
-                        attempt += 1;
-                    }
-                    None => return Err(error),
-                },
-            }
-        }
+        let exchange = trace.insert(self.exchange(&body));
+        self.post(&body, Some(&mut exchange.attempts))
     }
 }
 
@@ -514,6 +687,11 @@ mod tests {
     /// Serves `responses` in order, one per connection, on 127.0.0.1, then stops
     /// listening. Returns a client pointed at its `/v1/systemone` and the requests read.
     fn serve(responses: Vec<String>) -> (JevClient, Requests) {
+        serve_with_key(responses, "test-key")
+    }
+
+    /// [`serve`] with a client that sends `api_key`.
+    fn serve_with_key(responses: Vec<String>, api_key: &str) -> (JevClient, Requests) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let requests = Requests::default();
@@ -532,16 +710,18 @@ mod tests {
                 // Dropping the stream closes the connection.
             }
         });
+        (client_for_port(port, api_key), requests)
+    }
+
+    /// A client for `http://127.0.0.1:<port>/v1/systemone` sending `api_key`.
+    fn client_for_port(port: u16, api_key: &str) -> JevClient {
         let config = EngineConfig {
-            api_key: Some("test-key".to_string()),
+            api_key: Some(api_key.to_string()),
             timeout: Duration::from_secs(2),
             ..EngineConfig::default()
         };
         let endpoint = format!("http://127.0.0.1:{port}/v1/systemone");
-        (
-            JevClient::with_endpoint(&config, endpoint).unwrap(),
-            requests,
-        )
+        JevClient::with_endpoint(&config, endpoint).unwrap()
     }
 
     fn count(requests: &Requests) -> usize {
@@ -692,6 +872,183 @@ mod tests {
         let error = client.choose(&request()).unwrap_err();
         assert!(matches!(error, JevError::Request(_)), "{error:?}");
         assert_eq!(count(&requests), 1);
+    }
+
+    /// A successful answer for [`request`]: Jev picks O-O.
+    const ANSWER: &str = r#"{"model":"jev-1.13.0","answers":{"move":{"type":"choice","choice":"O-O","probabilities":{"Nxe5":0.25,"O-O":0.75},"confidence":0.6}},"usage":{"input_tokens":321,"output_tokens":9}}"#;
+
+    /// An API key the redaction tests look for in everything the client records.
+    const SENTINEL_KEY: &str = "sentinel-key-7Qx9";
+
+    #[test]
+    fn traced_exchange_records_the_request_and_every_attempt() {
+        let busy = response("503 Service Unavailable", "text/plain", "busy, try again");
+        let ok = response("200 OK", "application/json", ANSWER);
+        let (client, requests) = serve(vec![busy, ok]);
+        let mut trace = None;
+        let started = std::time::Instant::now();
+        let answer = client.choose_traced(&request(), &mut trace).unwrap();
+        let total = started.elapsed();
+        assert_eq!(answer.choice, "O-O");
+        assert_eq!(count(&requests), 2);
+
+        let exchange = trace.expect("the client records the exchange");
+        assert_eq!(exchange.method, "POST");
+        assert!(
+            exchange.url.starts_with("http://127.0.0.1:"),
+            "{}",
+            exchange.url
+        );
+        assert!(exchange.url.ends_with("/v1/systemone"), "{}", exchange.url);
+        assert_eq!(
+            exchange.headers,
+            vec![
+                ("Authorization".to_string(), "Bearer <redacted>".to_string()),
+                ("Content-Type".to_string(), "application/json".to_string()),
+            ]
+        );
+        assert_eq!(exchange.body, request().to_body("jev-latest"));
+        let [busy, ok] = exchange.attempts.as_slice() else {
+            panic!("expected two attempts, got {:?}", exchange.attempts);
+        };
+        assert_eq!(busy.status, Some(503));
+        assert_eq!(busy.response.as_deref(), Some("busy, try again"));
+        assert_eq!(busy.error.as_deref(), Some("HTTP 503: busy, try again"));
+        assert_eq!(ok.status, Some(200));
+        assert_eq!(ok.response.as_deref(), Some(ANSWER));
+        assert_eq!(ok.error, None);
+        // Each attempt times its own request, not the 250 ms backoff between them.
+        assert!(
+            busy.elapsed + ok.elapsed + BASE_BACKOFF <= total,
+            "{:?} + {:?} + backoff > {total:?}",
+            busy.elapsed,
+            ok.elapsed
+        );
+
+        // Only the record is redacted: the wire carries the real key.
+        for raw in requests.lock().unwrap().iter() {
+            assert!(raw.contains("Bearer test-key"), "{raw}");
+        }
+    }
+
+    #[test]
+    fn traced_exchange_records_a_failed_connection_without_a_status() {
+        // Nothing listens on the port once the listener is dropped.
+        let port = {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let client = client_for_port(port, "test-key");
+        let mut trace = None;
+        let error = client.choose_traced(&request(), &mut trace).unwrap_err();
+        assert!(matches!(error, JevError::Transport(_)), "{error:?}");
+        let exchange = trace.expect("the client records a failed exchange too");
+        assert_eq!(exchange.attempts.len(), 3, "{:?}", exchange.attempts);
+        for attempt in &exchange.attempts {
+            assert_eq!(attempt.status, None);
+            assert_eq!(attempt.response, None);
+            let text = attempt.error.as_deref().expect("an error for each attempt");
+            assert!(text.starts_with("network error: "), "{text}");
+        }
+    }
+
+    #[test]
+    fn traced_exchange_redacts_a_key_the_server_echoes() {
+        let echo = format!(r#"{{"error":"invalid api key {SENTINEL_KEY}"}}"#);
+        // The key straddles the 200-character cut of the error snippet.
+        let long = format!("{}{SENTINEL_KEY}", "x".repeat(195));
+        let (client, requests) = serve_with_key(
+            vec![
+                response("401 Unauthorized", "application/json", &echo),
+                // serde_json quotes the offending string in its error.
+                response("200 OK", "application/json", &format!("\"{SENTINEL_KEY}\"")),
+                response("422 Unprocessable Entity", "text/plain", &long),
+            ],
+            SENTINEL_KEY,
+        );
+
+        let mut trace = None;
+        let error = client.choose_traced(&request(), &mut trace).unwrap_err();
+        let exchange = trace.unwrap();
+        assert_eq!(
+            exchange.attempts[0].response.as_deref(),
+            Some(r#"{"error":"invalid api key <redacted>"}"#)
+        );
+        assert_eq!(
+            exchange.attempts[0].error.as_deref(),
+            Some(r#"HTTP 401: {"error":"invalid api key <redacted>"}"#)
+        );
+        assert_eq!(exchange.headers[0].1, "Bearer <redacted>");
+        let mut texts = vec![error.to_string(), format!("{exchange:?}")];
+
+        let mut trace = None;
+        let error = client.choose_traced(&request(), &mut trace).unwrap_err();
+        assert!(matches!(error, JevError::InvalidResponse(_)), "{error:?}");
+        let exchange = trace.unwrap();
+        assert_eq!(
+            exchange.attempts[0].response.as_deref(),
+            Some("\"<redacted>\"")
+        );
+        texts.extend([error.to_string(), format!("{exchange:?}")]);
+
+        let mut trace = None;
+        let error = client.choose_traced(&request(), &mut trace).unwrap_err();
+        let JevError::Http { message, .. } = &error else {
+            panic!("expected an HTTP error, got {error:?}");
+        };
+        assert_eq!(*message, format!("{}<reda", "x".repeat(195)));
+        texts.extend([error.to_string(), format!("{:?}", trace.unwrap())]);
+
+        assert_eq!(count(&requests), 3);
+        for text in &texts {
+            assert!(!text.contains(&SENTINEL_KEY[..8]), "{text}");
+        }
+        // The server did receive the key.
+        assert!(requests.lock().unwrap()[0].contains(SENTINEL_KEY));
+    }
+
+    #[test]
+    fn untraced_errors_redact_an_echoed_key_too() {
+        let echo = format!("no such key: {SENTINEL_KEY}");
+        let (client, _requests) = serve_with_key(
+            vec![response("401 Unauthorized", "text/plain", &echo)],
+            SENTINEL_KEY,
+        );
+        let error = client.choose(&request()).unwrap_err();
+        assert_eq!(error.to_string(), "HTTP 401: no such key: <redacted>");
+    }
+
+    #[test]
+    fn redaction_covers_every_string_in_a_json_body() {
+        let body = json!({
+            "model": format!("m-{SENTINEL_KEY}"),
+            "nested": [{ SENTINEL_KEY: [SENTINEL_KEY, 1, true, null] }],
+        });
+        assert_eq!(
+            redact_value(&body, SENTINEL_KEY),
+            json!({
+                "model": "m-<redacted>",
+                "nested": [{ "<redacted>": ["<redacted>", 1, true, null] }],
+            })
+        );
+        assert_eq!(redact("a key b key", "key"), "a <redacted> b <redacted>");
+        assert_eq!(redact("text", ""), "text", "an empty key redacts nothing");
+    }
+
+    #[test]
+    fn choose_traced_by_default_answers_without_a_trace() {
+        struct Plain;
+        impl MoveChooser for Plain {
+            fn choose(&self, _: &ChoiceRequest) -> Result<ChoiceAnswer, JevError> {
+                Err(JevError::Timeout)
+            }
+        }
+        let mut trace = None;
+        assert_eq!(
+            Plain.choose_traced(&request(), &mut trace),
+            Err(JevError::Timeout)
+        );
+        assert_eq!(trace, None);
     }
 
     #[test]

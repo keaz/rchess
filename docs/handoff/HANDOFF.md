@@ -6,8 +6,8 @@ Read this first. Follow the protocol in section 8 of
 ## Current
 Sub-project: tui-polish | Plan: docs/superpowers/plans/2026-09-27-tui-polish.md
 Branch: feat/tui-polish
-Last completed task: tui-polish task 1 (Piece images, dependencies and the picture compositor)
-Next task: tui-polish task 2 (engine exchange recording)
+Last completed task: tui-polish task 2 (Engine: record the Jev exchange for debug mode)
+Next task: tui-polish task 3 (full-screen layout)
 State: green (except 3 pre-existing old-code test failures)
 
 ## Verify before continuing
@@ -139,6 +139,7 @@ Run `cargo run` in a real terminal (Ghostty, Kitty, WezTerm or Alacritty) and ch
 - None.
 
 ## Log (newest first)
+- 2026-09-27 tui-polish task 2 done: Engine: record the Jev exchange for debug mode
 - 2026-09-27 tui-polish task 1 done: Piece images, dependencies and the picture compositor
 - 2026-09-27 tui-polish plan written: 8 tasks as git patches from a prototype (per-task 3-lens review with skeptics, whole-prototype 5-lens review, 3 fix rounds), replayed three times on a fresh clone; spec section 9 amended with the rulings made while prototyping
 - 2026-09-27 user smoke-tested the TUI: wants it to fill the terminal, bigger and clearer pieces, and a Jev debug view; tui-polish designed (spec section 9: full-screen layout, Cburnett piece images via ratatui-image, --debug exchange view and JSON-lines log)

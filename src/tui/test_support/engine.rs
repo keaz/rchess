@@ -71,6 +71,7 @@ pub(crate) fn jev_move(pos: &ChessPosition, uci: &str) -> ComputerMove {
         latency: Duration::from_millis(1234),
         input_tokens: Some(512),
         note: None,
+        exchange: None,
     }
 }
 

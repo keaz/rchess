@@ -1937,6 +1937,7 @@ mod tests {
             latency: Duration::from_millis(870),
             input_tokens: Some(900),
             note: None,
+            exchange: None,
         };
         assert_eq!(
             texts(&jev_lines(Some(&computer), JEV_STATUS, 40)),

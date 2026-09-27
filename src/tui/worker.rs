@@ -220,6 +220,7 @@ fn local_search_move(game: &Game, started: Instant) -> Option<ComputerMove> {
         latency: started.elapsed(),
         input_tokens: None,
         note: Some(ENGINE_ERROR_NOTE.to_string()),
+        exchange: None,
     })
 }
 

@@ -30,6 +30,12 @@ pub struct EngineConfig {
     pub veto_margin_cp: i32,
     /// Human-readable notes about ignored or adjusted settings, for the TUI.
     pub warnings: Vec<String>,
+    /// Record each Jev request and its responses in [`ComputerMove::exchange`]
+    /// (debug mode). Off by default and never read from the environment here: the
+    /// TUI sets it from `--debug` / `RCHESS_DEBUG`.
+    ///
+    /// [`ComputerMove::exchange`]: super::ComputerMove::exchange
+    pub trace: bool,
 }
 
 impl Default for EngineConfig {
@@ -42,6 +48,7 @@ impl Default for EngineConfig {
             timeout: Duration::from_secs(5),
             veto_margin_cp: 150,
             warnings: Vec::new(),
+            trace: false,
         }
     }
 }
@@ -56,6 +63,7 @@ impl fmt::Debug for EngineConfig {
             .field("timeout", &self.timeout)
             .field("veto_margin_cp", &self.veto_margin_cp)
             .field("warnings", &self.warnings)
+            .field("trace", &self.trace)
             .finish()
     }
 }
@@ -205,6 +213,24 @@ mod tests {
             bad.warnings,
             vec!["JEV_FILTER_LOSING=maybe is not true/false; using true"]
         );
+    }
+
+    #[test]
+    fn trace_is_off_and_never_read_from_the_environment() {
+        assert!(!EngineConfig::default().trace);
+        // The TUI sets `trace` from its own flag; no variable turns it on here.
+        let c = config(&[
+            ("RCHESS_DEBUG", "1"),
+            ("JEV_TRACE", "1"),
+            ("JEV_DEBUG", "1"),
+        ]);
+        assert!(!c.trace);
+        assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+        let traced = EngineConfig {
+            trace: true,
+            ..EngineConfig::default()
+        };
+        assert!(format!("{traced:?}").contains("trace: true"));
     }
 
     #[test]
