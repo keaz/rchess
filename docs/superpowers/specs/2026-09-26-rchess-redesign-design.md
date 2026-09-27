@@ -674,11 +674,22 @@ what is sent to Jev. Sections 6.x still hold except where this section changes t
   protocol and font size. The query
   is skipped (text styles only, `Image` removed from the `g` cycle) when `--glyphs`/`RCHESS_GLYPHS`
   names a text style, when `NO_COLOR` is set, or when `RCHESS_IMAGES=off`. A query error or timeout
-  never stops the program: it falls back to Halfblocks and adds a menu warning.
+  never stops the program: it falls back to Halfblocks and adds a menu warning. A reported or
+  measured font size outside 1..=256 pixels per cell is ignored (the next source is used), and no
+  picture is built larger than 4096 pixels per side (the square shows the Solid glyph instead).
+  When the query timed out, a kitty answer that arrives later (a slow SSH link) would reach
+  crossterm as key presses (`Alt+_`, `G`, `i`, `=`, ...); for 10 s after such a query one run of key
+  presses shaped like that answer is dropped. The other answers never become key presses.
+- Font changes: after a Resize, when the protocol is Sixel or iTerm2 (their pictures are encoded at a
+  pixel size; Kitty placeholders and half-blocks scale with the cells), the font size is measured
+  again the same way (cell-size query and status request, `poll`, 1 s deadline, else window pixels ÷
+  cells, else unchanged), once per batch of resize events; a changed size rebuilds the picker and
+  clears the picture cache. The font is never guessed from pixel sizes and padding alone.
 - Default style: `Image` when the picker found Kitty, iTerm2 or Sixel; otherwise Solid, with `Image`
   still in the cycle (drawn with half-blocks).
-- Drawing: in `Image` style each occupied square at least 5×2 cells gets an image; smaller squares
-  fall back to the Solid glyph for that frame. The image area is the square minus its leftmost and
+- Drawing: in `Image` style each occupied square at least 5×2 cells (Kitty, iTerm2, Sixel) or 11×5
+  cells (half-blocks, which are unrecognisable smaller) gets an image; smaller squares fall back to
+  the Solid glyph for that frame. A picture is never drawn under a dialog or the game-over box. The image area is the square minus its leftmost and
   rightmost columns, which stay text cells for the keyboard cursor's `[ ]` and the colour-independent
   side marks. The piece PNG is scaled to fit the image area's pixel size (aspect kept), centred, and
   composited (alpha over) onto a solid RGB rectangle of exactly that pixel size in the square's current
@@ -689,7 +700,10 @@ what is sent to Jev. Sections 6.x still hold except where this section changes t
   keyed by (piece, background RGB, pixel width, pixel height); a size change clears the cache. The
   cache holds the ratatui-image protocol object built for that composite, so a piece that moves to a
   square of the same colour reuses it. Legal-target dots on empty squares, the keyboard cursor and
-  the labels are text as in 6.3; nothing is drawn on top of an image.
+  the labels are text as in 6.3; nothing is drawn on top of an image. When the session drew Kitty
+  pictures, every restore path writes Kitty's delete-all command (`ESC _ G a=d,d=A ESC \`, tmux-wrapped
+  when needed) before leaving the alternate screen, so the pictures do not stay in the terminal's
+  image memory.
 - Indexed palettes (no truecolor) composite onto the RGB value of the indexed colour's xterm
   default. Colours used for compositing come from the same `Palette` as the text rendering.
 - Tests: snapshots keep using text styles; unit tests cover square-size maths, the composite (pixel
@@ -702,7 +716,8 @@ what is sent to Jev. Sections 6.x still hold except where this section changes t
 ### 9.4 Debug mode (TUI)
 
 - On with `--debug` or `RCHESS_DEBUG` set to anything other than empty or `0`; off by default. The
-  Status panel's border shows `DEBUG` while it is on. `--help` lists the flag and the variables
+  Status panel's top border shows `DEBUG` beside the mode title while it is on; when both do not fit,
+  the mode title keeps the border and `DEBUG` starts the first status line. `--help` lists the flag and the variables
   `RCHESS_DEBUG`, `RCHESS_DEBUG_LOG` and `RCHESS_IMAGES`.
 - Exchange view: `d` (board focus) opens a full-screen "Jev exchange" screen. Header: `exchange N of
   M · move <fullmove> · <SAN played> · <source> · <status> · <attempts> attempt(s) · <latency> ms`,
@@ -714,16 +729,19 @@ what is sent to Jev. Sections 6.x still hold except where this section changes t
   applied underneath and the view's exchange list grows while it is open. With no exchanges yet it
   says "no Jev requests yet". With debug off, `d` shows "debug mode is off (start with --debug)".
 - History: the last 50 exchanges in memory, newest last, including stale replies (marked).
-- Log file: one JSON object per line, appended to `RCHESS_DEBUG_LOG` when set, else
-  `$XDG_STATE_HOME/rchess/jev-debug.jsonl`, else `~/.local/state/rchess/jev-debug.jsonl` (macOS
-  too). The directory is created with mode 0700 and the file opened with mode 0600 (append). Fields:
+- Log file: one JSON object per line, appended to `RCHESS_DEBUG_LOG` when set (a leading `~` is
+  expanded as for save paths), else `$XDG_STATE_HOME/rchess/jev-debug.jsonl`, else
+  `~/.local/state/rchess/jev-debug.jsonl` (macOS too). Missing directories are created with mode
+  0700 (existing ones are left alone) and the file is opened for append with mode 0600; an existing
+  log with a looser mode is set to 0600. Fields:
   `time` (UTC, RFC 3339), `ply` (game ply when requested), `played` (SAN), `source` (the
   `MoveSource` label), `stale` (bool), `request` (method, URL, redacted headers, JSON body),
   `attempts` (each: `status` or null, `elapsed_ms`, `response` as JSON when it parses else a string,
   `error` or null). The UI thread sends each record over a channel to a dedicated thread named
   `debug-log`, which writes and flushes; the UI never waits on disk. The first write error shows one
-  status warning ("debug log disabled: <reason>") and stops logging for the session; the screen view
-  keeps working.
+  status warning ("debug log disabled: <reason>", kept until a game screen can show it) and stops
+  logging for the session; the screen view keeps working. The key is also redacted when a server
+  echoes it JSON-escaped (for example `\/`), both in the raw text and after decoding.
 
 ### 9.5 Engine changes for debug mode
 
