@@ -1,13 +1,12 @@
 //! Engine configuration from environment variables (spec 5.7). Parsing never
-//! fails: an invalid value falls back to its default and adds a warning.
+//! fails: an invalid value falls back to its default and adds a warning. The Jev
+//! endpoint is fixed (`jev::JEV_ENDPOINT`) and has no variable.
 
 use std::fmt;
 use std::time::Duration;
 
 /// Jev model used when `JEV_MODEL` is unset.
 pub const DEFAULT_MODEL: &str = "jev-latest";
-/// API base URL used when `JEV_BASE_URL` is unset or invalid.
-pub const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
 /// Shortlist cap used when `JEV_MAX_OPTIONS` is unset or invalid.
 pub const DEFAULT_MAX_OPTIONS: usize = 40;
 /// Jev accepts at most 255 options in one `choice` question.
@@ -21,8 +20,6 @@ pub struct EngineConfig {
     pub api_key: Option<String>,
     /// Jev model ID sent with each request, e.g. `jev-latest`.
     pub model: String,
-    /// Base URL without a trailing slash.
-    pub base_url: String,
     /// Shortlist cap, always within 1..=255.
     pub max_options: usize,
     /// Leave `losing` moves off the shortlist when any other move exists.
@@ -40,7 +37,6 @@ impl Default for EngineConfig {
         EngineConfig {
             api_key: None,
             model: DEFAULT_MODEL.to_string(),
-            base_url: DEFAULT_BASE_URL.to_string(),
             max_options: DEFAULT_MAX_OPTIONS,
             filter_losing: true,
             timeout: Duration::from_secs(5),
@@ -55,7 +51,6 @@ impl fmt::Debug for EngineConfig {
         f.debug_struct("EngineConfig")
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("model", &self.model)
-            .field("base_url", &self.base_url)
             .field("max_options", &self.max_options)
             .field("filter_losing", &self.filter_losing)
             .field("timeout", &self.timeout)
@@ -84,15 +79,6 @@ impl EngineConfig {
         };
         if let Some(model) = non_empty("JEV_MODEL") {
             config.model = model;
-        }
-        if let Some(url) = non_empty("JEV_BASE_URL") {
-            if url.starts_with("http://") || url.starts_with("https://") {
-                config.base_url = url.trim_end_matches('/').to_string();
-            } else {
-                config.warnings.push(format!(
-                    "JEV_BASE_URL={url} is not an http(s) URL; using {DEFAULT_BASE_URL}"
-                ));
-            }
         }
         if let Some(raw) = non_empty("JEV_MAX_OPTIONS") {
             match raw.parse::<usize>() {
@@ -142,11 +128,13 @@ mod tests {
         assert_eq!(c, EngineConfig::default());
         assert_eq!(c.api_key, None);
         assert_eq!(c.model, "jev-latest");
-        assert_eq!(c.base_url, "https://api.typesafe.ai");
         assert_eq!(c.max_options, 40);
         assert!(c.filter_losing);
         assert_eq!(c.timeout, Duration::from_secs(5));
         assert_eq!(c.veto_margin_cp, 150);
+        // The endpoint is fixed in `jev.rs`; the config carries no URL.
+        let text = format!("{c:?}");
+        assert!(!text.contains("url"), "{text}");
     }
 
     #[test]
@@ -173,30 +161,8 @@ mod tests {
     }
 
     #[test]
-    fn model_and_base_url() {
-        let c = config(&[
-            ("JEV_MODEL", "jev-1.13.0"),
-            ("JEV_BASE_URL", "http://localhost:8080/"),
-        ]);
-        assert_eq!(c.model, "jev-1.13.0");
-        assert_eq!(c.base_url, "http://localhost:8080");
-    }
-
-    #[test]
-    fn base_url_must_be_http() {
-        for raw in ["api.typesafe.ai", "ftp://example.com", "localhost:8080"] {
-            let c = config(&[("JEV_BASE_URL", raw)]);
-            assert_eq!(c.base_url, "https://api.typesafe.ai", "{raw}");
-            assert_eq!(
-                c.warnings,
-                vec![format!(
-                    "JEV_BASE_URL={raw} is not an http(s) URL; using https://api.typesafe.ai"
-                )]
-            );
-        }
-        let c = config(&[("JEV_BASE_URL", "https://example.com/")]);
-        assert_eq!(c.base_url, "https://example.com");
-        assert!(c.warnings.is_empty());
+    fn model() {
+        assert_eq!(config(&[("JEV_MODEL", "jev-1.13.0")]).model, "jev-1.13.0");
     }
 
     #[test]

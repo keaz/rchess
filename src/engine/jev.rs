@@ -17,6 +17,10 @@ use thiserror::Error;
 use super::annotate::Bucket;
 use super::config::EngineConfig;
 
+/// The TypeSafe System One endpoint every Jev request goes to (the URL of the
+/// TypeSafe quickstart). It is fixed, not configurable.
+pub const JEV_ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
+
 /// Maximum attempts for one request, counting the first.
 const MAX_ATTEMPTS: u32 = 3;
 const BASE_BACKOFF: Duration = Duration::from_millis(250);
@@ -220,7 +224,8 @@ fn request_error(error: ureq::Error) -> JevError {
     }
 }
 
-/// HTTP client for `POST {base_url}/v1/systemone`.
+/// HTTP client for `POST https://api.typesafe.ai/v1/systemone` ([`JEV_ENDPOINT`]),
+/// sending `Authorization: Bearer <key>` and a JSON body as in the TypeSafe quickstart.
 pub struct JevClient {
     agent: ureq::Agent,
     url: String,
@@ -239,8 +244,18 @@ impl fmt::Debug for JevClient {
 }
 
 impl JevClient {
-    /// `None` when the config has no API key.
+    /// A client for [`JEV_ENDPOINT`]; `None` when the config has no API key.
     pub fn new(config: &EngineConfig) -> Option<JevClient> {
+        JevClient::build(config, JEV_ENDPOINT.to_string())
+    }
+
+    /// A client for another endpoint, for the offline transport tests only.
+    #[cfg(test)]
+    fn with_endpoint(config: &EngineConfig, endpoint: String) -> Option<JevClient> {
+        JevClient::build(config, endpoint)
+    }
+
+    fn build(config: &EngineConfig, url: String) -> Option<JevClient> {
         let api_key = config.api_key.clone()?;
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_global(Some(config.timeout))
@@ -249,7 +264,7 @@ impl JevClient {
             .into();
         Some(JevClient {
             agent,
-            url: format!("{}/v1/systemone", config.base_url),
+            url,
             model: config.model.clone(),
             api_key,
         })
@@ -260,6 +275,9 @@ impl JevClient {
             .agent
             .post(&self.url)
             .header("Authorization", &format!("Bearer {}", self.api_key))
+            // `send_json` alone would send `application/json; charset=utf-8`; the
+            // TypeSafe quickstart sends plain `application/json`.
+            .content_type("application/json")
             .send_json(body)
             .map_err(request_error)?;
         let status = response.status().as_u16();
@@ -313,8 +331,7 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     fn request() -> ChoiceRequest {
         ChoiceRequest {
@@ -490,21 +507,24 @@ mod tests {
         }
     }
 
+    /// Every raw request (head and body) the scripted server has read, in order.
+    type Requests = Arc<Mutex<Vec<String>>>;
+
     /// Serves `responses` in order, one per connection, on 127.0.0.1, then stops
-    /// listening. Returns a client pointed at it and the number of requests read.
-    fn serve(responses: Vec<String>) -> (JevClient, Arc<AtomicUsize>) {
+    /// listening. Returns a client pointed at its `/v1/systemone` and the requests read.
+    fn serve(responses: Vec<String>) -> (JevClient, Requests) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let requests = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::clone(&requests);
+        let requests = Requests::default();
+        let received = Arc::clone(&requests);
         thread::spawn(move || {
             for response in responses {
                 let Ok((stream, _)) = listener.accept() else {
                     return;
                 };
                 let mut reader = BufReader::new(stream);
-                read_request(&mut reader);
-                counter.fetch_add(1, Ordering::SeqCst);
+                let raw = read_request(&mut reader);
+                received.lock().unwrap().push(raw);
                 let mut stream = reader.into_inner();
                 let _ = stream.write_all(response.as_bytes());
                 let _ = stream.flush();
@@ -513,19 +533,32 @@ mod tests {
         });
         let config = EngineConfig {
             api_key: Some("test-key".to_string()),
-            base_url: format!("http://127.0.0.1:{port}"),
             timeout: Duration::from_secs(2),
             ..EngineConfig::default()
         };
-        (JevClient::new(&config).unwrap(), requests)
+        let endpoint = format!("http://127.0.0.1:{port}/v1/systemone");
+        (
+            JevClient::with_endpoint(&config, endpoint).unwrap(),
+            requests,
+        )
     }
 
-    /// Reads one request: the head, then a body of `Content-Length` bytes.
-    fn read_request(reader: &mut BufReader<TcpStream>) {
+    fn count(requests: &Requests) -> usize {
+        requests.lock().unwrap().len()
+    }
+
+    /// Reads one request: the head, then a body of `Content-Length` bytes. Returns
+    /// both as text.
+    fn read_request(reader: &mut BufReader<TcpStream>) -> String {
+        let mut raw = String::new();
         let mut length = 0;
         loop {
             let mut line = String::new();
-            if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                break;
+            }
+            raw.push_str(&line);
+            if line == "\r\n" {
                 break;
             }
             if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
@@ -534,6 +567,8 @@ mod tests {
         }
         let mut body = vec![0; length];
         let _ = reader.read_exact(&mut body);
+        raw.push_str(&String::from_utf8_lossy(&body));
+        raw
     }
 
     fn response(status: &str, content_type: &str, body: &str) -> String {
@@ -558,7 +593,39 @@ mod tests {
         );
         assert_eq!(answer.model, "jev-1.13.0");
         assert_eq!(answer.input_tokens, 321);
-        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(count(&requests), 1);
+
+        // The wire format of the TypeSafe quickstart: `curl -X POST
+        // https://api.typesafe.ai/v1/systemone -H "Authorization: Bearer $KEY"
+        // -H "Content-Type: application/json"` with a JSON body.
+        let raw = requests.lock().unwrap()[0].clone();
+        let (head, body) = raw.split_once("\r\n\r\n").expect("a head and a body");
+        let mut lines = head.split("\r\n");
+        assert_eq!(lines.next(), Some("POST /v1/systemone HTTP/1.1"));
+        let headers: Vec<(String, String)> = lines
+            .map(|line| {
+                let (name, value) = line.split_once(':').expect("a header line");
+                (name.to_ascii_lowercase(), value.trim().to_string())
+            })
+            .collect();
+        let header = |name: &str| {
+            headers
+                .iter()
+                .filter(|(n, _)| n == name)
+                .map(|(_, v)| v.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(header("authorization"), vec!["Bearer test-key"], "{head}");
+        assert_eq!(header("content-type"), vec!["application/json"], "{head}");
+        let body: Value = serde_json::from_str(body).expect("a JSON body");
+        let keys: Vec<&str> = body
+            .as_object()
+            .expect("a JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, vec!["model", "questions", "state"]);
+        assert_eq!(body, request().to_body("jev-latest"));
     }
 
     #[test]
@@ -579,7 +646,7 @@ mod tests {
         assert_eq!(*status, 502);
         assert!(message.chars().count() <= 200, "{message}");
         assert!(!message.chars().any(char::is_control), "{message:?}");
-        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        assert_eq!(count(&requests), 3);
     }
 
     #[test]
@@ -595,7 +662,7 @@ mod tests {
             matches!(error, JevError::Http { status: 401, .. }),
             "{error:?}"
         );
-        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(count(&requests), 1);
     }
 
     #[test]
@@ -614,7 +681,7 @@ mod tests {
                 retry_after: None,
             }
         );
-        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(count(&requests), 1);
     }
 
     #[test]
@@ -623,7 +690,7 @@ mod tests {
         let (client, requests) = serve(vec![huge]);
         let error = client.choose(&request()).unwrap_err();
         assert!(matches!(error, JevError::Request(_)), "{error:?}");
-        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(count(&requests), 1);
     }
 
     #[test]
@@ -636,7 +703,12 @@ mod tests {
         let client = JevClient::new(&config).unwrap();
         let text = format!("{client:?}");
         assert!(!text.contains("secret-key-123"), "{text}");
-        assert!(text.contains("https://api.typesafe.ai/v1/systemone"));
+        assert!(text.contains(JEV_ENDPOINT), "{text}");
+    }
+
+    #[test]
+    fn the_endpoint_is_the_quickstart_url() {
+        assert_eq!(JEV_ENDPOINT, "https://api.typesafe.ai/v1/systemone");
     }
 
     /// Real API round trip. Run with: cargo test --lib engine::jev -- --ignored
