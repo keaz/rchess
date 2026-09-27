@@ -31,6 +31,10 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(2);
 const ERROR_SNIPPET_CHARS: usize = 200;
 /// Largest response body read, in bytes; a real answer is a few kilobytes.
 const MAX_BODY_BYTES: u64 = 1 << 20;
+/// The header that carries the API key, as `Bearer <key>` ([`bearer`]).
+const AUTHORIZATION: &str = "Authorization";
+/// The header naming the body's type.
+const CONTENT_TYPE_HEADER: &str = "Content-Type";
 /// The request's `Content-Type`, as the TypeSafe quickstart sends it.
 const CONTENT_TYPE: &str = "application/json";
 /// What a recorded exchange shows in place of the API key.
@@ -278,9 +282,16 @@ fn redact(text: &str, secret: &str) -> String {
 /// A response body with the key redacted, both in the raw text and, when the body is
 /// JSON, in the text a parser decodes from it: a server can echo the key with `\u`
 /// escapes that the raw text does not match. When decoding shows the key, the body
-/// is re-encoded from the redacted JSON, so no later parse can bring it back.
+/// is re-encoded from the redacted JSON, so no later parse can bring it back. The
+/// raw text also loses the key with `/` written as `\/`, JSON's other way to write
+/// it, in case a reader decodes part of a body that is not JSON as a whole.
 fn redact_body(text: &str, secret: &str) -> String {
     let text = redact(text, secret);
+    let text = if secret.contains('/') {
+        redact(&text, &secret.replace('/', "\\/"))
+    } else {
+        text
+    };
     let Ok(json) = serde_json::from_str::<Value>(&text) else {
         return text;
     };
@@ -306,6 +317,12 @@ fn redact_value(value: &Value, secret: &str) -> Value {
         ),
         Value::Null | Value::Bool(_) | Value::Number(_) => value.clone(),
     }
+}
+
+/// The `Authorization` value for `key`. [`JevClient`] sends it with the real key and
+/// records it with `<redacted>`, so the record shows what was sent.
+fn bearer(key: &str) -> String {
+    format!("Bearer {key}")
 }
 
 /// `error` with [`redact`] applied to its text.
@@ -400,8 +417,8 @@ impl JevClient {
             method: "POST".to_string(),
             url: self.url.clone(),
             headers: vec![
-                ("Authorization".to_string(), format!("Bearer {REDACTED}")),
-                ("Content-Type".to_string(), CONTENT_TYPE.to_string()),
+                (AUTHORIZATION.to_string(), bearer(REDACTED)),
+                (CONTENT_TYPE_HEADER.to_string(), CONTENT_TYPE.to_string()),
             ],
             body: redact_value(body, &self.api_key),
             attempts: Vec::new(),
@@ -450,7 +467,7 @@ impl JevClient {
         let sent = self
             .agent
             .post(&self.url)
-            .header("Authorization", &format!("Bearer {}", self.api_key))
+            .header(AUTHORIZATION, &bearer(&self.api_key))
             // `send_json` alone would send `application/json; charset=utf-8`; the
             // TypeSafe quickstart sends plain `application/json`.
             .content_type(CONTENT_TYPE)
@@ -944,10 +961,93 @@ pub(crate) mod tests {
             ok.elapsed
         );
 
-        // Only the record is redacted: the wire carries the real key.
+        // Only the record is redacted: the wire carries the real key. Every recorded
+        // header is one the server read, with the same value once the key is put back.
         for raw in requests.lock().unwrap().iter() {
             assert!(raw.contains("Bearer test-key"), "{raw}");
+            let head: Vec<(&str, &str)> = raw
+                .lines()
+                .take_while(|line| !line.is_empty())
+                .filter_map(|line| line.split_once(':'))
+                .map(|(name, value)| (name.trim(), value.trim()))
+                .collect();
+            for (name, value) in &exchange.headers {
+                let sent = value.replace(REDACTED, "test-key");
+                assert!(
+                    head.iter()
+                        .any(|(n, v)| n.eq_ignore_ascii_case(name) && *v == sent),
+                    "{name}: {sent} not in {raw}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn traced_exchange_redacts_the_key_in_the_request_body() {
+        let ok = response("200 OK", "application/json", ANSWER);
+        let (client, requests) = serve_with_key(vec![ok], SENTINEL_KEY);
+        let mut asked = request();
+        asked.state = json!({ "note": format!("key {SENTINEL_KEY}") });
+        asked.guidance = format!("Never repeat {SENTINEL_KEY}.");
+        let mut trace = None;
+        client.choose_traced(&asked, &mut trace).unwrap();
+
+        let body = trace.unwrap().body;
+        assert_eq!(body["state"]["note"], "key <redacted>");
+        assert_eq!(
+            body["questions"]["move"]["instructions"]["guidance"],
+            "Never repeat <redacted>."
+        );
+        assert!(!body.to_string().contains(SENTINEL_KEY), "{body}");
+        // The wire carries the request as it was asked.
+        let raw = &requests.lock().unwrap()[0];
+        assert!(raw.contains(&format!("key {SENTINEL_KEY}")), "{raw}");
+        assert!(
+            raw.contains(&format!("Never repeat {SENTINEL_KEY}.")),
+            "{raw}"
+        );
+    }
+
+    #[test]
+    fn traced_exchange_redacts_a_key_with_an_escaped_solidus() {
+        // JSON may write `/` as `\/`: a parser reads it back as the key, though the raw
+        // text does not contain it. Text that is not JSON is redacted in that form too.
+        let key = "sentinel/key-7Qx9";
+        let escaped = key.replace('/', "\\/");
+        let (client, _requests) = serve_with_key(
+            vec![
+                response(
+                    "401 Unauthorized",
+                    "application/json",
+                    &format!(r#"{{"error":"invalid api key {escaped}"}}"#),
+                ),
+                response(
+                    "401 Unauthorized",
+                    "text/plain",
+                    &format!("no such key: {escaped} ("),
+                ),
+            ],
+            key,
+        );
+
+        let mut trace = None;
+        let error = client.choose_traced(&request(), &mut trace).unwrap_err();
+        assert_eq!(
+            trace.unwrap().attempts[0].response.as_deref(),
+            Some(r#"{"error":"invalid api key <redacted>"}"#)
+        );
+        assert_eq!(
+            error.to_string(),
+            r#"HTTP 401: {"error":"invalid api key <redacted>"}"#
+        );
+
+        let mut trace = None;
+        let error = client.choose_traced(&request(), &mut trace).unwrap_err();
+        assert_eq!(
+            trace.unwrap().attempts[0].response.as_deref(),
+            Some("no such key: <redacted> (")
+        );
+        assert_eq!(error.to_string(), "HTTP 401: no such key: <redacted> (");
     }
 
     #[test]
@@ -1130,7 +1230,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn choose_traced_by_default_answers_without_a_trace() {
+    fn default_choose_traced_forwards_to_choose_and_records_nothing() {
         struct Plain;
         impl MoveChooser for Plain {
             fn choose(&self, _: &ChoiceRequest) -> Result<ChoiceAnswer, JevError> {

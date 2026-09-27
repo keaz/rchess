@@ -28,7 +28,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Serialize, Serializer};
 use serde_json::Value;
 
-use super::files::{civil_date, describe};
+use super::files::{civil_date, describe, expand_tilde};
 use super::glyphs::char_width;
 use crate::core::Game;
 use crate::engine::{ComputerMove, JevExchange};
@@ -48,8 +48,8 @@ const LOG_THREAD: &str = "debug-log";
 const LOG_DIR: &str = "rchess";
 /// The log's file name.
 const LOG_FILE: &str = "jev-debug.jsonl";
-/// Why there is no log when no path could be worked out.
-const NO_LOG_PATH: &str = "no log file (set RCHESS_DEBUG_LOG, XDG_STATE_HOME or HOME)";
+/// Why there is no log when none of the variables that give its path is set.
+pub const NO_LOG_PATH: &str = "no log file (set RCHESS_DEBUG_LOG, XDG_STATE_HOME or HOME)";
 
 /// True when debug mode is on: `--debug` was given (`flag`), or `RCHESS_DEBUG` is set
 /// to anything but empty or `0` (surrounding whitespace ignored).
@@ -63,37 +63,28 @@ pub fn enabled(flag: bool, get: impl Fn(&str) -> Option<String>) -> bool {
 /// `$XDG_STATE_HOME/rchess/jev-debug.jsonl`, else `~/.local/state/rchess/jev-debug.jsonl`
 /// (on macOS too). Empty variables count as unset, and so does a relative
 /// `XDG_STATE_HOME` (the XDG base directory rules say to ignore one). A leading `~/` in
-/// `RCHESS_DEBUG_LOG` is expanded to `HOME`, as for save paths ([`expand_tilde`]); other
-/// text (including `~name`) is used as given. `None` when none of the three is set, or
-/// when `RCHESS_DEBUG_LOG` starts with `~/` and `HOME` is not set.
+/// `RCHESS_DEBUG_LOG` is `HOME`, as in save paths ([`expand_tilde`]); a relative path
+/// stays relative to the working directory.
+///
+/// # Errors
+///
+/// Why there is no path, for [`DebugLog::open`] to report: [`NO_LOG_PATH`] when none of
+/// the three is set, or the reason `~` cannot be expanded when `RCHESS_DEBUG_LOG`
+/// starts with `~/` and `HOME` is not set.
 ///
 /// `get` reads an environment variable; pass `|k| std::env::var(k).ok()`.
-pub fn log_path(get: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+pub fn log_path(get: impl Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
     let set = |name: &str| get(name).filter(|value| !value.is_empty());
     if let Some(path) = set(DEBUG_LOG_ENV) {
-        return expand_tilde(&path, set("HOME").as_deref());
+        return expand_tilde(&path, set("HOME").as_deref().map(Path::new))
+            .map_err(|error| format!("{DEBUG_LOG_ENV}: {error}"));
     }
     let state = set("XDG_STATE_HOME")
         .map(PathBuf::from)
         .filter(|dir| dir.is_absolute())
-        .or_else(|| set("HOME").map(|home| Path::new(&home).join(".local").join("state")))?;
-    Some(state.join(LOG_DIR).join(LOG_FILE))
-}
-
-/// Expands a leading `~/` in `path` to `home`, the same rule
-/// [`super::files::resolve_path`] uses for save paths: `~name` and a path with no
-/// leading `~` are returned as given, and `~` alone (a folder, not a file) falls
-/// through unchanged too, since a caller turns it into a file path itself. `None` when
-/// `path` starts with `~/` (or `~\` on Windows) and `home` is not set or empty — there is
-/// then nothing to expand it to.
-fn expand_tilde(path: &str, home: Option<&str>) -> Option<PathBuf> {
-    match path.strip_prefix('~') {
-        Some(rest) if rest.starts_with(std::path::is_separator) => {
-            let home = home.filter(|home| !home.is_empty())?;
-            Some(Path::new(home).join(rest.trim_start_matches(std::path::is_separator)))
-        }
-        _ => Some(PathBuf::from(path)),
-    }
+        .or_else(|| set("HOME").map(|home| Path::new(&home).join(".local").join("state")))
+        .ok_or_else(|| NO_LOG_PATH.to_string())?;
+    Ok(state.join(LOG_DIR).join(LOG_FILE))
 }
 
 /// `time` in UTC as RFC 3339 with milliseconds: `2026-09-27T14:03:05.120Z`. Times before
@@ -434,11 +425,15 @@ impl ExchangeView {
             .or_else(|| (!history.is_empty()).then_some(0))
     }
 
-    /// A new exchange numbered `number` has arrived: shown when nothing is, otherwise
-    /// the view stays where it is.
-    pub fn follow(&mut self, number: u64) {
-        if self.shown.is_none() {
-            self.show(Some(number));
+    /// A new exchange has arrived in `history`: the newest is shown when nothing is.
+    /// Otherwise the view stays on its exchange, scroll and all, while that is kept; once
+    /// it has been dropped, the view moves to the oldest one kept, at its top.
+    pub fn follow(&mut self, history: &History) {
+        let kept = self.shown.and_then(|number| history.index_of(number));
+        match (self.shown, kept) {
+            (None, _) => self.show(history.last().map(|record| record.number)),
+            (Some(_), Some(_)) => {}
+            (Some(_), None) => self.show(history.get(0).map(|record| record.number)),
         }
     }
 
@@ -592,8 +587,7 @@ pub struct LogFailure {
 /// The debug log: records go over a channel to the `debug-log` thread, which appends
 /// each as a line ([`log_line`]) and flushes it. The file and any missing folders are
 /// created with the first record: folders with mode 0700, the file with mode 0600 (an
-/// existing file is appended to and its mode is tightened to 0600 too; an existing
-/// folder keeps its mode).
+/// existing file is appended to and made 0600 too; an existing folder keeps its mode).
 ///
 /// The first error ends the thread; [`DebugLog::failure`] then reports it once and
 /// nothing more is written. Records never wait: [`DebugLog::write`] only sends.
@@ -617,17 +611,14 @@ enum LogState {
 }
 
 impl DebugLog {
-    /// The log at `path` ([`log_path`]); without one, a log that reports the missing
-    /// path at the first record.
+    /// The log at `path` ([`log_path`]); without one, a log that reports why there is
+    /// no path (the error) at the first record.
     #[must_use]
-    pub fn open(path: Option<PathBuf>) -> DebugLog {
+    pub fn open(path: Result<PathBuf, String>) -> DebugLog {
         match path {
-            Some(path) => DebugLog::start(path),
-            None => DebugLog {
-                state: LogState::Unavailable(LogFailure {
-                    reason: NO_LOG_PATH.to_string(),
-                    path: None,
-                }),
+            Ok(path) => DebugLog::start(path),
+            Err(reason) => DebugLog {
+                state: LogState::Unavailable(LogFailure { reason, path: None }),
             },
         }
     }
@@ -734,10 +725,11 @@ fn write_records(path: &Path, queued: &Receiver<Record>) -> Result<(), LogFailur
     Ok(())
 }
 
-/// Opens `path` for appending, creating it (mode 0600) and its missing folders (mode
-/// 0700) as needed. `OpenOptionsExt::mode` only applies when the open call creates the
-/// file, so an existing file with a looser mode (left over from an older build, or made
-/// by another process) is explicitly tightened to 0600 here too.
+/// Opens `path` for appending, creating it and its missing folders (mode 0700) as
+/// needed. The file gets mode 0600, also when it was already there with a looser one;
+/// folders that were already there keep theirs (one may be the user's
+/// `~/.local/state`). Only a regular file is changed: a device such as `/dev/null`
+/// is written as it is.
 fn open_log(path: &Path) -> io::Result<File> {
     if let Some(folder) = path
         .parent()
@@ -757,8 +749,8 @@ fn open_log(path: &Path) -> io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = file.metadata()?.permissions().mode() & 0o777;
-        if mode != 0o600 {
+        let metadata = file.metadata()?;
+        if metadata.is_file() && metadata.permissions().mode() & 0o777 != 0o600 {
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
     }
@@ -820,7 +812,6 @@ impl DebugSession {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::fs;
     use std::time::Instant;
 
@@ -828,16 +819,8 @@ mod tests {
 
     use super::*;
     use crate::engine::{JevAttempt, recorded_exchange};
-    use crate::tui::test_support::TempDir;
     use crate::tui::test_support::engine::{SENTINEL_KEY, jev_exchange, jev_move};
-
-    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
-        let map: HashMap<String, String> = pairs
-            .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-            .collect();
-        move |key| map.get(key).cloned()
-    }
+    use crate::tui::test_support::{TempDir, env};
 
     /// `ms` milliseconds after the epoch.
     fn at_ms(ms: u64) -> SystemTime {
@@ -901,7 +884,7 @@ mod tests {
 
     #[test]
     fn the_log_path_follows_the_variables_in_order() {
-        let log = |pairs: &[(&str, &str)]| log_path(env(pairs));
+        let log = |pairs: &[(&str, &str)]| log_path(env(pairs)).ok();
         let all = [
             (DEBUG_LOG_ENV, "/tmp/mine.jsonl"),
             ("XDG_STATE_HOME", "/xdg/state"),
@@ -937,30 +920,13 @@ mod tests {
                 "XDG_STATE_HOME {xdg:?} is ignored"
             );
         }
-        assert_eq!(log(&[]), None);
-        assert_eq!(log(&[("HOME", ""), ("XDG_STATE_HOME", "state")]), None);
-        // A leading `~/` in RCHESS_DEBUG_LOG is the home folder, as for save paths.
-        assert_eq!(
-            log(&[(DEBUG_LOG_ENV, "~/jev.jsonl"), ("HOME", "/home/ana")]),
-            Some(PathBuf::from("/home/ana/jev.jsonl"))
-        );
-        assert_eq!(
-            log(&[(DEBUG_LOG_ENV, "~/a/b.jsonl"), ("HOME", "/home/ana")]),
-            Some(PathBuf::from("/home/ana/a/b.jsonl"))
-        );
-        // Only a leading `~/` is the home folder: `~name` and an inner `~` are literal.
-        assert_eq!(
-            log(&[(DEBUG_LOG_ENV, "~ana/jev.jsonl"), ("HOME", "/home/ana")]),
-            Some(PathBuf::from("~ana/jev.jsonl"))
-        );
-        assert_eq!(
-            log(&[(DEBUG_LOG_ENV, "logs/~/jev.jsonl"), ("HOME", "/home/ana")]),
-            Some(PathBuf::from("logs/~/jev.jsonl"))
-        );
-        // Without HOME there is nothing to expand `~/` to: no log, rather than a literal
-        // `./~/...` folder.
-        assert_eq!(log(&[(DEBUG_LOG_ENV, "~/jev.jsonl")]), None);
-        assert_eq!(log(&[(DEBUG_LOG_ENV, "~/jev.jsonl"), ("HOME", "")]), None);
+        for pairs in [&[][..], &[("HOME", ""), ("XDG_STATE_HOME", "state")]] {
+            assert_eq!(
+                log_path(env(pairs)),
+                Err(NO_LOG_PATH.to_string()),
+                "{pairs:?}"
+            );
+        }
     }
 
     #[test]
@@ -1156,12 +1122,12 @@ mod tests {
         view.newer(&history);
         assert_eq!(view.shown, None);
 
-        let first = history.push(exchange(), false, at_ms(1)).number;
-        view.follow(first);
+        history.push(exchange(), false, at_ms(1));
+        view.follow(&history);
         assert_eq!(view.shown, Some(1), "the first exchange is shown at once");
         for n in 2..=3 {
-            let number = history.push(exchange(), false, at_ms(n)).number;
-            view.follow(number);
+            history.push(exchange(), false, at_ms(n));
+            view.follow(&history);
         }
         assert_eq!(view.shown, Some(1), "later ones do not move the view");
         view.newer(&history);
@@ -1179,14 +1145,39 @@ mod tests {
     fn a_dropped_exchange_leaves_the_view_on_the_oldest() {
         let mut history = History::new();
         history.push(exchange(), false, at_ms(1));
+        history.push(exchange(), false, at_ms(2));
         let mut view = ExchangeView::open(&history);
-        for n in 2..=51 {
+        view.older(&history);
+        (view.page, view.max_scroll) = (10, 40);
+        view.down(7);
+        assert_eq!((view.shown, view.scroll), (Some(1), 7));
+        // While the exchange shown is kept, new ones leave the view and its scroll alone.
+        for n in 3..=50 {
             history.push(exchange(), false, at_ms(n));
+            view.follow(&history);
         }
+        assert_eq!((view.shown, view.scroll), (Some(1), 7));
+        // Once it is dropped, the view moves to the oldest kept, at its top.
+        history.push(exchange(), false, at_ms(51));
+        view.follow(&history);
         assert_eq!(history.index_of(1), None);
+        assert_eq!((view.shown, view.scroll), (Some(2), 0));
+        assert_eq!(view.index(&history), Some(0));
+        view.down(3);
+        history.push(exchange(), false, at_ms(52));
+        view.follow(&history);
+        assert_eq!((view.shown, view.scroll), (Some(3), 0), "and again");
+        view.newer(&history);
+        assert_eq!(view.shown, Some(4));
+
+        // A view that missed the drop (no follow) still shows the oldest kept.
+        let mut view = ExchangeView {
+            shown: Some(1),
+            ..ExchangeView::default()
+        };
         assert_eq!(view.index(&history), Some(0));
         view.newer(&history);
-        assert_eq!(view.shown, Some(3));
+        assert_eq!(view.shown, Some(4));
     }
 
     #[test]
@@ -1344,6 +1335,54 @@ mod tests {
     // ----- the log thread -----
 
     #[test]
+    fn a_leading_tilde_in_the_log_path_is_the_home_folder() {
+        let dir = TempDir::new("debug-log");
+        let home = dir.path().to_str().expect("a UTF-8 temp dir");
+        let path = log_path(env(&[(DEBUG_LOG_ENV, "~/x.jsonl"), ("HOME", home)]));
+        assert_eq!(path, Ok(dir.join("x.jsonl")));
+        let mut log = DebugLog::open(path);
+        log.write(&record(false));
+        log.close(Duration::from_secs(10));
+        assert_eq!(
+            fs::read_to_string(dir.join("x.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert!(!dir.join("~").exists());
+
+        // Only a leading `~/` is the home folder.
+        let log = |raw: &str| log_path(env(&[(DEBUG_LOG_ENV, raw), ("HOME", "/home/ana")]));
+        assert_eq!(log("~/a/b.jsonl"), Ok(PathBuf::from("/home/ana/a/b.jsonl")));
+        assert_eq!(log("logs/~/b.jsonl"), Ok(PathBuf::from("logs/~/b.jsonl")));
+        assert_eq!(log("~ana/b.jsonl"), Ok(PathBuf::from("~ana/b.jsonl")));
+    }
+
+    #[test]
+    fn a_tilde_without_a_home_is_reported_as_such() {
+        // Without a home there is nothing to expand `~` to, so there is no log, and the
+        // reason says so rather than asking for RCHESS_DEBUG_LOG, which is set.
+        for pairs in [
+            &[(DEBUG_LOG_ENV, "~/x.jsonl")][..],
+            &[(DEBUG_LOG_ENV, "~/x.jsonl"), ("HOME", "")],
+            &[
+                (DEBUG_LOG_ENV, "~/x.jsonl"),
+                ("XDG_STATE_HOME", "/xdg/state"),
+            ],
+        ] {
+            let mut log = DebugLog::open(log_path(env(pairs)));
+            log.write(&record(false));
+            let failure = log.failure().expect("reported");
+            assert_eq!(
+                failure.reason, "RCHESS_DEBUG_LOG: cannot expand ~ in ~/x.jsonl: HOME is not set",
+                "{pairs:?}"
+            );
+            assert_eq!(failure.path, None);
+        }
+    }
+
+    #[test]
     fn the_log_is_created_private_and_gets_one_line_per_record() {
         let dir = TempDir::new("debug-log");
         let path = dir.path().join("state").join("rchess").join(LOG_FILE);
@@ -1392,6 +1431,27 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn an_existing_log_is_made_private_and_its_folder_is_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("debug-log");
+        // A folder the user already had, such as ~/.local/state, and a log another
+        // program left readable by everyone.
+        let folder = dir.join("state");
+        fs::create_dir(&folder).unwrap();
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = folder.join(LOG_FILE);
+        fs::write(&path, "{\"earlier\":true}\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut log = DebugLog::start(path.clone());
+        log.write(&record(false));
+        log.close(Duration::from_secs(10));
+        assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 2);
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&folder), 0o755);
+    }
+
+    #[test]
     fn a_write_error_is_reported_once_and_ends_the_log() {
         let dir = TempDir::new("debug-log");
         // A folder where the file should be: opening it fails.
@@ -1414,7 +1474,7 @@ mod tests {
 
     #[test]
     fn a_missing_path_is_reported_at_the_first_record() {
-        let mut log = DebugLog::open(None);
+        let mut log = DebugLog::open(Err(NO_LOG_PATH.to_string()));
         assert_eq!(log.failure(), None);
         log.write(&record(false));
         let failure = log.failure().expect("reported");

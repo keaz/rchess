@@ -2,11 +2,11 @@
 //!
 //! [`enter`] puts the terminal in raw mode on the alternate screen, runs the
 //! caller's start-up step (the graphics query), then turns on click-and-drag
-//! mouse reporting and bracketed paste. [`leave`] undoes all of it
-//! and is reached on every exit path: a normal return or `?` error (through
-//! [`Guard`]), a panic on the UI thread (through the panic hook) and SIGINT,
-//! SIGTERM or SIGHUP (through the flag from [`register_signals`], which the main
-//! loop checks every tick; the program then ends by that signal with
+//! mouse reporting and bracketed paste. [`leave`] undoes all of it (deleting any
+//! Kitty pictures first) and is reached on every exit path: a normal return or `?`
+//! error (through [`Guard`]), a panic on the UI thread (through the panic hook) and
+//! SIGINT, SIGTERM or SIGHUP (through the flag from [`register_signals`], which the
+//! main loop checks every tick; the program then ends by that signal with
 //! [`exit_by_signal`]). If the loop does not react within [`STUCK_GRACE`], the
 //! signal thread restores the terminal itself and ends the process. That is also
 //! how a hangup ends when the UI is idle: crossterm keeps polling a hung-up tty
@@ -22,7 +22,7 @@ use std::fmt;
 use std::io::{self, stdout};
 use std::panic;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -33,10 +33,21 @@ use ratatui::crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use ratatui::crossterm::terminal::disable_raw_mode;
 use ratatui::crossterm::terminal::is_raw_mode_enabled;
 use ratatui::crossterm::{Command, execute};
+use ratatui_image::picker::cap_parser::Parser;
 
 /// True between a successful [`enter`] and the first [`leave`], which makes
 /// `leave` idempotent and a no-op when the terminal was never set up.
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Whether this session drew Kitty pictures, and how they reached the terminal:
+/// [`NO_KITTY`], [`KITTY`] or [`KITTY_IN_TMUX`]. [`leave`] deletes them.
+static KITTY_IMAGES: AtomicU8 = AtomicU8::new(NO_KITTY);
+/// No Kitty picture was drawn.
+const NO_KITTY: u8 = 0;
+/// Kitty pictures were sent straight to the terminal.
+const KITTY: u8 = 1;
+/// Kitty pictures went through tmux's passthrough.
+const KITTY_IN_TMUX: u8 = 2;
 
 /// The only thread whose panic may touch the terminal: the one running the UI.
 const UI_THREAD: &str = "main";
@@ -95,6 +106,48 @@ impl Command for DisableClickMouse {
     }
 }
 
+/// Deletes every Kitty picture and frees its data (`a=d,d=A`), so Kitty and Ghostty
+/// do not keep them after the program ends. With `tmux` the command is wrapped for
+/// tmux's passthrough, as ratatui-image wraps the pictures. It prints nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeleteKittyImages {
+    /// The pictures went through tmux.
+    pub tmux: bool,
+}
+
+impl Command for DeleteKittyImages {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        let (start, escape, end) = Parser::tmux_start_escape_end(self.tmux);
+        write!(f, "{start}{escape}_Ga=d,d=A{escape}\\{end}")
+    }
+
+    /// The Windows console draws no Kitty pictures.
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Notes that Kitty pictures were drawn (through tmux when `tmux`), so [`leave`]
+/// deletes them before it leaves the alternate screen.
+pub fn note_kitty_images(tmux: bool) {
+    note_kitty(&KITTY_IMAGES, tmux);
+}
+
+fn note_kitty(state: &AtomicU8, tmux: bool) {
+    state.store(if tmux { KITTY_IN_TMUX } else { KITTY }, Ordering::SeqCst);
+}
+
+/// The command that deletes the Kitty pictures noted in `state`, once; `None` when
+/// none were drawn.
+fn kitty_cleanup(state: &AtomicU8) -> Option<DeleteKittyImages> {
+    match state.swap(NO_KITTY, Ordering::SeqCst) {
+        KITTY => Some(DeleteKittyImages { tmux: false }),
+        KITTY_IN_TMUX => Some(DeleteKittyImages { tmux: true }),
+        _ => None,
+    }
+}
+
 /// Sets up the terminal: raw mode and the alternate screen (`ratatui::try_init`),
 /// then `before_input`, then click-and-drag mouse reporting and bracketed paste,
 /// then a thread-aware panic hook. Returns the terminal with what `before_input`
@@ -134,13 +187,26 @@ pub fn enter<T>(before_input: impl FnOnce() -> T) -> io::Result<(DefaultTerminal
         }
     };
     ACTIVE.store(true, Ordering::SeqCst);
-    let value = before_input();
-    finish_enter(
-        original,
-        || execute!(stdout(), EnableClickMouse, EnableBracketedPaste),
-        leave,
-    )?;
+    let value = query_then_enable(before_input, || {
+        finish_enter(
+            original,
+            || execute!(stdout(), EnableClickMouse, EnableBracketedPaste),
+            leave,
+        )
+    })?;
     Ok((terminal, value))
+}
+
+/// The order [`enter`] keeps once raw mode and the alternate screen are on: first
+/// `before_input` (the graphics query), then `enable` (mouse reporting and bracketed
+/// paste), so no mouse or paste report can mix into the query's answers.
+fn query_then_enable<T>(
+    before_input: impl FnOnce() -> T,
+    enable: impl FnOnce() -> io::Result<()>,
+) -> io::Result<T> {
+    let value = before_input();
+    enable()?;
+    Ok(value)
 }
 
 /// The rest of [`enter`] once `try_init` succeeded: `enable` turns on mouse
@@ -163,17 +229,27 @@ fn finish_enter(
     Ok(())
 }
 
-/// Restores the terminal: turns off mouse reporting and bracketed paste, then
+/// Restores the terminal: deletes the Kitty pictures if any were drawn
+/// ([`note_kitty_images`]), turns off mouse reporting and bracketed paste, then
 /// raw mode and the alternate screen (`ratatui::try_restore`), then shows the
 /// cursor. Every error is ignored and nothing is printed, so this never panics,
 /// even on a hung-up tty. Only the first call after [`enter`] does anything, so
 /// every exit path may call it.
 pub fn leave() {
     leave_once(&ACTIVE, || {
-        let _ = execute!(stdout(), DisableClickMouse, DisableBracketedPaste);
+        write_teardown(&mut stdout(), kitty_cleanup(&KITTY_IMAGES));
         let _ = ratatui::try_restore();
         let _ = execute!(stdout(), Show);
     });
+}
+
+/// What [`leave`] writes while still on the alternate screen: `kitty` (the pictures'
+/// deletion) first, then mouse reporting and bracketed paste off. Errors are ignored.
+fn write_teardown(out: &mut impl io::Write, kitty: Option<DeleteKittyImages>) {
+    if let Some(delete) = kitty {
+        let _ = execute!(out, delete);
+    }
+    let _ = execute!(out, DisableClickMouse, DisableBracketedPaste);
 }
 
 /// Calls [`leave`] when dropped. Bind it to a named variable for the lifetime of
@@ -339,7 +415,7 @@ fn is_ui_thread(name: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
 
     fn ansi(command: impl Command) -> String {
         let mut out = String::new();
@@ -381,6 +457,43 @@ mod tests {
             String::from_utf8(teardown).unwrap(),
             "\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?2004l"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kitty_pictures_are_deleted_first_and_only_after_kitty_drew() {
+        assert_eq!(
+            ansi(DeleteKittyImages { tmux: false }),
+            "\x1b_Ga=d,d=A\x1b\\"
+        );
+        assert_eq!(
+            ansi(DeleteKittyImages { tmux: true }),
+            "\x1bPtmux;\x1b\x1b_Ga=d,d=A\x1b\x1b\\\x1b\\"
+        );
+        let teardown = |kitty| {
+            let mut out = Vec::new();
+            write_teardown(&mut out, kitty);
+            String::from_utf8(out).unwrap()
+        };
+        assert_eq!(
+            teardown(Some(DeleteKittyImages { tmux: false })),
+            "\x1b_Ga=d,d=A\x1b\\\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?2004l"
+        );
+        assert_eq!(
+            teardown(None),
+            "\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?2004l"
+        );
+
+        let used = AtomicU8::new(NO_KITTY);
+        assert_eq!(kitty_cleanup(&used), None, "no kitty picture was drawn");
+        note_kitty(&used, true);
+        note_kitty(&used, false);
+        assert_eq!(
+            kitty_cleanup(&used),
+            Some(DeleteKittyImages { tmux: false }),
+            "the last note wins"
+        );
+        assert_eq!(kitty_cleanup(&used), None, "cleaned up once");
     }
 
     #[test]
@@ -448,6 +561,28 @@ mod tests {
         panic::set_hook(found);
         assert!(failed_enable_restores, "original hook put back");
         assert!(success_installs_thread_hook, "thread-aware hook installed");
+    }
+
+    #[test]
+    fn the_query_runs_before_mouse_and_paste_are_enabled() {
+        // `enter` calls this once raw mode and the alternate screen are on (the pty
+        // smoke test checks the query comes after ?1049h on the wire).
+        let steps = RefCell::new(Vec::new());
+        let value = query_then_enable(
+            || {
+                steps.borrow_mut().push("query");
+                7
+            },
+            || {
+                steps.borrow_mut().push("enable");
+                Ok(())
+            },
+        );
+        assert_eq!(value.unwrap(), 7);
+        assert_eq!(*steps.borrow(), ["query", "enable"]);
+
+        let failed = query_then_enable(|| 7, || Err(io::Error::other("no mouse")));
+        assert_eq!(failed.unwrap_err().to_string(), "no mouse");
     }
 
     #[test]

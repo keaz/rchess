@@ -21,7 +21,8 @@
 //! latency, model and the note) and takes the rows from Moves, which gets the rest and
 //! keeps at least [`MOVES_MIN_ROWS`]; when even that is not enough, only the note is cut
 //! short, ending in `…`. Menu, dialogs, help and the game-over overlay stay centred boxes.
-//! In debug mode the Status panel's border says `DEBUG`.
+//! In debug mode the Status panel says `DEBUG`: on the top border beside the mode when
+//! both fit, else at the start of its first line.
 //!
 //! The exchange view takes the whole screen instead of the playing screen (nothing of the
 //! board is drawn under it, so no piece picture is lost under it), with dialogs still on
@@ -1550,7 +1551,7 @@ mod tests {
     use super::*;
     use crate::core::{START_FEN, Square};
     use crate::tui::board::{image_area, square_at, square_rect};
-    use crate::tui::debug::DebugLog;
+    use crate::tui::debug::{DebugLog, NO_LOG_PATH};
     use crate::tui::event::AppEvent;
     use crate::tui::glyphs::{ImageSupport, initial_glyphs};
     use crate::tui::graphics::picker_for;
@@ -1973,6 +1974,11 @@ mod tests {
 
     /// The Status panel's top border, where the mode title goes.
     fn status_title(h: &Harness) -> String {
+        status_row(h, 0)
+    }
+
+    /// Row `row` of the Status panel, counted from its top border.
+    fn status_row(h: &Harness, row: u16) -> String {
         let buffer = h.buffer();
         let area = buffer.area;
         let status = playing_layout(
@@ -1983,8 +1989,56 @@ mod tests {
         )
         .status;
         (status.x..status.right())
-            .map(|x| buffer[(x, status.y)].symbol())
+            .map(|x| buffer[(x, status.y + row)].symbol())
             .collect()
+    }
+
+    #[test]
+    fn the_mode_title_keeps_its_room_in_debug_mode() {
+        for (width, height) in [(60, 20), (80, 24), (120, 40)] {
+            for jev in [false, true] {
+                for key in ['1', '2', '3', '5'] {
+                    let engine = || {
+                        if jev {
+                            FakeEngine::jev()
+                        } else {
+                            FakeEngine::local()
+                        }
+                    };
+                    let mut plain = Harness::sized(engine(), width, height);
+                    plain.char(key);
+                    let mut h = Harness::build(engine(), (width, height), Vec::new(), |app| {
+                        app.with_debug(DebugLog::open(Err(NO_LOG_PATH.to_string())))
+                    });
+                    h.char(key);
+                    let case = format!("{width}x{height} jev={jev} {key}");
+                    let top = status_title(&h);
+                    let first = status_row(&h, 1);
+                    // The same mode title as without debug mode, which always has one.
+                    let title = h
+                        .app
+                        .mode_labels()
+                        .into_iter()
+                        .find(|label| status_title(&plain).contains(&format!(" {label} ┐")))
+                        .unwrap_or_else(|| panic!("{case}: no mode title"));
+                    assert!(top.contains(&format!(" {title} ┐")), "{case}: {top}");
+                    // DEBUG beside it when both fit, else at the start of the first line.
+                    let on_top = top.contains("┌ Status ─ DEBUG ─");
+                    let in_text = first.starts_with("│ DEBUG White to move");
+                    assert!(on_top != in_text, "{case}: {top} / {first}");
+                    if width >= 120 && jev {
+                        assert!(on_top, "{case}: {top}");
+                    }
+                }
+            }
+        }
+        // At the smallest size no mode leaves room for both.
+        let mut h = Harness::build(FakeEngine::jev(), (60, 20), Vec::new(), |app| {
+            app.with_debug(DebugLog::open(Err(NO_LOG_PATH.to_string())))
+        });
+        h.char('5');
+        assert!(status_title(&h).contains(" Jev vs Jev ┐"));
+        insta::assert_snapshot!("jev_vs_jev_debug_60x20", h.terminal.backend());
     }
 
     #[test]
@@ -2669,7 +2723,7 @@ mod tests {
     /// answer to 1. e4 came after an undo (stale), then its answer to 1. e4 played again.
     fn two_exchanges(width: u16, height: u16) -> Harness {
         let mut h = Harness::build(FakeEngine::jev(), (width, height), Vec::new(), |app| {
-            app.with_debug(DebugLog::open(None))
+            app.with_debug(DebugLog::open(Err(NO_LOG_PATH.to_string())))
         });
         h.char('2');
         h.moves(&["e4"]);

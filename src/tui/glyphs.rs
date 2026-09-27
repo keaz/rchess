@@ -398,11 +398,13 @@ pub fn initial_glyphs(
         }
     });
 
-    // `Off` with `image` named first means one of the two switches is on.
+    // Name the switch that turned images off, if one did.
     let off_because = if no_color(&get) {
-        "NO_COLOR is set"
+        " (NO_COLOR is set)"
+    } else if images_off(&get) {
+        " (RCHESS_IMAGES=off)"
     } else {
-        "RCHESS_IMAGES=off"
+        ""
     };
     let warnings = refused
         .into_iter()
@@ -413,7 +415,7 @@ pub fn initial_glyphs(
                 shorten(&value)
             ),
             Refused::ImagesOff => {
-                format!("{source}: images are off ({off_because}); using {set}")
+                format!("{source}: images are off{off_because}; using {set}")
             }
         })
         .collect();
@@ -474,11 +476,10 @@ pub fn shorten(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use ratatui::{buffer::Buffer, layout::Rect, style::Style, text::Span};
 
     use super::*;
+    use crate::tui::test_support::env;
 
     fn all_pieces() -> impl Iterator<Item = Piece> {
         Side::ALL
@@ -488,14 +489,6 @@ mod tests {
 
     /// No graphics query ran: the text styles only.
     const OFF: ImageSupport = ImageSupport::Off;
-
-    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
-        let map: HashMap<String, String> = pairs
-            .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-            .collect();
-        move |key| map.get(key).cloned()
-    }
 
     /// Asserts `s` is one cell wide by ratatui's measure and in a real buffer.
     fn assert_one_cell(s: &str) {
@@ -957,6 +950,14 @@ mod tests {
         assert_eq!(
             warnings,
             ["--glyphs: images are off (RCHESS_IMAGES=off); using ascii"]
+        );
+        // Off for another reason (no terminal was asked): no switch is blamed.
+        assert_eq!(
+            initial_glyphs(Some("image"), env(&[]), OFF),
+            (
+                GlyphSet::Solid,
+                vec!["--glyphs: images are off; using solid".to_string()]
+            )
         );
     }
 

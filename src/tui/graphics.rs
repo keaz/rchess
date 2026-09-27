@@ -1,5 +1,8 @@
 //! Graphics detection (spec 9.3): which image protocol the terminal speaks and how
-//! large its font is, found out once at start-up.
+//! large its font is, found out once at start-up. After that only the font size can
+//! change (a font zoom), and it matters only to Sixel and iTerm2 pictures, which are
+//! encoded at a pixel size: after a resize the run loop asks the terminal for it again
+//! ([`FontMeter::measure`]), the same way.
 //!
 //! [`detect`] writes ratatui-image's capability query ([`Parser::query`]) and reads the
 //! answers itself, on the UI thread: it polls stdin with a deadline of
@@ -42,6 +45,10 @@ const POLL_SLICE: Duration = Duration::from_millis(50);
 /// How long after a query that gave up waiting its answer may still arrive and is
 /// kept out of the input ([`LateAnswers`]).
 const LATE_ANSWER_WINDOW: Duration = Duration::from_secs(10);
+
+/// The largest font size believed, in pixels per side of a cell. A bigger one is a
+/// bogus answer, and would make every picture huge.
+const MAX_CELL_PX: u16 = 256;
 
 /// The most key presses a late kitty answer is taken to have after its Alt+`_`;
 /// Kitty's answer has 8 (`Gi=31;OK`), an error answer a few dozen.
@@ -197,7 +204,8 @@ fn ask(query: &str, stop: impl Fn() -> bool) -> Result<Vec<Response>, QueryError
 
 /// Whether this platform's [`read_stdin_byte`] can actually read stdin. Only the unix
 /// implementation polls and reads; the `#[cfg(not(unix))]` stub always errors without
-/// reading anything, so [`ask`] must not write the query there either.
+/// reading anything, so [`ask`] and [`FontMeter::measure`] must not write their query
+/// there either.
 #[cfg(unix)]
 const ANSWERS_READABLE: bool = true;
 #[cfg(not(unix))]
@@ -228,6 +236,130 @@ fn ask_with(
     read_answers(read_byte, QUERY_TIMEOUT, stop)
 }
 
+/// Asks the terminal for its font size again after resizes ([`FontMeter::measure`]),
+/// and remembers what the measurements that gave up waiting still owe.
+///
+/// A terminal answers in order. On a slow link the answers of a measurement that gave
+/// up may still be on their way when the next one is asked, so that one reads them
+/// first: it skips one status report (and the cell size before it) for each
+/// measurement that gave up in the last 10 s, and takes the answer after them, its own.
+/// When they do not come (crossterm read them in between), it takes the last answer it
+/// read once the deadline has passed.
+#[derive(Clone, Debug, Default)]
+pub struct FontMeter {
+    /// How many measurements gave up since the last one that got an answer: the
+    /// status reports the terminal may still send ahead of the next one's.
+    owed: usize,
+    /// Until when those may still come (10 s after the last one gave up); later they
+    /// are taken to be read by crossterm or lost.
+    until: Option<Instant>,
+}
+
+impl FontMeter {
+    /// Asks the terminal for its font size again, after a resize: a font zoom changes
+    /// the cells, not the window, and Sixel and iTerm2 pictures are encoded at the
+    /// pixel size of the cells they fill. Call it on the UI thread between batches of
+    /// events.
+    ///
+    /// It writes the cell-size query, the status request and the device attributes
+    /// request (`ESC [ 16 t`, `ESC [ 5 n`, `ESC [ c`, wrapped for tmux like the
+    /// start-up query) and reads the answers as [`detect`] does, up to its own status
+    /// report (see [`FontMeter`]), taking at most [`QUERY_TIMEOUT`], less once `stop`
+    /// returns true. The size is the cell-size answer, else the window's pixels per
+    /// cell, else `None`: keep the current one ([`measured_font`]).
+    ///
+    /// The answers need no [`LateAnswers`]: all three are CSI sequences that crossterm
+    /// cannot take for a key. It drops the cell size and status reports (ending in `t`
+    /// and `n`) and keeps the device attributes to itself. But crossterm's reader
+    /// reads stdin until its bytes make an event, so dropped answers alone would leave
+    /// it blocked until the next key, click or paste, and the screen would not be
+    /// redrawn until then. The device attributes answer comes after them and makes
+    /// that event, so whatever answers reach crossterm (this measurement's own device
+    /// attributes, or late answers), they end with one. Bytes that arrive while the
+    /// measurement reads (keys typed in those milliseconds) are fed to the answer
+    /// parser and lost.
+    pub fn measure(&mut self, is_tmux: bool, stop: impl Fn() -> bool) -> Option<CellSize> {
+        let answers = if ANSWERS_READABLE {
+            match write_stdout(font_query_text(is_tmux).as_bytes()) {
+                Ok(()) => self.read(read_stdin_byte, QUERY_TIMEOUT, stop),
+                Err(error) => Err(error.into()),
+            }
+        } else {
+            Err(QueryError::Io(io::ErrorKind::Unsupported.into()))
+        };
+        measured_font(answers, window_cell_size())
+    }
+
+    /// Reads the answers to a measurement with [`read_answers_after`], skipping those
+    /// still owed, and keeps count.
+    fn read(
+        &mut self,
+        read_byte: impl FnMut(Duration) -> io::Result<Option<u8>>,
+        timeout: Duration,
+        stop: impl Fn() -> bool,
+    ) -> Result<Vec<Response>, QueryError> {
+        let owed = self.owed_at(Instant::now());
+        let answers = read_answers_after(read_byte, timeout, stop, owed);
+        self.settle(owed, &answers, Instant::now());
+        answers
+    }
+
+    /// The status reports still owed at `now`.
+    fn owed_at(&self, now: Instant) -> usize {
+        match self.until {
+            Some(until) if now <= until => self.owed,
+            _ => 0,
+        }
+    }
+
+    /// Counts a measurement that was owed `owed` status reports and read `answers`,
+    /// at `now`: one that got an answer settles every debt, one that gave up adds its
+    /// own.
+    fn settle(&mut self, owed: usize, answers: &Result<Vec<Response>, QueryError>, now: Instant) {
+        if answers.is_ok() {
+            self.owed = 0;
+            self.until = None;
+        } else {
+            self.owed = owed + 1;
+            self.until = Some(now + LATE_ANSWER_WINDOW);
+        }
+    }
+}
+
+/// The query [`FontMeter::measure`] writes: the cell-size query, the status request
+/// and the device attributes request, wrapped for tmux like the start-up query.
+fn font_query_text(is_tmux: bool) -> String {
+    let (start, escape, end) = Parser::tmux_start_escape_end(is_tmux);
+    format!("{start}{escape}[16t{escape}[5n{escape}[c{end}")
+}
+
+/// The font size the answers to [`FontMeter::measure`]'s query give: the cell-size answer
+/// when it is plausible ([`cell_size_answer`]), else `window` (the window's pixel
+/// size per cell); `None` when neither says, or the query failed and the window
+/// does not say either, so the current size stays.
+fn measured_font(
+    answers: Result<Vec<Response>, QueryError>,
+    window: Option<CellSize>,
+) -> Option<CellSize> {
+    answers
+        .ok()
+        .and_then(|responses| cell_size_answer(&responses))
+        .or(window)
+}
+
+/// The font size in the last cell-size answer among `responses`, when it is
+/// plausible ([`font_size`]).
+fn cell_size_answer(responses: &[Response]) -> Option<CellSize> {
+    responses
+        .iter()
+        .rev()
+        .find_map(|response| match response {
+            Response::CellSize(Some((width, height))) => Some(font_size(*width, *height)),
+            _ => None,
+        })
+        .flatten()
+}
+
 /// Feeds the bytes from `read_byte` to the answer parser until the status report
 /// arrives, and returns the answers before it. Nothing after the status report is
 /// read, so keys typed later stay for the event loop.
@@ -236,20 +368,36 @@ fn ask_with(
 /// `wait`; it is never asked to wait past the deadline `timeout` from now, nor
 /// longer than 50 ms at a time. `stop` is checked before every read.
 fn read_answers(
+    read_byte: impl FnMut(Duration) -> io::Result<Option<u8>>,
+    timeout: Duration,
+    stop: impl Fn() -> bool,
+) -> Result<Vec<Response>, QueryError> {
+    read_answers_after(read_byte, timeout, stop, 0)
+}
+
+/// [`read_answers`] after skipping `owed` status reports and the answers before each:
+/// it returns the answers before the status report numbered `owed + 1`. When the
+/// deadline passes after at least one status report, the answers before the last one
+/// read are the result (the owed ones did not come; that one was the query's own).
+fn read_answers_after(
     mut read_byte: impl FnMut(Duration) -> io::Result<Option<u8>>,
     timeout: Duration,
     stop: impl Fn() -> bool,
+    owed: usize,
 ) -> Result<Vec<Response>, QueryError> {
     let deadline = Instant::now() + timeout;
     let mut parser = Parser::new();
     let mut responses = Vec::new();
+    // The answers before the last status report skipped, and how many were.
+    let mut last = None;
+    let mut skipped = 0;
     loop {
         if stop() {
             return Err(QueryError::Interrupted);
         }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            return Err(QueryError::Timeout);
+            return last.ok_or(QueryError::Timeout);
         }
         let Some(byte) = read_byte(left.min(POLL_SLICE))? else {
             continue;
@@ -257,7 +405,11 @@ fn read_answers(
         // The answers are ASCII; ratatui-image feeds its parser the same way.
         for response in parser.push(char::from(byte)) {
             match response {
-                Response::Status => return Ok(responses),
+                Response::Status if skipped == owed => return Ok(responses),
+                Response::Status => {
+                    skipped += 1;
+                    last = Some(std::mem::take(&mut responses));
+                }
                 other => responses.push(other),
             }
         }
@@ -267,7 +419,8 @@ fn read_answers(
 /// Maps the answers to a protocol and font size as ratatui-image does
 /// (`Picker::from_query_stdio`): the protocol the answers name (Kitty over Sixel),
 /// else one the environment names ([`protocol_from_env`]), else half-blocks; the font
-/// size from the cell-size answer, else `window` (the window's pixel size per cell).
+/// size from the cell-size answer when it is plausible ([`font_size`]), else `window`
+/// (the window's pixel size per cell).
 /// Without any font size the protocol is half-blocks at 10×20, since the other
 /// protocols draw at the pixel size they are given. A failed query is half-blocks
 /// with a warning.
@@ -289,19 +442,16 @@ fn interpret(
         }
     };
     let mut answered = None;
-    let mut cell_size = None;
-    for response in responses {
+    for response in &responses {
         match response {
             Response::Kitty => answered = Some(ProtocolType::Kitty),
             Response::Sixel => {
                 answered.get_or_insert(ProtocolType::Sixel);
             }
-            Response::CellSize(Some((width, height))) => {
-                cell_size = Some(CellSize::new(width, height));
-            }
             _ => {}
         }
     }
+    let cell_size = cell_size_answer(&responses);
     let (protocol, cell_size) = match cell_size.or(window) {
         Some(cell_size) => {
             let protocol = answered
@@ -324,7 +474,9 @@ fn interpret(
 /// turns the kitty answer `ESC _ G i=31;OK ESC \` into the key presses Alt+`_`, `G`,
 /// `i`, `=`, `3`, `1`, `;`, `O`, `K`, Alt+`\`; on the menu the `3` would start a
 /// game. The other answers never become key presses: crossterm keeps the device
-/// attributes to itself and drops the cell size and status reports.
+/// attributes to itself and drops the cell size and status reports (CSI sequences
+/// ending in `t` and `n`, which it cannot parse), so a font measurement that gave up
+/// waiting needs none of this (see [`FontMeter::measure`] for what it does instead).
 ///
 /// After a query that gave up waiting ([`Graphics::answers_pending`]) and for the
 /// next 10 s, it drops one such run of key presses: an Alt+`_`, then printable
@@ -433,14 +585,23 @@ fn protocol_from_env(is_tmux: bool, get: impl Fn(&str) -> Option<String>) -> Opt
 }
 
 /// The font size from the terminal's pixel and cell counts, as ratatui-image
-/// computes it (rounded down); `None` when the terminal reports no pixel size.
+/// computes it (rounded down); `None` when the terminal reports no pixel size, or
+/// one that gives no plausible font ([`font_size`]).
 fn cell_size_from_window(window: WindowSize) -> Option<CellSize> {
     let width = window.width.checked_div(window.columns)?;
     let height = window.height.checked_div(window.rows)?;
-    (width > 0 && height > 0).then(|| CellSize::new(width, height))
+    font_size(width, height)
 }
 
-/// [`cell_size_from_window`] for this terminal.
+/// A font `width` × `height` pixels, or `None` when that cannot be one: a side of
+/// zero or over [`MAX_CELL_PX`].
+fn font_size(width: u16, height: u16) -> Option<CellSize> {
+    let plausible = |side: u16| (1..=MAX_CELL_PX).contains(&side);
+    (plausible(width) && plausible(height)).then(|| CellSize::new(width, height))
+}
+
+/// The font size from this terminal's pixel and cell counts
+/// ([`cell_size_from_window`]); `None` when it reports no pixel size.
 fn window_cell_size() -> Option<CellSize> {
     window_size().ok().and_then(cell_size_from_window)
 }
@@ -484,7 +645,7 @@ fn read_stdin_byte(_wait: Duration) -> io::Result<Option<u8>> {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
-    use std::collections::{HashMap, VecDeque};
+    use std::collections::VecDeque;
     use std::io;
     use std::time::{Duration, Instant};
 
@@ -496,7 +657,7 @@ mod tests {
     use super::*;
     use crate::tui::board::CellSize;
     use crate::tui::glyphs::ImageSupport;
-    use crate::tui::test_support::{chord_event, key_event, late_kitty_answer};
+    use crate::tui::test_support::{chord_event, env, key_event, late_kitty_answer};
 
     /// Kitty 0.39: the graphics probe is accepted, no sixel, 9×18 cells.
     const KITTY: &[u8] = b"\x1b_Gi=31;OK\x1b\\\x1b[?62;c\x1b[6;18;9t\x1b[0n";
@@ -511,17 +672,12 @@ mod tests {
     /// Both kitty graphics and sixel: Kitty wins, as in ratatui-image.
     const KITTY_AND_SIXEL: &[u8] = b"\x1b[?62;4c\x1b_Gi=31;OK\x1b\\\x1b[6;20;10t\x1b[0n";
 
-    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
-        let map: HashMap<String, String> = pairs
-            .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-            .collect();
-        move |key| map.get(key).cloned()
-    }
+    /// What the query reader returns.
+    type Answers = Result<Vec<Response>, QueryError>;
 
     /// The answers in `bytes` as the query reader collects them; bytes that end before
     /// the status report are a terminal that never finished answering.
-    fn answers(bytes: &[u8]) -> Result<Vec<Response>, QueryError> {
+    fn answers(bytes: &[u8]) -> Answers {
         let mut source = VecDeque::from(bytes.to_vec());
         read_answers(
             |_| Ok(source.pop_front()),
@@ -847,6 +1003,33 @@ mod tests {
     }
 
     #[test]
+    fn implausible_font_sizes_are_not_believed() {
+        // Over 256 pixels per cell is no font: every picture would be huge. Such a
+        // cell-size answer counts as missing, so the window's size is used, else 10×20.
+        let huge: &[u8] = b"\x1b_Gi=31;OK\x1b\\\x1b[6;4000;300t\x1b[0n";
+        assert_eq!(
+            interpret(answers(huge), false, env(&[]), Some(CellSize::new(9, 18))),
+            detection(ProtocolType::Kitty, (9, 18))
+        );
+        assert_eq!(
+            interpret(answers(huge), false, env(&[]), None),
+            detection(ProtocolType::Halfblocks, (10, 20))
+        );
+        let window = |columns, rows, width, height| WindowSize {
+            rows,
+            columns,
+            width,
+            height,
+        };
+        assert_eq!(
+            cell_size_from_window(window(80, 24, 80 * 256, 24 * 256)),
+            Some(CellSize::new(256, 256))
+        );
+        assert_eq!(cell_size_from_window(window(80, 24, 80 * 257, 480)), None);
+        assert_eq!(cell_size_from_window(window(1, 1, 800, 65535)), None);
+    }
+
+    #[test]
     fn no_answer_falls_back_to_half_blocks_with_a_warning() {
         let silent = interpret(
             Err(QueryError::Timeout),
@@ -904,6 +1087,220 @@ mod tests {
             None,
             "under a pixel"
         );
+    }
+
+    // ----- measuring the font again -----
+
+    /// A font measurement's answers: a `width` × `height` cell, the status report and
+    /// a Sixel terminal's device attributes.
+    fn font_answer(width: u16, height: u16) -> Vec<u8> {
+        format!("\x1b[6;{height};{width}t\x1b[0n\x1b[?62;4c").into_bytes()
+    }
+
+    /// What a measurement reads from `bytes` when `owed` status reports are owed,
+    /// and the bytes it leaves unread.
+    fn owed_answers(bytes: &[u8], owed: usize) -> (Answers, Vec<u8>) {
+        let mut source = VecDeque::from(bytes.to_vec());
+        let answers = read_answers_after(
+            |_| Ok(source.pop_front()),
+            Duration::from_millis(50),
+            || false,
+            owed,
+        );
+        (answers, source.into())
+    }
+
+    #[test]
+    fn the_font_query_asks_for_the_cell_size_the_status_and_the_device_attributes() {
+        assert_eq!(font_query_text(false), "\x1b[16t\x1b[5n\x1b[c");
+        assert_eq!(
+            font_query_text(true),
+            "\x1bPtmux;\x1b\x1b[16t\x1b\x1b[5n\x1b\x1b[c\x1b\\"
+        );
+    }
+
+    #[test]
+    fn a_measurement_leaves_only_the_device_attributes_to_crossterm() {
+        // crossterm drops the cell size and status reports without making an event, and
+        // its reader then waits in `read` for more input: the device attributes after
+        // them make the event that ends that wait.
+        let (answers, left) = owed_answers(&font_answer(8, 16), 0);
+        assert_eq!(
+            answers.expect("complete"),
+            [Response::CellSize(Some((8, 16)))]
+        );
+        assert_eq!(left, b"\x1b[?62;4c");
+    }
+
+    #[test]
+    fn a_measurement_skips_the_answers_owed_by_one_that_gave_up() {
+        // The late answers of a measurement that gave up (8×16) come first, then this
+        // one's own (11×22).
+        let bytes = [font_answer(8, 16), font_answer(11, 22)].concat();
+        let (answers, left) = owed_answers(&bytes, 1);
+        assert_eq!(
+            measured_font(answers, None),
+            Some(CellSize::new(11, 22)),
+            "its own answer, not the late one"
+        );
+        assert_eq!(
+            left, b"\x1b[?62;4c",
+            "only its own device attributes are left"
+        );
+        // Two owed, and keys typed in between do not count as answers.
+        let bytes = [
+            font_answer(8, 16),
+            b"q".to_vec(),
+            font_answer(9, 18),
+            font_answer(11, 22),
+        ]
+        .concat();
+        let (answers, _) = owed_answers(&bytes, 2);
+        assert_eq!(measured_font(answers, None), Some(CellSize::new(11, 22)));
+    }
+
+    #[test]
+    fn owed_answers_that_never_come_leave_the_last_answer_after_the_deadline() {
+        // crossterm read the late answers before this measurement: its own answer is the
+        // only one, taken once the deadline has passed.
+        let (answers, left) = owed_answers(&font_answer(11, 22), 1);
+        assert_eq!(measured_font(answers, None), Some(CellSize::new(11, 22)));
+        assert_eq!(left, b"", "the device attributes were read while waiting");
+        // Nothing at all is a timeout, whatever is owed.
+        for owed in [0, 1, 3] {
+            let (answers, _) = owed_answers(b"", owed);
+            assert!(
+                matches!(answers, Err(QueryError::Timeout)),
+                "{owed}: {answers:?}"
+            );
+        }
+        // An answer cut off before its status report is none.
+        let (answers, _) = owed_answers(b"\x1b[6;22;11t", 1);
+        assert!(matches!(answers, Err(QueryError::Timeout)), "{answers:?}");
+    }
+
+    #[test]
+    fn a_measurement_that_gave_up_is_owed_by_the_next_for_a_while() {
+        let now = Instant::now();
+        let mut meter = FontMeter::default();
+        assert_eq!(meter.owed_at(now), 0);
+        meter.settle(0, &Err(QueryError::Timeout), now);
+        assert_eq!(meter.owed_at(now), 1);
+        meter.settle(1, &Err(QueryError::Timeout), now);
+        assert_eq!(
+            meter.owed_at(now),
+            2,
+            "each one that gave up owes its answers"
+        );
+        assert_eq!(
+            meter.owed_at(now + LATE_ANSWER_WINDOW + Duration::from_millis(1)),
+            0,
+            "answers that late are taken to be read by crossterm or lost"
+        );
+        meter.settle(2, &Ok(vec![Response::CellSize(Some((8, 16)))]), now);
+        assert_eq!(
+            meter.owed_at(now),
+            0,
+            "a measurement that got an answer owes nothing"
+        );
+        meter.settle(0, &Err(QueryError::Interrupted), now);
+        assert_eq!(meter.owed_at(now), 1);
+    }
+
+    #[test]
+    fn a_resize_after_a_measurement_that_gave_up_gets_its_own_answer() {
+        // The pty experiment: a measurement gives up; the next one is asked before the
+        // late answers arrive, then gets them and its own.
+        let mut meter = FontMeter::default();
+        let mut measure = |bytes: &[u8]| {
+            let mut source = VecDeque::from(bytes.to_vec());
+            let answers = meter.read(
+                |_| Ok(source.pop_front()),
+                Duration::from_millis(50),
+                || false,
+            );
+            (measured_font(answers, None), Vec::from(source))
+        };
+        assert_eq!(measure(b""), (None, vec![]), "the first gives up");
+        let bytes = [font_answer(8, 16), font_answer(11, 22)].concat();
+        assert_eq!(
+            measure(&bytes),
+            (Some(CellSize::new(11, 22)), b"\x1b[?62;4c".to_vec())
+        );
+        // Nothing is owed any more: the next takes the first answer.
+        assert_eq!(
+            measure(&font_answer(9, 18)),
+            (Some(CellSize::new(9, 18)), b"\x1b[?62;4c".to_vec())
+        );
+    }
+
+    #[test]
+    fn a_measurement_takes_the_cell_size_answer() {
+        const ZOOMED: &[u8] = b"\x1b[6;16;8t\x1b[0n";
+        assert_eq!(
+            measured_font(answers(ZOOMED), Some(CellSize::DEFAULT)),
+            Some(CellSize::new(8, 16)),
+            "the answer wins over the window's pixels per cell"
+        );
+        assert_eq!(
+            measured_font(answers(ZOOMED), None),
+            Some(CellSize::new(8, 16))
+        );
+        // Recorded answers from real terminals carry it the same way.
+        assert_eq!(
+            measured_font(answers(WEZTERM), None),
+            Some(CellSize::new(8, 16))
+        );
+        assert_eq!(
+            measured_font(answers(GHOSTTY), None),
+            Some(CellSize::new(17, 38))
+        );
+        assert_eq!(measured_font(answers(SIXEL), None), Some(CellSize::DEFAULT));
+    }
+
+    #[test]
+    fn a_measurement_without_an_answer_uses_the_window_else_keeps_the_font() {
+        let window = Some(CellSize::new(8, 16));
+        // A terminal that never answers, one that answers only the status request, and
+        // a query that failed or was interrupted.
+        let cases: [fn() -> Answers; 5] = [
+            || answers(b""),
+            || answers(PLAIN),
+            || answers(b"\x1b[0n"),
+            || Err(QueryError::Interrupted),
+            || Err(QueryError::Io(io::Error::other("input/output error"))),
+        ];
+        for failed in cases {
+            assert_eq!(measured_font(failed(), window), window);
+            assert_eq!(measured_font(failed(), None), None, "the font stays");
+        }
+    }
+
+    #[test]
+    fn garbage_around_a_measurement_is_not_a_font_size() {
+        let window = Some(CellSize::new(8, 16));
+        // Keys typed while the query waits do not hide the answer after them.
+        assert_eq!(
+            measured_font(answers(b"qe4\x1b[A\x1b[6;20;10t\x1b[0n"), window),
+            Some(CellSize::DEFAULT)
+        );
+        // A mangled or implausible answer counts as none.
+        for garbage in [
+            &b"\x1b[6;x;yt\x1b[0n"[..],
+            b"\x1b[6;4000;300t\x1b[0n",
+            b"\x1b[6;0;0t\x1b[0n",
+            b"\x1b[6t\x1b[0n",
+            b"\x01\x7f\xff\x1b\x1b[0n",
+        ] {
+            assert_eq!(
+                measured_font(answers(garbage), window),
+                window,
+                "{garbage:?}"
+            );
+            assert_eq!(measured_font(answers(garbage), None), None, "{garbage:?}");
+        }
+        // Without the status report the answers never end: a timeout.
+        assert_eq!(measured_font(answers(b"zz\x1b[6;16;8t"), None), None);
     }
 
     // ----- the picker -----

@@ -62,6 +62,10 @@ fn source(piece: Piece) -> &'static RgbaImage {
 /// anti-aliased edges are scaled against the colour they are shown on, and nothing
 /// depends on how a terminal treats transparency. A zero width or height gives an
 /// empty image.
+///
+/// The image is allocated in full (4 bytes a pixel), so the caller keeps the size
+/// to what a board square needs; the board builds nothing over 4096 pixels on a
+/// side, and a size whose byte count overflows `usize` panics.
 #[must_use]
 pub fn composite(piece: Piece, background: [u8; 3], width_px: u32, height_px: u32) -> RgbaImage {
     let [r, g, b] = background;
@@ -266,6 +270,27 @@ mod tests {
     }
 
     #[test]
+    fn every_piece_is_embedded_from_its_own_file() {
+        // The file name comes from the piece itself: `w` or `b`, then the kind's letter.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/pieces");
+        for piece in all_pieces() {
+            let side = match piece.color {
+                Side::White => 'w',
+                Side::Black => 'b',
+            };
+            let name = format!("{side}{}.png", piece.kind.to_char().to_ascii_uppercase());
+            let bytes = std::fs::read(dir.join(&name)).expect("the asset file");
+            let image = image::load_from_memory_with_format(&bytes, ImageFormat::Png)
+                .expect("a PNG")
+                .into_rgba8();
+            assert!(
+                image == *source(piece),
+                "{piece:?} is not drawn from {name}"
+            );
+        }
+    }
+
+    #[test]
     fn every_piece_has_its_own_image() {
         let pieces: Vec<Piece> = all_pieces().collect();
         for (i, a) in pieces.iter().enumerate() {
@@ -298,7 +323,17 @@ mod tests {
     fn composite_is_opaque_with_the_background_in_the_corners() {
         for piece in all_pieces() {
             for background in [LIGHT, DARK, SELECTED] {
-                for (width, height) in [(48, 48), (50, 60), (60, 20), (20, 60), (160, 160)] {
+                // (24, 32) and (30, 40) are the smallest image areas the board draws:
+                // 3×2 cells at 8×16 and at 10×20.
+                for (width, height) in [
+                    (24, 32),
+                    (30, 40),
+                    (48, 48),
+                    (50, 60),
+                    (60, 20),
+                    (20, 60),
+                    (160, 160),
+                ] {
                     let image = composite(piece, background, width, height);
                     assert!(
                         image.pixels().all(|p| p[3] == 255),

@@ -23,16 +23,29 @@ nothing touches the network), drives it with keystrokes or signals, and checks:
 * the graphics query (spec 9.3), on a pty that
   - never answers: the query is written once, in raw mode, between ?1049h and
     ?1000h; start-up goes on after about 1 s with a menu warning, keys typed
-    afterwards work, half-block pictures are in the `g` cycle, and the terminal
-    is restored;
+    afterwards work, the Image style (half blocks) is in the `g` cycle, showing
+    solid glyphs on 80x24's small squares and pictures at 200x60, and the
+    terminal is restored;
   - answers late, while the menu is up: the answer does not act as key presses
     (its `3` would start a game);
   - gets SIGTERM or hangs up while the query waits: the process ends by that
     signal at once, SIGTERM with the terminal restored;
   - answers like Kitty: start-up goes on at once, the answer is not echoed,
     Image is the starting style and pieces are kitty pictures (unicode
-    placeholders);
-* exit writes ?1006l ?1002l ?1000l ?2004l and then ?1049l, then only shows the
+    placeholders), and a resize asks nothing (placeholders scale with the cells);
+  - answers like a Sixel terminal with a 10x20 font, then zooms out to 8x16
+    (more cells, and SIGWINCH): the resize asks for the cell size again (CSI 16 t,
+    the status request and the device attributes, nothing else), and with the
+    answer the pictures are re-encoded for 8x16 cells, so none spills out of its
+    square; the window reports no pixels, so only the answer can give the new
+    size; a resize whose query is not answered keeps 8x16 and the game goes on
+    after about 1 s, and its late answers, which end with the device attributes,
+    do not leave the UI waiting for a key (a resize right after them is handled
+    at once); a resize that comes after a query gave up but before its late
+    answers arrive takes its own answer (11x22), not the late one, and the UI
+    still reacts to the next resize without a key;
+* exit writes ?1006l ?1002l ?1000l ?2004l and then ?1049l (after kitty pictures,
+  Kitty's delete-all-images command comes first, and only then), then only shows the
   cursor again (?25h) and draws nothing on the main screen, exits with status 0,
   and leaves the pty's termios exactly as it was before the program started
   (ICANON and ECHO back on);
@@ -87,7 +100,25 @@ QUERY_PARTS = [QUERY_START, b"\x1b[c", b"\x1b[16t", QUERY_END]
 # What Kitty answers: graphics OK, device attributes without sixel, a 9x18 pixel
 # cell and the status report.
 KITTY_ANSWER = b"\x1b_Gi=31;OK\x1b\\\x1b[?62;c\x1b[6;18;9t\x1b[0n"
+# What a Sixel terminal answers: no kitty graphics, device attributes with sixel
+# (4), a 10x20 pixel cell and the status report.
+SIXEL_ANSWER = b"\x1b[?62;4c\x1b[6;20;10t\x1b[0n"
+# A Sixel picture's raster attributes: its width and height in pixels.
+SIXEL_RASTER = re.compile(rb'\x1bP[0-9;]*q"1;1;(\d+);(\d+)')
 QUERY_WARNING = "graphics query: no answer within 1 s"
+# What the app asks after a resize while its pictures are Sixel or iTerm2: the cell
+# size and the status report, which ends the answers the app reads, then the device
+# attributes, whose answer comes last and is left to crossterm.
+FONT_QUERY = b"\x1b[16t\x1b[5n"
+ATTRIBUTES_REQUEST = b"\x1b[c"
+FULL_FONT_QUERY = FONT_QUERY + ATTRIBUTES_REQUEST
+# A Sixel terminal's answer to the device attributes request.
+ATTRIBUTES_ANSWER = b"\x1b[?62;4c"
+# A Sixel terminal's answer to the font query after a zoom to an 8x16 pixel cell.
+ZOOMED_ANSWER = b"\x1b[6;16;8t\x1b[0n" + ATTRIBUTES_ANSWER
+# Kitty's command to delete every image and free its data, written at exit after
+# kitty pictures were drawn.
+KITTY_DELETE = b"\x1b_Ga=d,d=A\x1b\\"
 # Kitty's unicode placeholder: every cell of a kitty picture holds one.
 PLACEHOLDER = "\U0010EEEE"
 SECRET_VARS = ("JEV_API_KEY", "TYPESAFE_API_KEY")
@@ -327,13 +358,14 @@ class App:
                 return True
         return False
 
-    def wait_bytes(self, needle, timeout=5.0):
+    def wait_bytes(self, needle, timeout=5.0, start=0):
+        """Waits until `needle` is in the stream from offset `start` on."""
         end = time.monotonic() + timeout
         while time.monotonic() < end:
-            if needle in self.stream:
+            if needle in self.stream[start:]:
                 return True
             self.pump(0.02)
-        return needle in self.stream
+        return needle in self.stream[start:]
 
     def wait_exit(self, timeout=5.0):
         end = time.monotonic() + timeout
@@ -378,7 +410,8 @@ class App:
 
 def check_setup(app, query=False):
     """Checks the setup sequences; with `query`, that the graphics query is written
-    once, between ?1049h and ?1000h, and otherwise that none of it is written."""
+    once, after ?1049h and before the first mouse or paste sequence (?1000h to
+    ?2004h), and otherwise that none of it is written."""
     check(app.wait_bytes(SETUP[-1]), "setup sequences arrive")
     offsets = ordered(app.stream, SETUP)
     check(
@@ -394,18 +427,30 @@ def check_setup(app, query=False):
             f"offsets {offsets}",
         )
         check(app.stream.count(QUERY_START) == 1, "the query is written once")
+        query_end = app.stream.find(QUERY_END)
+        early = [seq for seq in SETUP[1:] if 0 <= app.stream.find(seq) < query_end]
+        check(not early, "no mouse or paste sequence before the query", f"found {early}")
     else:
         sent = [part for part in QUERY_PARTS if part in app.stream]
         check(not sent, "images off: no graphics query", f"found {sent}")
 
 
-def check_teardown(app, after, label):
+def check_teardown(app, after, label, kitty=False):
     offsets = ordered(app.stream, TEARDOWN, after)
     check(
         offsets is not None,
         f"{label}: teardown order ?1006l ?1002l ?1000l ?2004l then ?1049l",
         f"offsets {offsets}",
     )
+    if kitty:
+        deleted = ordered(app.stream, [KITTY_DELETE] + TEARDOWN, after)
+        check(
+            deleted is not None and app.stream.count(KITTY_DELETE) == 1,
+            f"{label}: the kitty pictures are deleted once, before ?1006l and ?1049l",
+            f"offsets {deleted}",
+        )
+    else:
+        check(KITTY_DELETE not in app.stream, f"{label}: no kitty delete command")
     if offsets is not None:
         tail = app.stream[offsets[-1] + len(TEARDOWN[-1]):]
         # The cursor comes back (it is hidden while the UI runs) and nothing else follows.
@@ -775,8 +820,24 @@ def scenario_query_unanswered(binary):
         app.send(b"gg")
         check(app.wait_screen("glyphs: image"), "Image is still in the g cycle")
         text = app.screen().text()
-        check("▀" in text or "▄" in text, "pieces are drawn with half-blocks")
-        app.screen().show("half-block pictures")
+        # 80x24 gives 5x2 squares, too small for half-block pictures (11x5 at least).
+        check(
+            "♜" in text and "▀" not in text and "▄" not in text,
+            "at 80x24 the squares are too small for half-block pictures: solid glyphs",
+        )
+        app.screen().show("image style on small squares")
+        resized_at = len(app.stream)
+        set_window(app, 60, 200, 0, 0)
+        end = time.monotonic() + 5
+        while "▀".encode() not in app.stream[resized_at:] and time.monotonic() < end:
+            app.pump(0.05)
+        drawn = app.stream[resized_at:]
+        check(
+            "▀".encode() in drawn or "▄".encode() in drawn,
+            "at 200x60 the pieces are drawn with half-blocks",
+        )
+        set_window(app, ROWS, COLS, 0, 0)
+        app.idle(0.3)
         app.send(b"q")
         check(app.wait_screen("Quit the game in progress?"), "q asks for confirmation")
         quit_at = len(app.stream)
@@ -891,6 +952,17 @@ def scenario_query_kitty(binary):
         check(board.count(PLACEHOLDER) > 0, "the board shows the pictures' placeholder cells")
         check("♜" not in board, "no solid glyphs while the pictures are shown")
         app.screen().show("kitty pictures (placeholders show as their character)")
+        resized_at = len(app.stream)
+        set_window(app, 30, 100, 800, 480)
+        end = time.monotonic() + 5
+        while b"a=T,U=1" not in app.stream[resized_at:] and time.monotonic() < end:
+            app.pump(0.05)
+        app.idle(0.3)
+        check(b"a=T,U=1" in app.stream[resized_at:], "a resize redraws the kitty pictures")
+        check(b"[16t" not in app.stream[resized_at:], "a resize asks nothing with kitty pictures")
+        set_window(app, ROWS, COLS, 0, 0)
+        app.idle(0.3)
+        check(b"[16t" not in app.stream[resized_at:], "nor does a second one")
         app.send(b"g")
         check(app.wait_screen("glyphs: solid"), "the style was Image (g goes on to Solid)")
         check("♜" in app.screen().text(), "then the pieces are solid glyphs")
@@ -900,7 +972,166 @@ def scenario_query_kitty(binary):
         app.send(b"y", settle=0)
         check(app.wait_exit(), "process exits after y")
         check(app.status == 0, "exit status 0", f"status {app.status}")
-        check_teardown(app, quit_at, "quit after kitty pictures")
+        check_teardown(app, quit_at, "quit after kitty pictures", kitty=True)
+    finally:
+        app.close()
+
+
+def set_window(app, rows, cols, width_px, height_px):
+    """Gives the pty a new size in cells and pixels and tells the child, as a
+    terminal window does when it is resized or its font zoomed."""
+    fcntl.ioctl(app.slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, width_px, height_px))
+    os.kill(app.pid, signal.SIGWINCH)
+
+
+def sixel_sizes(stream):
+    """The pixel size of every Sixel picture in `stream`, in order."""
+    return [(int(w), int(h)) for w, h in SIXEL_RASTER.findall(stream)]
+
+
+def wait_sixels(app, start, count, timeout=5.0):
+    """Waits for `count` Sixel pictures after `start` in the stream; their sizes."""
+    end = time.monotonic() + timeout
+    while len(sixel_sizes(app.stream[start:])) < count and time.monotonic() < end:
+        app.pump(0.05)
+    app.idle(0.3)
+    return sixel_sizes(app.stream[start:])
+
+
+def answer_font(app, asked_at, width, height, upto=None):
+    """Answers the font measurement written after `asked_at` (and before `upto`) as a
+    terminal does: a cell of `width` x `height` pixels and the status report, then the
+    device attributes if they were asked for too."""
+    asked = app.stream[asked_at:upto]
+    answer = b"\x1b[6;%d;%dt\x1b[0n" % (height, width)
+    if ATTRIBUTES_REQUEST in asked:
+        answer += ATTRIBUTES_ANSWER
+    os.write(app.master, answer)
+
+
+def scenario_query_sixel_zoom(binary):
+    print("scenario: Sixel pictures follow a font zoom (10x20 to 8x16), measured again")
+    app = App(binary, env=QUERY_ENV)
+    try:
+        fcntl.ioctl(app.slave, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 800, 480))
+        check(wait_for_query(app) is not None, "the graphics query is written")
+        os.write(app.master, SIXEL_ANSWER)
+        check(app.wait_screen("1. Human vs Human"), "menu renders")
+        check(QUERY_WARNING not in app.screen().text(), "no query warning")
+        app.send(b"1")
+        check(app.wait_screen("White to move"), "Human vs Human starts")
+        app.idle(0.3)
+        before = sixel_sizes(app.stream)
+        # 80x24 gives 5x2 squares, image areas of 3x2 cells: 30x40 pixels at 10x20.
+        check(len(before) == 32, "every piece is a Sixel picture", f"{len(before)} pictures")
+        check(set(before) == {(30, 40)}, "pictures fit 3x2 cells of 10x20", f"sizes {set(before)}")
+        zoomed_at = len(app.stream)
+        # The zoom: more cells, and a window that reports no pixels, so the size can
+        # come only from the answer.
+        set_window(app, 30, 100, 0, 0)
+        check(
+            app.wait_bytes(FONT_QUERY, start=zoomed_at), "the resize asks for the cell size again"
+        )
+        app.idle(0.1)
+        asked = app.stream[zoomed_at:]
+        check(
+            asked.count(b"[16t") == 1
+            and asked.count(FULL_FONT_QUERY) == 1
+            and asked.count(ATTRIBUTES_REQUEST) == 1
+            and b"Gi=31" not in asked,
+            "once, and only for the cell size, the status and the device attributes",
+        )
+        answered_at = len(app.stream)
+        answered = time.monotonic()
+        os.write(app.master, ZOOMED_ANSWER)
+        after = wait_sixels(app, answered_at, 32)
+        # 100x30 gives 7x3 squares, image areas of 5x3 cells: 40x48 pixels at 8x16. At the
+        # old font they would be 50x60, 1.25 columns and 0.75 rows too big.
+        check(len(after) == 32, "the zoom redraws every picture", f"{len(after)} pictures")
+        check(set(after) == {(40, 48)}, "pictures fit 5x3 cells of 8x16", f"sizes {set(after)}")
+        check(time.monotonic() - answered < 2.0, "right after the answer")
+        check("White to move" in app.screen().text(), "the game is still shown")
+        check_no_query_text(app, "board after the zoom")
+
+        # A resize the terminal does not answer keeps the font, after about 1 s. The wait is
+        # timed from the resize: the query is written after it, so the measurement cannot give
+        # up sooner, and noticing the query late cannot shorten the time measured.
+        resized_at = len(app.stream)
+        resized = time.monotonic()
+        set_window(app, ROWS, COLS, 0, 0)
+        check(
+            app.wait_bytes(FONT_QUERY, timeout=2.0, start=resized_at), "the next resize asks again"
+        )
+        kept = wait_sixels(app, resized_at, 32)
+        waited = time.monotonic() - resized
+        check(len(kept) == 32, "the pictures are redrawn", f"{len(kept)} pictures")
+        check(
+            kept and all(w % 8 == 0 and h % 16 == 0 for w, h in kept),
+            "still for 8x16 cells",
+            f"sizes {set(kept)}",
+        )
+        check(waited >= 0.9, "once the query gave up", f"{waited:.2f}s")
+        # Its answers come late, as a terminal sends them: in order, so the device
+        # attributes come last and make crossterm an event. Alone, the dropped cell size
+        # and status reports would leave crossterm's reader waiting for the next input.
+        os.write(app.master, ZOOMED_ANSWER)
+        app.idle(0.3)
+        late_at = len(app.stream)
+        set_window(app, 30, 100, 0, 0)
+        check(
+            app.wait_bytes(FONT_QUERY, timeout=1.0, start=late_at),
+            "the UI still reacts without a key after the late answers (a resize asks at once)",
+        )
+        answer_font(app, late_at, 8, 16)
+        # This measurement still counts the late answers as owed (crossterm read them), so
+        # it waits out the deadline for them before it takes its own.
+        check(len(wait_sixels(app, late_at, 32)) == 32, "and redraws the pictures")
+
+        # A slow link: a resize comes after a measurement gave up but before its answers
+        # arrive. The next measurement skips those and takes its own answer, and leaves
+        # nothing to crossterm that would make it wait for a key.
+        gave_up_at = len(app.stream)
+        set_window(app, ROWS, COLS, 0, 0)
+        check(
+            app.wait_bytes(FONT_QUERY, timeout=2.0, start=gave_up_at),
+            "a resize asks, and gets no answer in time",
+        )
+        wait_sixels(app, gave_up_at, 32)
+        second_at = len(app.stream)
+        set_window(app, 26, 90, 0, 0)
+        check(
+            app.wait_bytes(FONT_QUERY, timeout=2.0, start=second_at),
+            "a resize right after the one that gave up asks again",
+        )
+        # The late answers to the first measurement (still 8x16), then 0.2 s later the
+        # second one's own answer (a zoom to 11x22).
+        answer_font(app, gave_up_at, 8, 16, upto=second_at)
+        app.idle(0.2)
+        own_at = len(app.stream)
+        answer_font(app, second_at, 11, 22)
+        fresh = wait_sixels(app, own_at, 32)
+        check(
+            len(fresh) == 32 and all(w % 11 == 0 and h % 22 == 0 for w, h in fresh),
+            "the pictures follow the measurement's own answer (11x22), not the late one",
+            f"{len(fresh)} pictures, sizes {set(fresh)}",
+        )
+        after_at = len(app.stream)
+        set_window(app, ROWS, COLS, 0, 0)
+        check(
+            app.wait_bytes(FONT_QUERY, timeout=2.0, start=after_at),
+            "the UI reacts to a resize without a key after the late answers",
+        )
+        answer_font(app, after_at, 8, 16)
+        check(len(wait_sixels(app, after_at, 32)) == 32, "and redraws the pictures")
+        app.send(b"g")
+        check(app.wait_screen("glyphs: solid"), "keys work after the unanswered query")
+        app.send(b"q")
+        check(app.wait_screen("Quit the game in progress?"), "q asks for confirmation")
+        quit_at = len(app.stream)
+        app.send(b"y", settle=0)
+        check(app.wait_exit(), "process exits after y")
+        check(app.status == 0, "exit status 0", f"status {app.status}")
+        check_teardown(app, quit_at, "quit after the zoom")
     finally:
         app.close()
 
@@ -992,6 +1223,7 @@ def main():
     scenario_query_signal(binary)
     scenario_query_hangup(binary)
     scenario_query_kitty(binary)
+    scenario_query_sixel_zoom(binary)
     for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         scenario_signal(binary, signum)
     scenario_signal(binary, signal.SIGTERM, repeat=2)

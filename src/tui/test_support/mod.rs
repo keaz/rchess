@@ -17,6 +17,7 @@
 pub(crate) mod engine;
 pub(crate) mod harness;
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -116,6 +117,18 @@ pub(crate) fn buffer_text(buffer: &Buffer) -> String {
         text.push('\n');
     }
     text
+}
+
+// ----- environment -----
+
+/// An environment variable reader over `pairs` only, for the functions that take
+/// `get` in place of `std::env::var`.
+pub(crate) fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+    let map: HashMap<String, String> = pairs
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect();
+    move |key| map.get(key).cloned()
 }
 
 // ----- files -----

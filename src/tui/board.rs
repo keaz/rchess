@@ -16,8 +16,9 @@
 //! composited onto the square's colour
 //! ([`composite`](super::pieces::composite)) and drawn by the terminal's
 //! graphics protocol through a ratatui-image [`Picker`], in the square's
-//! [`image_area`]. Squares smaller than [`MIN_IMAGE_SQUARE`] show the Solid
-//! glyph instead. [`PieceImages`] keeps the encoded pictures between frames.
+//! [`image_area`]. Squares smaller than [`min_picture_square`] for the protocol
+//! ([`MIN_IMAGE_SQUARE`], or [`MIN_HALFBLOCK_SQUARE`] for half blocks) show the
+//! Solid glyph instead. [`PieceImages`] keeps the encoded pictures between frames.
 
 use std::fmt;
 
@@ -42,9 +43,24 @@ use crate::core::{Color as Side, Piece, PieceKind, Position as ChessPosition, Sq
 pub const MIN_SQUARE: (u16, u16) = (3, 1);
 
 /// The smallest square `(width, height)` in cells that shows a piece as a picture
-/// in the [`GlyphSet::Image`] style; smaller squares show the Solid glyph. Its
-/// [`image_area`] is 3×2 cells.
+/// in the [`GlyphSet::Image`] style with a pixel protocol (Kitty, iTerm2, Sixel);
+/// smaller squares show the Solid glyph. Its [`image_area`] is 3×2 cells.
 pub const MIN_IMAGE_SQUARE: (u16, u16) = (5, 2);
+
+/// The smallest square `(width, height)` in cells that shows a piece as a picture
+/// drawn in half blocks, which have two pixels per cell: below an [`image_area`] of
+/// 9×5 cells the pieces cannot be told apart, so smaller squares show the Solid
+/// glyph.
+pub const MIN_HALFBLOCK_SQUARE: (u16, u16) = (11, 5);
+
+/// The smallest square that shows a picture drawn with `protocol`:
+/// [`MIN_HALFBLOCK_SQUARE`] for half blocks, else [`MIN_IMAGE_SQUARE`].
+pub fn min_picture_square(protocol: ProtocolType) -> (u16, u16) {
+    match protocol {
+        ProtocolType::Halfblocks => MIN_HALFBLOCK_SQUARE,
+        ProtocolType::Sixel | ProtocolType::Kitty | ProtocolType::Iterm2 => MIN_IMAGE_SQUARE,
+    }
+}
 
 /// A terminal cell's size in pixels, which is the font size. It makes squares
 /// look square: see [`square_width`].
@@ -204,6 +220,11 @@ pub fn image_area(square: Rect) -> Option<Rect> {
         .then(|| Rect::new(square.x + 1, square.y, square.width - 2, square.height))
 }
 
+/// The largest picture built, in pixels per side. Real image areas are a few hundred
+/// pixels; a bigger one could only come from a bogus font size, and would cost
+/// seconds and hundreds of megabytes on the UI thread.
+const MAX_PICTURE_PX: u32 = 4096;
+
 /// Piece pictures kept between frames for the [`GlyphSet::Image`] style: the
 /// ratatui-image [`Protocol`] a picker made of each
 /// [`composite`](super::pieces::composite), one per [`ImageKey`], so a picture is
@@ -248,8 +269,15 @@ impl PieceImages {
         self.cache.is_empty()
     }
 
+    /// Drops every picture, as when the font changed.
+    pub fn clear(&mut self) {
+        self.cache.clear();
+        self.made_for = None;
+    }
+
     /// The picture of `piece` on `background` (RGB) for an image area of `cells`,
-    /// drawn by `picker`: made on first use, `None` when the picker cannot encode it.
+    /// drawn by `picker`: made on first use, `None` when the picker cannot encode it
+    /// or it would be over [`MAX_PICTURE_PX`] on a side.
     fn picture(
         &mut self,
         picker: &Picker,
@@ -275,6 +303,9 @@ impl PieceImages {
             u32::from(cells.width) * u32::from(font.width),
             u32::from(cells.height) * u32::from(font.height),
         );
+        if key.width_px > MAX_PICTURE_PX || key.height_px > MAX_PICTURE_PX {
+            return None;
+        }
         self.cache
             .get_or_insert_with(key, |key| {
                 let image = DynamicImage::ImageRgba8(key.composite());
@@ -457,7 +488,7 @@ impl BoardView<'_> {
 
     /// The picture of `piece` on the square at `rect`, whose background is `bg`, and
     /// the area it goes in. Only in the Image style with a picker, on a square of at
-    /// least [`MIN_IMAGE_SQUARE`] whose image area lies wholly inside `clip` and meets
+    /// least [`min_picture_square`] for its protocol whose image area lies wholly inside `clip` and meets
     /// none of the [`overlays`](Self::overlays), and on a background with a known RGB
     /// value ([`glyphs::xterm_rgb`]); `None` otherwise, and the square shows the glyph.
     fn picture<'i>(
@@ -472,6 +503,10 @@ impl BoardView<'_> {
             return None;
         }
         let picker = self.picker?;
+        let (min_width, min_height) = min_picture_square(picker.protocol_type());
+        if rect.width < min_width || rect.height < min_height {
+            return None;
+        }
         let area = image_area(rect).filter(|&area| {
             clip.intersection(area) == area
                 && !self.overlays.iter().any(|overlay| overlay.intersects(area))
@@ -1607,7 +1642,7 @@ mod tests {
     fn pictures_are_kept_and_reused_on_squares_of_the_same_colour() {
         let mut images = PieceImages::new();
         // White's king on dark e1, Black's on light e8, a white pawn on light a2.
-        let mut scene = Scene::new(57, 25, "4k3/8/8/8/8/8/P7/4K3 w - - 0 1");
+        let mut scene = Scene::new(89, 41, "4k3/8/8/8/8/8/P7/4K3 w - - 0 1");
         let picker = scene.picker.clone().expect("a picker");
         scene.draw(&mut images);
         assert_eq!(images.len(), 3);
@@ -1634,7 +1669,7 @@ mod tests {
 
     #[test]
     fn each_highlight_colour_gets_its_own_picture() {
-        let mut scene = Scene::new(57, 25, ROOK_CHECK);
+        let mut scene = Scene::new(89, 41, ROOK_CHECK);
         let picker = scene.picker.clone().expect("a picker");
         let pal = scene.palette;
         let mut images = PieceImages::new();
@@ -1696,17 +1731,73 @@ mod tests {
     }
 
     #[test]
+    fn half_blocks_need_bigger_squares_than_pixel_protocols() {
+        assert_eq!(MIN_IMAGE_SQUARE, (5, 2));
+        assert_eq!(MIN_HALFBLOCK_SQUARE, (11, 5));
+        assert_eq!(
+            image_area(Rect::new(0, 0, 11, 5)).map(|area| area.as_size()),
+            Some(Size::new(9, 5))
+        );
+        assert_eq!(
+            min_picture_square(ProtocolType::Halfblocks),
+            MIN_HALFBLOCK_SQUARE
+        );
+        for protocol in [
+            ProtocolType::Kitty,
+            ProtocolType::Iterm2,
+            ProtocolType::Sixel,
+        ] {
+            assert_eq!(
+                min_picture_square(protocol),
+                MIN_IMAGE_SQUARE,
+                "{protocol:?}"
+            );
+        }
+    }
+
+    #[test]
     fn squares_too_small_for_a_picture_show_the_solid_glyph() {
         let glyph = glyphs::glyph(GlyphSet::Solid, WHITE_KING);
-        // (terminal, font the squares are shaped for, square size)
+        // (terminal, font the squares are shaped for, square size, protocol)
         let cases = [
-            ((31, 11), CellSize::DEFAULT, (3, 1)),
-            ((41, 9), CellSize::new(5, 20), (5, 1)),
-            ((25, 17), CellSize::new(12, 12), (3, 2)),
+            ((31, 11), CellSize::DEFAULT, (3, 1), ProtocolType::Sixel),
+            ((41, 9), CellSize::new(5, 20), (5, 1), ProtocolType::Kitty),
+            (
+                (25, 17),
+                CellSize::new(12, 12),
+                (3, 2),
+                ProtocolType::Iterm2,
+            ),
+            // Half blocks: 7×3 and 9×4 squares, and one short of 11×5 either way.
+            (
+                (57, 25),
+                CellSize::DEFAULT,
+                (7, 3),
+                ProtocolType::Halfblocks,
+            ),
+            (
+                (73, 33),
+                CellSize::DEFAULT,
+                (9, 4),
+                ProtocolType::Halfblocks,
+            ),
+            (
+                (89, 33),
+                CellSize::new(8, 21),
+                (11, 4),
+                ProtocolType::Halfblocks,
+            ),
+            (
+                (73, 41),
+                CellSize::new(10, 17),
+                (9, 5),
+                ProtocolType::Halfblocks,
+            ),
         ];
-        for ((width, height), cell, size) in cases {
+        for ((width, height), cell, size, protocol) in cases {
             let mut scene = Scene::new(width, height, KINGS_AND_KNIGHT);
             scene.cell = cell;
+            scene.picker = Some(picker_for(protocol, cell));
             let mut images = PieceImages::new();
             let (terminal, g) = scene.draw(&mut images);
             assert_eq!((g.square_w, g.square_h), size);
@@ -1714,16 +1805,19 @@ mod tests {
             assert_eq!(
                 (e1.symbol(), e1.fg),
                 (glyph, scene.palette.white_piece),
-                "{size:?}"
+                "{size:?} {protocol:?}"
             );
-            assert!(images.is_empty(), "{size:?}: a picture was built");
+            assert!(
+                images.is_empty(),
+                "{size:?} {protocol:?}: a picture was built"
+            );
         }
 
-        // From 5×2 on, pictures.
-        let mut scene = Scene::new(41, 17, KINGS_AND_KNIGHT);
+        // Half blocks from 11×5 on, pictures.
+        let mut scene = Scene::new(89, 41, KINGS_AND_KNIGHT);
         let mut images = PieceImages::new();
         let (terminal, g) = scene.draw(&mut images);
-        assert_eq!((g.square_w, g.square_h), MIN_IMAGE_SQUARE);
+        assert_eq!((g.square_w, g.square_h), MIN_HALFBLOCK_SQUARE);
         assert_eq!(images.len(), 3);
         let e1 = glyph_cell(square_rect(&g, Square::E1));
         assert_ne!(terminal.backend().buffer()[e1].symbol(), glyph);
@@ -1734,17 +1828,42 @@ mod tests {
         let (terminal, _) = scene.draw(&mut images);
         assert_eq!(terminal.backend().buffer()[e1].symbol(), glyph);
         assert!(images.is_empty());
+
+        // The pixel protocols from 5×2 on.
+        let mut scene = Scene::new(41, 17, KINGS_AND_KNIGHT);
+        scene.picker = Some(picker_for(ProtocolType::Sixel, CellSize::DEFAULT));
+        let mut images = PieceImages::new();
+        let (terminal, g) = scene.draw(&mut images);
+        assert_eq!((g.square_w, g.square_h), MIN_IMAGE_SQUARE);
+        assert_eq!(images.len(), 3);
+        let e1 = glyph_cell(square_rect(&g, Square::E1));
+        assert_ne!(terminal.backend().buffer()[e1].symbol(), glyph);
+    }
+
+    #[test]
+    fn a_picture_too_large_to_build_is_drawn_as_the_glyph() {
+        // No real font gives an image area over 4096 pixels on a side; building one
+        // would take seconds and hundreds of megabytes on the UI thread.
+        let picker = halfblocks(CellSize::new(256, 256));
+        let mut images = PieceImages::new();
+        let too_wide = images.picture(&picker, WHITE_KING, [0, 0, 0], Size::new(17, 1));
+        assert!(too_wide.is_none(), "17 cells of 256 pixels");
+        let too_tall = images.picture(&picker, WHITE_KING, [0, 0, 0], Size::new(1, 17));
+        assert!(too_tall.is_none(), "17 rows of 256 pixels");
+        assert!(images.is_empty(), "nothing was built");
+        let widest = images.picture(&picker, WHITE_KING, [0, 0, 0], Size::new(16, 1));
+        assert!(widest.is_some(), "4096 pixels are built");
     }
 
     #[test]
     fn another_square_size_or_font_replaces_the_pictures() {
         let mut images = PieceImages::new();
-        let mut scene = Scene::new(41, 17, KINGS_AND_KNIGHT);
+        let mut scene = Scene::new(89, 41, KINGS_AND_KNIGHT);
         scene.draw(&mut images);
         assert_eq!(images.len(), 3);
 
         // Bigger squares: the small pictures are dropped, not kept beside the new ones.
-        scene.size = (57, 25);
+        scene.size = (105, 49);
         scene.draw(&mut images);
         assert_eq!(images.len(), 3);
 
@@ -1762,7 +1881,7 @@ mod tests {
 
     #[test]
     fn the_cursor_and_the_no_colour_marks_stay_beside_a_picture() {
-        let mut scene = Scene::new(57, 25, ROOK_CHECK);
+        let mut scene = Scene::new(89, 41, ROOK_CHECK);
         let picker = scene.picker.clone().expect("a picker");
         let pal = scene.palette;
         let rook = Piece::new(Side::Black, PieceKind::Rook);
@@ -1874,17 +1993,17 @@ mod tests {
 
     #[test]
     fn a_picture_the_area_cuts_off_is_drawn_as_the_glyph() {
-        let scene = Scene::new(57, 25, KINGS_AND_KNIGHT);
-        let full = Rect::new(0, 0, 57, 25);
+        let scene = Scene::new(89, 41, KINGS_AND_KNIGHT);
+        let full = Rect::new(0, 0, 89, 41);
         let g = layout_board(full, false, CellSize::DEFAULT).expect("fits");
-        // Rank 1 takes rows 21 to 23; the area stops after row 22.
+        // Rank 1 takes rows 35 to 39; the area stops after row 38.
         let e1 = square_rect(&g, Square::E1);
-        assert_eq!((e1.y, e1.height), (21, 3));
+        assert_eq!((e1.y, e1.height), (35, 5));
         let mut buf = Buffer::empty(full);
         let mut images = PieceImages::new();
         ratatui::widgets::StatefulWidget::render(
             scene.view(g),
-            Rect::new(0, 0, 57, 23),
+            Rect::new(0, 0, 89, 39),
             &mut buf,
             &mut images,
         );
@@ -1896,16 +2015,16 @@ mod tests {
                 scene.palette.white_piece
             )
         );
-        assert_eq!(buf[(e1.x, 23)], Cell::EMPTY);
+        assert_eq!(buf[(e1.x, 39)], Cell::EMPTY);
         // Only Black's king, on rank 8, has its whole image area inside.
         assert_eq!(images.len(), 1);
     }
 
     #[test]
     fn a_piece_under_a_box_shows_its_glyph_until_the_box_closes() {
-        let mut scene = Scene::new(57, 25, KINGS_AND_KNIGHT);
+        let mut scene = Scene::new(89, 41, KINGS_AND_KNIGHT);
         let picker = scene.picker.clone().expect("a picker");
-        let full = Rect::new(0, 0, 57, 25);
+        let full = Rect::new(0, 0, 89, 41);
         let g = layout_board(full, false, CellSize::DEFAULT).expect("fits");
         let (e1, g1) = (square_rect(&g, Square::E1), square_rect(&g, sq("g1")));
         // A box over one cell of g1's picture, its last one, and nothing of e1's.

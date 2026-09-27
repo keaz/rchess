@@ -34,15 +34,17 @@ use std::time::{Duration, Instant};
 
 use ratatui::backend::Backend;
 use ratatui::crossterm::event::Event;
+use ratatui_image::picker::ProtocolType;
 
 use crate::core::Game;
 use crate::engine::{ComputerMove, ComputerPlayer, EngineConfig};
 
 use self::app::{Action, App};
+use self::board::CellSize;
 use self::debug::DebugLog;
 use self::event::AppEvent;
-use self::graphics::{Graphics, LateAnswers};
-use self::worker::{Engine, EngineOutcome, EngineReply};
+use self::graphics::{FontMeter, Graphics, LateAnswers};
+use self::worker::{Engine, EngineOutcome, EngineReply, EngineRequest};
 
 /// How long one batch waits for terminal input before its `Tick` (spec 6.5).
 const TICK: Duration = Duration::from_millis(50);
@@ -227,14 +229,21 @@ fn play(
     // for the cursor position, another answer to wait for.)
     screen.backend_mut().clear()?;
     let mut late = LateAnswers::after(&graphics, Instant::now());
+    let mut meter = FontMeter::default();
     let mut app = build(graphics);
     let result = run_loop(
         &mut app,
         quit,
         |app| {
-            screen
-                .draw(|frame| app.render(frame, Instant::now()))
-                .map(drop)
+            screen.draw(|frame| app.render(frame, Instant::now()))?;
+            // Kitty keeps pictures after the program ends unless they are deleted.
+            if let Some(picker) = app.picker()
+                && picker.protocol_type() == ProtocolType::Kitty
+                && !app.piece_images().is_empty()
+            {
+                terminal::note_kitty_images(picker.tmux_detected());
+            }
+            Ok(())
         },
         |replies| {
             let mut batch = event::collect(replies, TICK)?;
@@ -243,6 +252,10 @@ fn play(
                 inject_ui_fault(fault, &batch);
             }
             Ok(batch)
+        },
+        |app| {
+            let is_tmux = app.picker().is_some_and(|picker| picker.tmux_detected());
+            meter.measure(is_tmux, || quit.load(Ordering::SeqCst) != 0)
         },
     );
     app.close_debug_log(LOG_GRACE);
@@ -392,15 +405,23 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Cli {
 /// (the number of a quit signal, 0 until one arrives) is set. Both are checked
 /// before every draw, so a signal is seen within one batch timeout.
 ///
+/// Engine requests start at once. A font measurement ([`Action::MeasureFont`]) waits
+/// for the end of the batch, so that it sees the terminal after every resize in it,
+/// and runs once however many resizes asked: `measure_font` asks the terminal
+/// ([`FontMeter::measure`] in production, up to [`graphics::QUERY_TIMEOUT`] when it
+/// does not answer) and its result goes to
+/// [`App::font_measured`] before the next draw.
+///
 /// Drawing comes before each batch so that mouse events are hit-tested against
 /// what is on screen. Every batch ends with a `Tick`, so the screen is redrawn at
 /// least once per batch (the spinner and the Jev vs Jev delay depend on it);
 /// ratatui writes only the cells that changed. Once the app quits, the rest of
 /// the batch is dropped.
 ///
-/// `draw` and `next_batch` are the terminal in production and a `TestBackend`
-/// with scripted batches in tests. Engine replies travel over a channel created
-/// here: `next_batch` receives its end, the worker threads send on the other.
+/// `draw`, `next_batch` and `measure_font` are the terminal in production and a
+/// `TestBackend` with scripted batches and font sizes in tests. Engine replies
+/// travel over a channel created here: `next_batch` receives its end, the worker
+/// threads send on the other.
 ///
 /// # Errors
 ///
@@ -410,45 +431,49 @@ fn run_loop(
     quit: &AtomicI32,
     mut draw: impl FnMut(&mut App) -> io::Result<()>,
     mut next_batch: impl FnMut(&Receiver<EngineReply>) -> io::Result<Vec<AppEvent>>,
+    mut measure_font: impl FnMut(&App) -> Option<CellSize>,
 ) -> io::Result<()> {
     let (replies_tx, replies) = mpsc::channel();
     while quit.load(Ordering::SeqCst) == 0 && !app.should_quit() {
         draw(app)?;
         let batch = next_batch(&replies)?;
         let now = Instant::now();
+        let mut measure = false;
         for event in batch {
             for action in app.handle(event, now) {
-                perform(action, app.engine(), &replies_tx);
+                match action {
+                    Action::RequestEngine(request) => {
+                        request_engine(request, app.engine(), &replies_tx);
+                    }
+                    Action::MeasureFont => measure = true,
+                }
             }
             if app.should_quit() {
                 break;
             }
         }
+        if measure && !app.should_quit() {
+            let measured = measure_font(app);
+            app.font_measured(measured);
+        }
     }
     Ok(())
 }
 
-/// Carries out one [`Action`] for the app.
-fn perform(action: Action, engine: &Arc<dyn Engine>, replies: &Sender<EngineReply>) {
-    match action {
-        Action::RequestEngine(request) => {
-            let (generation, hash) = (request.generation, request.hash);
-            if let Err(error) = worker::spawn_request(Arc::clone(engine), request, replies.clone())
-            {
-                // No thread means no reply. Answer for it, so the app stops
-                // waiting: it shows the failure and lets the person retry.
-                let failed = EngineReply {
-                    generation,
-                    hash,
-                    outcome: EngineOutcome::Failed(format!(
-                        "cannot start the engine thread: {error}"
-                    )),
-                    exchange: None,
-                };
-                // The receiver lives in `run_loop`, which is still running.
-                let _ = replies.send(failed);
-            }
-        }
+/// Runs `request` on an engine thread, whose reply arrives on `replies`.
+fn request_engine(request: EngineRequest, engine: &Arc<dyn Engine>, replies: &Sender<EngineReply>) {
+    let (generation, hash) = (request.generation, request.hash);
+    if let Err(error) = worker::spawn_request(Arc::clone(engine), request, replies.clone()) {
+        // No thread means no reply. Answer for it, so the app stops
+        // waiting: it shows the failure and lets the person retry.
+        let failed = EngineReply {
+            generation,
+            hash,
+            outcome: EngineOutcome::Failed(format!("cannot start the engine thread: {error}")),
+            exchange: None,
+        };
+        // The receiver lives in `run_loop`, which is still running.
+        let _ = replies.send(failed);
     }
 }
 
@@ -807,21 +832,34 @@ mod tests {
         unused_steps: usize,
         /// [`App::in_flight`] at every draw, so before every batch.
         in_flight: Vec<usize>,
+        /// The draw each font measurement came after (1 for the first draw).
+        measured_after: Vec<usize>,
     }
 
     /// Runs [`run_loop`] on an 80×24 `TestBackend`, serving `steps` as batches. Running
     /// out of steps before the loop ends is an error, so a loop that fails to quit fails
-    /// the test instead of hanging it.
+    /// the test instead of hanging it. Font measurements find nothing.
     fn drive(app: &mut App, quit: &AtomicI32, steps: Vec<Step>) -> Run {
+        drive_with_font(app, quit, steps, None)
+    }
+
+    /// [`drive`], with every font measurement giving `font`.
+    fn drive_with_font(
+        app: &mut App,
+        quit: &AtomicI32,
+        steps: Vec<Step>,
+        font: Option<CellSize>,
+    ) -> Run {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
         let mut steps = VecDeque::from(steps);
-        let mut draws = 0;
+        let draws = std::cell::Cell::new(0);
         let mut in_flight = Vec::new();
+        let mut measured_after = Vec::new();
         let result = run_loop(
             app,
             quit,
             |app| {
-                draws += 1;
+                draws.set(draws.get() + 1);
                 in_flight.push(app.in_flight());
                 terminal
                     .draw(|frame| app.render(frame, Instant::now()))
@@ -844,12 +882,82 @@ mod tests {
                 batch.push(AppEvent::Tick);
                 Ok(batch)
             },
+            |_| {
+                measured_after.push(draws.get());
+                font
+            },
         );
         Run {
             result,
-            draws,
+            draws: draws.get(),
             unused_steps: steps.len(),
             in_flight,
+            measured_after,
+        }
+    }
+
+    /// A game on an app whose picker draws with `protocol` at 10×20.
+    fn picture_game(protocol: ProtocolType) -> App {
+        let mut app = new_app().with_picker(Some(picker_for(protocol, CellSize::DEFAULT)));
+        app.set_cell_size(CellSize::DEFAULT);
+        let _ = app.handle(key(KeyCode::Char('1')), Instant::now());
+        app
+    }
+
+    fn resizes(sizes: &[(u16, u16)]) -> Step {
+        Step::Events(
+            sizes
+                .iter()
+                .map(|&(columns, rows)| AppEvent::Term(Event::Resize(columns, rows)))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn a_batch_of_resizes_measures_the_font_once_after_the_batch() {
+        let mut app = picture_game(ProtocolType::Sixel);
+        let run = drive_with_font(
+            &mut app,
+            &AtomicI32::new(0),
+            vec![
+                resizes(&[(100, 30), (90, 26), (100, 30)]),
+                Step::Events(Vec::new()),
+                resizes(&[(80, 24)]),
+                Step::Signal,
+            ],
+            Some(CellSize::new(8, 16)),
+        );
+        run.result.expect("loop ends cleanly");
+        assert_eq!(run.measured_after, [1, 3], "once per batch of resizes");
+        assert_eq!(app.cell_size(), CellSize::new(8, 16));
+        let font = app.picker().map(|picker| picker.font_size());
+        assert_eq!(font.map(|font| (font.width, font.height)), Some((8, 16)));
+
+        // Nothing measured keeps the font.
+        let mut app = picture_game(ProtocolType::Iterm2);
+        let run = drive(
+            &mut app,
+            &AtomicI32::new(0),
+            vec![resizes(&[(100, 30)]), Step::Signal],
+        );
+        run.result.expect("loop ends cleanly");
+        assert_eq!(run.measured_after, [1]);
+        assert_eq!(app.cell_size(), CellSize::DEFAULT);
+    }
+
+    #[test]
+    fn kitty_and_half_block_pictures_are_never_measured() {
+        for protocol in [ProtocolType::Kitty, ProtocolType::Halfblocks] {
+            let mut app = picture_game(protocol);
+            let run = drive_with_font(
+                &mut app,
+                &AtomicI32::new(0),
+                vec![resizes(&[(100, 30), (80, 24)]), Step::Signal],
+                Some(CellSize::new(8, 16)),
+            );
+            run.result.expect("loop ends cleanly");
+            assert!(run.measured_after.is_empty(), "{protocol:?}");
+            assert_eq!(app.cell_size(), CellSize::DEFAULT, "{protocol:?}");
         }
     }
 
@@ -1145,6 +1253,7 @@ mod tests {
             &quit,
             |_| Err(io::Error::other("tty gone")),
             |_| panic!("no batch after a failed draw"),
+            |_| panic!("no font measurement"),
         );
         assert_eq!(result.expect_err("draw failed").to_string(), "tty gone");
     }
@@ -1162,6 +1271,7 @@ mod tests {
                 Ok(())
             },
             |_| Err(io::Error::other("read failed")),
+            |_| panic!("no font measurement"),
         );
         assert_eq!(result.expect_err("read failed").to_string(), "read failed");
         assert_eq!(draws, 1);
@@ -1224,11 +1334,7 @@ mod tests {
         let engine: Arc<dyn Engine> = Arc::new(PanickingEngine(local_engine()));
         assert_eq!(engine.status(), "No JEV_API_KEY — local search");
         let (tx, rx) = mpsc::channel();
-        perform(
-            Action::RequestEngine(worker::EngineRequest::new(1, Game::new())),
-            &engine,
-            &tx,
-        );
+        request_engine(worker::EngineRequest::new(1, Game::new()), &engine, &tx);
         let reply = rx.recv_timeout(REPLY_TIMEOUT).expect("a reply arrives");
         let EngineOutcome::Move(computer) = reply.outcome else {
             panic!("expected the fallback move, got {:?}", reply.outcome);
@@ -1243,7 +1349,7 @@ mod tests {
         let request = worker::EngineRequest::new(7, crate::core::Game::new());
         let hash = request.hash;
 
-        perform(Action::RequestEngine(request), &engine, &tx);
+        request_engine(request, &engine, &tx);
 
         let reply = rx.recv_timeout(REPLY_TIMEOUT).expect("a reply arrives");
         assert!(worker::is_current(&reply, 7, hash));

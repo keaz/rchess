@@ -96,8 +96,9 @@ impl Harness {
     pub(crate) fn send(&mut self, event: AppEvent) -> Vec<Action> {
         let actions = self.app.handle(event, self.now);
         for action in &actions {
-            let Action::RequestEngine(request) = action;
-            self.request = Some(request.clone());
+            if let Action::RequestEngine(request) = action {
+                self.request = Some(request.clone());
+            }
         }
         self.draw();
         actions

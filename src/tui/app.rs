@@ -3,8 +3,9 @@
 //! [`App`] owns the game and all UI state. The run loop feeds it [`AppEvent`]s through
 //! [`App::handle`] and draws it with [`App::render`]; nothing else changes it. It never
 //! blocks and never spawns threads: when the computer should move, `handle` returns an
-//! [`Action::RequestEngine`] and the run loop starts the worker. The only I/O it does is
-//! writing the files the user asks it to save.
+//! [`Action::RequestEngine`] and the run loop starts the worker; when a resize may have
+//! zoomed the font, it returns an [`Action::MeasureFont`] and the run loop asks the
+//! terminal. The only I/O it does is writing the files the user asks it to save.
 //!
 //! Screens are [`Screen::Menu`], [`Screen::Playing`] and [`Screen::GameOver`] (an overlay on
 //! the playing screen), with a stack of [`Dialog`]s on top. Input goes to the topmost focus
@@ -56,13 +57,14 @@ use ratatui::crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::{Position as CellPosition, Rect};
-use ratatui_image::picker::Picker;
+use ratatui_image::picker::{Picker, ProtocolType};
 
 use super::board::{BoardGeometry, CellSize, Highlights, PieceImages, square_at};
 use super::debug::{DebugLog, DebugSession, Exchange, ExchangeView, History};
 use super::event::AppEvent;
 use super::files::{SaveError, pgn_export, resolve_path, tilde_path, today, write_file};
 use super::glyphs::{self, GlyphSet, Palette};
+use super::graphics;
 use super::input::{Command, LineEditor, parse_command, unquote};
 use super::movetext::{MoveTextError, parse_move};
 use super::panels;
@@ -247,6 +249,12 @@ pub enum Action {
     /// every request must be answered exactly once, or the app waits forever (and counts
     /// it against [`MAX_IN_FLIGHT`]).
     RequestEngine(EngineRequest),
+    /// Ask the terminal for its font size again (`graphics::FontMeter::measure`) once the
+    /// batch is handled, and hand the result to [`App::font_measured`]. Returned for a
+    /// resize while pictures are Sixel or iTerm2, which are encoded at the pixel size
+    /// of their cells, and not again until the result is in, so a batch of resizes
+    /// asks once.
+    MeasureFont,
 }
 
 /// Which side a Human vs Jev game gives the person.
@@ -617,6 +625,8 @@ pub struct App {
     picker: Option<Picker>,
     /// The terminal's font size, which shapes the board's squares.
     cell_size: CellSize,
+    /// An [`Action::MeasureFont`] was returned and its result is not in yet.
+    measuring_font: bool,
     /// The board's piece pictures, kept between draws.
     piece_images: PieceImages,
     /// Debug mode's exchanges and log; `None` when debug mode is off.
@@ -703,6 +713,7 @@ impl App {
             glyphs,
             picker: None,
             cell_size: CellSize::DEFAULT,
+            measuring_font: false,
             piece_images: PieceImages::new(),
             debug: None,
             exchange_view: None,
@@ -757,9 +768,40 @@ impl App {
     }
 
     /// Sets the terminal's font size, which is known only once the terminal has been asked
-    /// (default [`CellSize::DEFAULT`]). The next draw shapes the board's squares for it.
+    /// (default [`CellSize::DEFAULT`]). The next draw shapes the board's squares for it,
+    /// and a picker for another font size is replaced by one for this size (same
+    /// protocol) and the pictures made for the old one are dropped, so pictures are
+    /// encoded for the cells they are drawn in.
     pub fn set_cell_size(&mut self, cell_size: CellSize) {
         self.cell_size = cell_size;
+        if let Some(picker) = &self.picker {
+            let font = picker.font_size();
+            if (font.width, font.height) != (cell_size.width(), cell_size.height()) {
+                self.picker = Some(graphics::picker_for(picker.protocol_type(), cell_size));
+                self.piece_images.clear();
+            }
+        }
+    }
+
+    /// The result of an [`Action::MeasureFont`]: the font size the terminal has now, or
+    /// `None` when it could not say (the size stays). Only a size other than the current
+    /// one changes anything ([`set_cell_size`](Self::set_cell_size)).
+    pub fn font_measured(&mut self, measured: Option<CellSize>) {
+        self.measuring_font = false;
+        if let Some(cell_size) = measured
+            && cell_size != self.cell_size
+        {
+            self.set_cell_size(cell_size);
+        }
+    }
+
+    /// True when the pictures are encoded at a pixel size (Sixel and iTerm2), so a font
+    /// zoom must be followed; Kitty placeholders and half-blocks scale with the cells.
+    fn pictures_follow_the_font(&self) -> bool {
+        matches!(
+            self.picker.as_ref().map(Picker::protocol_type),
+            Some(ProtocolType::Sixel | ProtocolType::Iterm2)
+        )
     }
 
     /// Turns debug mode on (spec 9.4): Jev exchanges that arrive with engine replies are
@@ -1131,6 +1173,7 @@ impl App {
     /// event was collected.
     #[must_use = "the run loop must execute the returned actions"]
     pub fn handle(&mut self, event: AppEvent, now: Instant) -> Vec<Action> {
+        let mut actions = Vec::new();
         match event {
             AppEvent::Term(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                 if !self.too_small {
@@ -1141,15 +1184,20 @@ impl App {
             }
             AppEvent::Term(Event::Mouse(mouse)) if !self.too_small => self.on_mouse(mouse),
             AppEvent::Term(Event::Paste(text)) if !self.too_small => self.on_paste(&text),
+            AppEvent::Term(Event::Resize(..)) => {
+                // A resize may be a font zoom, which only the terminal can tell.
+                if self.pictures_follow_the_font() && !self.measuring_font {
+                    self.measuring_font = true;
+                    actions.push(Action::MeasureFont);
+                }
+            }
             AppEvent::Term(_) | AppEvent::Tick => {}
             AppEvent::Engine(reply) => self.on_engine(reply, now),
         }
         self.report_log_failure();
         self.release_held(now);
-        self.engine_request(now)
-            .map(Action::RequestEngine)
-            .into_iter()
-            .collect()
+        actions.extend(self.engine_request(now).map(Action::RequestEngine));
+        actions
     }
 
     fn on_key(&mut self, key: KeyEvent) {
@@ -1653,9 +1701,9 @@ impl App {
         let (Some(debug), Some(exchange)) = (&mut self.debug, exchange) else {
             return;
         };
-        let number = debug.record(*exchange, stale, SystemTime::now());
+        debug.record(*exchange, stale, SystemTime::now());
         if let Some(view) = &mut self.exchange_view {
-            view.follow(number);
+            view.follow(debug.history());
         }
     }
 
@@ -2501,13 +2549,13 @@ mod tests {
     use std::sync::mpsc;
 
     use ratatui::style::Modifier;
-    use ratatui_image::picker::ProtocolType;
 
     use super::*;
     use crate::core::{Piece, Position as ChessPosition, START_FEN};
     use crate::engine::EngineConfig;
     use crate::engine::{MoveSource, analyse, recorded_exchange};
     use crate::tui::board::square_rect;
+    use crate::tui::debug::NO_LOG_PATH;
     use crate::tui::graphics;
     use crate::tui::panels::HELP_LINES;
     use crate::tui::test_support::engine::{
@@ -3369,10 +3417,133 @@ mod tests {
         assert_eq!(h.app.status_line(), "glyphs: image");
     }
 
+    /// A font size and protocol as the picker reports them.
+    fn picker_format(app: &App) -> Option<(ProtocolType, (u16, u16))> {
+        app.picker().map(|picker| {
+            let font = picker.font_size();
+            (picker.protocol_type(), (font.width, font.height))
+        })
+    }
+
+    /// A game on an app whose picker draws with `protocol` for a `font` the terminal
+    /// reported.
+    fn picture_app(protocol: ProtocolType, font: CellSize) -> Harness {
+        let picker = graphics::picker_for(protocol, font);
+        let mut h = Harness::build(FakeEngine::local(), (80, 24), Vec::new(), |app| {
+            app.with_picker(Some(picker))
+        });
+        h.app.set_cell_size(font);
+        h.char('1');
+        h
+    }
+
+    /// Resizes the terminal to `columns`×`rows` and sends the resize.
+    fn resize(h: &mut Harness, (columns, rows): (u16, u16)) -> Vec<Action> {
+        h.terminal.backend_mut().resize(columns, rows);
+        h.send(AppEvent::Term(Event::Resize(columns, rows)))
+    }
+
+    /// How many font measurements `actions` ask for.
+    fn measurements(actions: &[Action]) -> usize {
+        actions
+            .iter()
+            .filter(|action| matches!(action, Action::MeasureFont))
+            .count()
+    }
+
+    #[test]
+    fn a_resize_measures_the_font_only_for_sixel_and_iterm2_pictures() {
+        for protocol in [ProtocolType::Sixel, ProtocolType::Iterm2] {
+            let mut h = picture_app(protocol, CellSize::DEFAULT);
+            assert_eq!(measurements(&resize(&mut h, (100, 30))), 1, "{protocol:?}");
+        }
+        // Kitty placeholders and half-blocks scale with the cells.
+        for protocol in [ProtocolType::Kitty, ProtocolType::Halfblocks] {
+            let mut h = picture_app(protocol, CellSize::DEFAULT);
+            assert_eq!(measurements(&resize(&mut h, (100, 30))), 0, "{protocol:?}");
+        }
+        // Images off: no picker, nothing to follow.
+        let mut h = Harness::new();
+        h.char('1');
+        assert_eq!(measurements(&resize(&mut h, (100, 30))), 0);
+        // Only a resize asks.
+        let mut h = picture_app(ProtocolType::Sixel, CellSize::DEFAULT);
+        let mut actions = h.tick();
+        actions.extend(h.char('g'));
+        actions.extend(h.command("e4"));
+        assert_eq!(measurements(&actions), 0);
+    }
+
+    #[test]
+    fn a_batch_of_resizes_measures_the_font_once() {
+        let mut h = picture_app(ProtocolType::Sixel, CellSize::DEFAULT);
+        let mut asked = 0;
+        for size in [(100, 30), (90, 26), (120, 40), (120, 40)] {
+            asked += measurements(&resize(&mut h, size));
+        }
+        asked += measurements(&h.tick());
+        assert_eq!(asked, 1, "one measurement until its result is in");
+        h.app.font_measured(None);
+        assert_eq!(
+            measurements(&resize(&mut h, (80, 24))),
+            1,
+            "the next resize measures again"
+        );
+    }
+
+    #[test]
+    fn measuring_the_font_it_already_has_changes_nothing() {
+        let mut h = picture_app(ProtocolType::Sixel, CellSize::DEFAULT);
+        for _ in 0..3 {
+            h.char('g');
+        }
+        assert_eq!(h.app.glyphs(), GlyphSet::Image);
+        let pictures = h.app.piece_images().len();
+        assert!(pictures > 0, "the pieces are pictures");
+        for measured in [Some(CellSize::DEFAULT), None] {
+            let _ = resize(&mut h, (80, 24));
+            h.app.font_measured(measured);
+            assert_eq!(h.app.cell_size(), CellSize::DEFAULT, "{measured:?}");
+            assert_eq!(picker_format(&h.app), Some((ProtocolType::Sixel, (10, 20))));
+            assert_eq!(
+                h.app.piece_images().len(),
+                pictures,
+                "the pictures are kept"
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_font_rebuilds_the_picker_and_drops_the_pictures() {
+        let mut h = picture_app(ProtocolType::Sixel, CellSize::DEFAULT);
+        for _ in 0..3 {
+            h.char('g');
+        }
+        assert!(!h.app.piece_images().is_empty());
+        // A font zoom: the window keeps its pixels and gets more cells, now 8×16 each.
+        assert_eq!(measurements(&resize(&mut h, (100, 30))), 1);
+        h.app.font_measured(Some(CellSize::new(8, 16)));
+        assert_eq!(h.app.cell_size(), CellSize::new(8, 16));
+        assert_eq!(
+            picker_format(&h.app),
+            Some((ProtocolType::Sixel, (8, 16))),
+            "the pictures are encoded for the new font"
+        );
+        assert!(h.app.piece_images().is_empty(), "the old pictures are gone");
+        h.draw();
+        assert!(!h.app.piece_images().is_empty(), "and drawn again");
+
+        // Without images the font size still shapes the squares.
+        let mut h = Harness::new();
+        h.app.font_measured(Some(CellSize::new(8, 16)));
+        assert_eq!(h.app.cell_size(), CellSize::new(8, 16));
+        assert_eq!(picker_format(&h.app), None, "images stay off");
+    }
+
     #[test]
     fn the_image_style_draws_pictures_and_keeps_them_between_draws() {
         let picker = graphics::picker_for(ProtocolType::Halfblocks, CellSize::DEFAULT);
-        let mut h = Harness::build(FakeEngine::local(), (120, 40), Vec::new(), |app| {
+        let mut h = Harness::build(FakeEngine::local(), (200, 60), Vec::new(), |app| {
             app.with_picker(Some(picker))
         });
         h.char('1');
@@ -3414,7 +3585,7 @@ mod tests {
         assert_eq!(h.app.piece_images().len(), 22);
 
         // A bigger terminal gets bigger squares: only what is on the board now is built.
-        h.terminal.backend_mut().resize(200, 60);
+        h.terminal.backend_mut().resize(300, 100);
         h.draw();
         assert_eq!(h.app.piece_images().len(), 21);
         assert!(!e1(&h).contains(king));
@@ -4609,7 +4780,11 @@ mod tests {
     /// An 80×24 Human vs Jev game (the person plays White) in debug mode, with a log that
     /// has no file (it reports that at the first exchange).
     fn debug_game() -> Harness {
-        let mut h = debug_app(FakeEngine::jev(), (80, 24), DebugLog::open(None));
+        let mut h = debug_app(
+            FakeEngine::jev(),
+            (80, 24),
+            DebugLog::open(Err(NO_LOG_PATH.to_string())),
+        );
         h.char('2');
         h
     }
@@ -4740,7 +4915,11 @@ mod tests {
 
     #[test]
     fn an_answer_held_while_paused_is_kept_when_played_or_dropped() {
-        let mut h = debug_app(FakeEngine::jev(), (80, 24), DebugLog::open(None));
+        let mut h = debug_app(
+            FakeEngine::jev(),
+            (80, 24),
+            DebugLog::open(Err(NO_LOG_PATH.to_string())),
+        );
         h.char('5');
         h.reply("e2e4");
         h.at_ms(5_000);
@@ -4753,7 +4932,11 @@ mod tests {
         assert_eq!(h.uci(), Vec::<String>::new());
         assert_eq!(kept(&h), [("e5".to_string(), true)], "undo dropped it");
 
-        let mut h = debug_app(FakeEngine::jev(), (80, 24), DebugLog::open(None));
+        let mut h = debug_app(
+            FakeEngine::jev(),
+            (80, 24),
+            DebugLog::open(Err(NO_LOG_PATH.to_string())),
+        );
         h.char('5');
         h.reply("e2e4");
         h.at_ms(5_000);
@@ -4780,7 +4963,11 @@ mod tests {
 
     #[test]
     fn replies_are_played_under_the_view_and_it_stays_on_its_exchange() {
-        let mut h = debug_app(FakeEngine::jev(), (80, 24), DebugLog::open(None));
+        let mut h = debug_app(
+            FakeEngine::jev(),
+            (80, 24),
+            DebugLog::open(Err(NO_LOG_PATH.to_string())),
+        );
         h.char('5');
         h.char('d');
         h.reply_traced("e2e4");
@@ -4906,7 +5093,11 @@ mod tests {
         let mut h = Harness::sized(FakeEngine::jev(), 120, 40);
         h.char('2');
         assert!(!top_row(&h).contains("DEBUG"));
-        let mut h = debug_app(FakeEngine::jev(), (120, 40), DebugLog::open(None));
+        let mut h = debug_app(
+            FakeEngine::jev(),
+            (120, 40),
+            DebugLog::open(Err(NO_LOG_PATH.to_string())),
+        );
         h.char('2');
         let row = top_row(&h);
         assert!(row.contains("┌ Status ─ DEBUG ─"), "{row}");
@@ -4918,7 +5109,11 @@ mod tests {
         // 80x24: both DEBUG and the mode title would not fit on the border together,
         // so the mode title (chosen from the full room) keeps the border and DEBUG
         // starts the first status line instead.
-        let mut h = debug_app(FakeEngine::jev(), (80, 24), DebugLog::open(None));
+        let mut h = debug_app(
+            FakeEngine::jev(),
+            (80, 24),
+            DebugLog::open(Err(NO_LOG_PATH.to_string())),
+        );
         h.char('2');
         let top_row = h.screen().lines().next().unwrap_or_default().to_string();
         assert!(!top_row.contains("DEBUG"), "{top_row}");
@@ -4927,7 +5122,11 @@ mod tests {
         assert!(second_row.contains("DEBUG White to move"), "{second_row}");
 
         // 60x20: same precedence, with the shorter mode label.
-        let mut h = debug_app(FakeEngine::jev(), (60, 20), DebugLog::open(None));
+        let mut h = debug_app(
+            FakeEngine::jev(),
+            (60, 20),
+            DebugLog::open(Err(NO_LOG_PATH.to_string())),
+        );
         h.char('2');
         let top_row = h.screen().lines().next().unwrap_or_default().to_string();
         assert!(!top_row.contains("DEBUG"), "{top_row}");
@@ -5041,6 +5240,26 @@ mod tests {
                 .starts_with("debug log disabled: it is a folder: "),
             "{}",
             h.app.status_line()
+        );
+    }
+
+    #[test]
+    fn a_log_failure_found_on_the_menu_waits_for_the_next_game() {
+        let mut h = debug_game();
+        h.moves(&["e4"]);
+        h.char('m');
+        h.char('y');
+        assert_eq!(h.app.screen(), Screen::Menu);
+        // Jev's answer comes on the menu: stale, but kept and logged, and the log fails.
+        h.reply_traced("e7e5");
+        h.tick();
+        assert_eq!(h.app.exchanges().map(History::len), Some(1));
+        assert_eq!(h.app.status_line(), "", "the menu shows no status line");
+        h.char('2');
+        assert_eq!(h.app.screen(), Screen::Playing);
+        assert_eq!(
+            h.app.status_line(),
+            "debug log disabled: no log file (set RCHESS_DEBUG_LOG, XDG_STATE_HOME or HOME)"
         );
     }
 
