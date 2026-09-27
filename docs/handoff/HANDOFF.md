@@ -5,9 +5,9 @@ Read this first. Follow the protocol in section 8 of
 
 ## Current
 Sub-project: tui (not started) | Plan: to be written — docs/superpowers/plans/2026-09-26-tui.md
-Branch: main @ 7e6bce3 (feat/jev-engine fast-forward merged, then deleted)
-Last completed task: engine sub-project merged into main — engine DONE (one known issue open, see below)
-Next task: brainstorm/plan the TUI from spec section 6 (read "Core API caveats", the engine caveats and "Known open issues" first)
+Branch: fix/engine-pin-and-endpoint (from main @ 86e1ed5) — ready for the user to merge into main
+Last completed task: engine follow-up — SEE pin release fixed, `new_attack` pin-aware, Jev endpoint fixed (no `JEV_*` URL variable)
+Next task: TUI brainstorming, then plan, from spec section 6 (read "Core API caveats", the engine caveats and "Known open issues" first)
 State: green (except 3 pre-existing old-code test failures)
 
 ## Verify before continuing
@@ -58,16 +58,17 @@ cargo test --lib engine:: && cargo test --lib core:: && cargo test --test core_p
 - TUI integration: send `game.clone()` (the whole `Game`) to a long-lived worker thread that owns the ComputerPlayer<JevClient> (ComputerPlayer::from_config(EngineConfig::from_env())), or share the player through `Arc` (it is `Sync`, not `Clone`); worst-case `choose_move` latency is about 19 s (3 attempts × 5 s timeout + backoff + search), so tag each request with a generation counter and discard stale results; show EngineConfig.warnings, ComputerMove.note, source (its `Display` label), top and model.
 - The ignored live Jev round-trip test (`engine::jev::tests::live_choice_round_trip`) passed once during Task 7, with the user's key.
 - Test counts after the final fix wave: `cargo test --lib engine::` 87 passed, 2 ignored; `cargo test --lib core::` 51 passed, 1 ignored; `core_properties` 2 passed; whole lib 193 passed, 3 failed (old code), 3 ignored.
-- Final-review fix wave: a mate on the 100th half-move now outranks the fifty-move rule; SEE ignores pinned pieces off their pin line; annotation facts corrected ("exposed to capture" wording, no such fact for the capturing piece, a king only attacks undefended pieces); JEV_BASE_URL validated; transport errors classified (new `JevError::Request`), 1 MiB body cap and offline TcpListener tests; notes stripped of control characters; public docs, `ComputerPlayer` Debug and `MoveSource` Display; harness `jev pick` column and answered-only latency.
+- Engine follow-up (2026-09-27): SEE judges the first capturer by the pins of the position as it stands and the recaptures by the pins after the first capture (pins changed by later captures are still not modelled); `new_attack`'s "defended" check is pin-aware. The Jev endpoint is fixed, not configurable (user decision): `jev::JEV_ENDPOINT` = `https://api.typesafe.ai/v1/systemone`, the TypeSafe quickstart URL, with `Authorization: Bearer <key>` and `Content-Type: application/json`; an offline test pins that wire format. Test counts: `cargo test --lib engine::` 93 passed, 2 ignored; whole lib 199 passed, 3 failed (old code), 3 ignored.
+- Final-review fix wave: a mate on the 100th half-move now outranks the fifty-move rule; SEE ignores pinned pieces off their pin line; annotation facts corrected ("exposed to capture" wording, no such fact for the capturing piece, a king only attacks undefended pieces); base-URL variable validated (since removed by the engine follow-up); transport errors classified (new `JevError::Request`), 1 MiB body cap and offline TcpListener tests; notes stripped of control characters; public docs, `ComputerPlayer` Debug and `MoveSource` Display; harness `jev pick` column and answered-only latency.
 
 ## Known open issues
-- Engine SEE pin release (important, found by the final re-review, user chose to merge first): `src/engine/see.rs` computes pins once from the position before the first capture. When the pinning piece itself makes the first capture off its line, the released piece is still treated as pinned. Repro: `4k3/8/8/4b3/8/2p5/8/4QK2 w - - 0 1` — Qxc3 is annotated "wins material in the exchange" though Bxc3 wins the queen; `capture_gain` then yields a false threat and a false "moves ... to safety" fact. Search scores, buckets, the losing filter and the veto are unaffected. Fix: recompute the recapturing side's pins after the first capture (from `pos.play(mv)` in `see`, with the first capturer removed in `capture_gain`) and add the repro as a test.
-- Engine minor follow-ups: `new_attack`'s "defended" check is pin-blind; `JEV_BASE_URL=http://` (or `https://`) passes validation and becomes `http:`; `ComputerMove.model` and Transport/Request error text skip the control-character sanitiser; the historical engine plan still uses the old "undefended against capture" wording.
+- Engine minor follow-ups: `ComputerMove.model` and Transport/Request error text skip the control-character sanitiser; the historical engine plan still uses the old "undefended against capture" wording.
 
 ## Open questions for user
 - None.
 
 ## Log (newest first)
+- 2026-09-27 engine follow-up on fix/engine-pin-and-endpoint: SEE pin release fixed, pin-aware `new_attack`, fixed Jev endpoint (base-URL variable removed); ready to merge; next: TUI brainstorming.
 - 2026-09-27 feat/jev-engine fast-forward merged into main (engine DONE); SEE pin-release issue left open by user choice, recorded under Known open issues.
 - 2026-09-26 engine final-review fix wave (F1–F18): mate before fifty-move rule, pin-aware SEE, annotation fixes, transport hardening and offline tests, API polish, harness columns, docs
 - 2026-09-26 engine sub-project complete; harness run recorded

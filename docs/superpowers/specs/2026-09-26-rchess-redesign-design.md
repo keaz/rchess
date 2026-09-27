@@ -160,7 +160,8 @@ examples/jev_eval.rs   evaluation harness (section 5.8)
 
 ```rust
 pub struct EngineConfig {
-    // api_key, model, base_url, max_options, filter_losing, timeout, veto_margin_cp, warnings
+    // api_key, model, max_options, filter_losing, timeout, veto_margin_cp, warnings
+    // (no URL: the endpoint is the fixed jev::JEV_ENDPOINT)
 }
 impl EngineConfig {
     pub fn from_env() -> EngineConfig;                                  // never fails
@@ -223,8 +224,10 @@ Rules:
 - **Budget**: scoring all root moves of Kiwipete takes under 250 ms in release mode.
 - **SEE**: swap-off algorithm using `Position::attackers_to` with x-rays revealed by removing
   attackers from the occupancy; king value treated as effectively infinite. A piece absolutely
-  pinned to its king takes part only when the target lies on its pin line; pins are computed once
-  for the starting position (a pin created or released mid-exchange is not modelled).
+  pinned to its king takes part only when the target lies on its pin line. The first capturer is
+  checked against the pins of the position before it moves; the recaptures against the pins of the
+  position after the first capture (so a pin that capture releases or creates is honoured). Pins
+  created or released by later captures in the exchange are not modelled.
 
 ### 5.4 Annotation and buckets
 
@@ -238,7 +241,8 @@ Per root move, `annotate.rs` produces plain words (joined with "; ") from facts 
 - promotes to a <piece>
 - gives check / delivers checkmate
 - attacks the <piece> on <square> — the most valuable enemy piece the moved piece newly attacks,
-  when it is worth more than the mover or undefended (a king counts as worth more than anything)
+  when it is worth more than the mover or undefended (a king counts as worth more than anything; a
+  defender pinned to its king off the line to the attacked piece does not defend it)
 - moves the attacked <piece> to safety — the moved piece was losing material by SEE before and is
   not after
 - leaves the <piece> on <square> exposed to capture — our most valuable piece that the
@@ -328,7 +332,10 @@ State fields, all computed by `describe.rs`:
 
 ### 5.7 Client, retries and configuration
 
-- `JevClient` posts with `ureq` 3.x. Request/response types are plain `serde` structs, so they can be
+- `JevClient` posts with `ureq` 3.x to the fixed endpoint `jev::JEV_ENDPOINT` =
+  `https://api.typesafe.ai/v1/systemone` (the TypeSafe quickstart URL), with
+  `Authorization: Bearer <key>` and `Content-Type: application/json`. The endpoint is not
+  configurable (user decision, 2026-09-27); the offline transport tests use a test-only constructor. Request/response types are plain `serde` structs, so they can be
   tested without a network.
 - Retries: at most 3 attempts. Retry 429, 5xx (including 529) and transport errors; backoff 250 ms
   then 500 ms, or the `retry-after` value when present, capped at 2 s. No retry on other 4xx.
@@ -340,7 +347,6 @@ State fields, all computed by `describe.rs`:
 | --- | --- | --- |
 | `JEV_API_KEY` (fallback `TYPESAFE_API_KEY`) | none | Required for Jev play. Absent or empty means local-search fallback. |
 | `JEV_MODEL` | `jev-latest` | Model alias or versioned ID. |
-| `JEV_BASE_URL` | `https://api.typesafe.ai` | Override for testing. |
 | `JEV_MAX_OPTIONS` | `40` | Shortlist cap, clamped to 1..=255. |
 | `JEV_FILTER_LOSING` | `true` | Drop `losing` moves when alternatives exist (`true/false/1/0/yes/no`). |
 
