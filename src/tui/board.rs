@@ -204,9 +204,6 @@ impl BoardView<'_> {
                 cell.modifier = modifier;
             }
         }
-        if let Some((left, right)) = self.side_marks(sq, is_capture) {
-            self.render_side_marks(rect, left, right, clip, buf);
-        }
         if let Some(cell) = cell_in(buf, clip, glyph_cell(rect)) {
             if let Some(piece) = piece {
                 let fg = match piece.color {
@@ -220,8 +217,12 @@ impl BoardView<'_> {
                     .set_fg(self.palette.black_piece);
             }
         }
-        if self.highlights.cursor == Some(sq) {
+        let cursor = self.highlights.cursor == Some(sq);
+        if cursor {
             self.render_cursor(rect, clip, buf);
+        }
+        if let Some((left, right)) = self.side_marks(sq, is_capture) {
+            self.render_side_marks(rect, (left, right), cursor, clip, buf);
         }
     }
 
@@ -282,20 +283,29 @@ impl BoardView<'_> {
         }
     }
 
-    /// Writes `left` and `right` in the square's outer columns on the glyph row.
+    /// Writes the `(left, right)` marks in the square's outer columns on the glyph row. Under
+    /// the cursor, whose `[` `]` hold the outer columns, they go just inside them (`[(p)]`);
+    /// a square too narrow for both keeps the cursor's `[` and the mark's right side
+    /// (`[p)`), so the cursor never hides the mark.
     fn render_side_marks(
         &self,
         rect: Rect,
-        left: &'static str,
-        right: &'static str,
+        (left, right): (&'static str, &'static str),
+        cursor: bool,
         clip: Rect,
         buf: &mut Buffer,
     ) {
         if rect.width < 3 {
             return;
         }
+        let (first, last) = (rect.left(), rect.right() - 1);
+        let columns = match (cursor, rect.width >= 5) {
+            (false, _) => [Some((first, left)), Some((last, right))],
+            (true, true) => [Some((first + 1, left)), Some((last - 1, right))],
+            (true, false) => [None, Some((last, right))],
+        };
         let y = glyph_cell(rect).y;
-        for (x, mark) in [(rect.left(), left), (rect.right() - 1, right)] {
+        for (x, mark) in columns.into_iter().flatten() {
             if let Some(cell) = cell_in(buf, clip, CellPosition::new(x, y)) {
                 cell.set_symbol(mark).set_fg(self.palette.black_piece);
             }
@@ -858,6 +868,62 @@ mod tests {
             .collect();
         assert_eq!(symbols, " \u{265B} ");
         assert!(buf.content().iter().all(|c| c.modifier.is_empty()));
+    }
+
+    #[test]
+    fn without_colour_the_cursor_never_hides_a_capture_or_check_mark() {
+        // Black has just played d7-d5 beside White's e5 pawn: d6 is an empty capture
+        // target (en passant), so its marks are all that says "capture".
+        let position =
+            ChessPosition::from_fen("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1").expect("valid FEN");
+        let at = |cursor: &str, selected: Option<&str>, check: Option<&str>| Highlights {
+            selected: selected.map(sq),
+            targets: if selected.is_some() {
+                vec![sq("d6"), sq("e6")]
+            } else {
+                Vec::new()
+            },
+            cursor: Some(sq(cursor)),
+            check: check.map(sq),
+            ..Highlights::default()
+        };
+        // (board width, height, capture under the cursor, king in check under it,
+        // plain cursor, quiet target under the cursor), for each square size.
+        let cases = [
+            (31, 11, "[ )", "[\u{2654}+", "[ ]", "[.]"),
+            (41, 17, "[( )]", "[+\u{2654}+]", "[   ]", "[ . ]"),
+            (57, 25, "[(   )]", "[+ \u{2654} +]", "[     ]", "[  .  ]"),
+        ];
+        for (width, height, capture, check, plain, quiet) in cases {
+            let row = |highlights: &Highlights, name: &str| -> String {
+                let (terminal, g) = draw_marked(
+                    width,
+                    height,
+                    &position,
+                    GlyphSet::Outline,
+                    false,
+                    highlights,
+                    true,
+                );
+                let buf = terminal.backend().buffer();
+                let rect = square_rect(&g, sq(name));
+                let y = glyph_cell(rect).y;
+                (0..rect.width)
+                    .map(|dx| buf[(rect.x + dx, y)].symbol())
+                    .collect()
+            };
+            let size = format!("{width}x{height}");
+            assert_eq!(row(&at("d6", Some("e5"), None), "d6"), capture, "{size}");
+            assert_eq!(row(&at("e1", None, Some("e1")), "e1"), check, "{size}");
+            assert_eq!(row(&at("a1", None, None), "a1"), plain, "{size}");
+            assert_eq!(row(&at("e6", Some("e5"), None), "e6"), quiet, "{size}");
+            // Away from the cursor the marks stay in the outer columns.
+            let away = row(&at("a1", Some("e5"), None), "d6");
+            assert!(
+                away.starts_with('(') && away.ends_with(')'),
+                "{size}: {away}"
+            );
+        }
     }
 
     #[test]
