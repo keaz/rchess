@@ -245,6 +245,7 @@ dependencies = [
  "proptest",
  "ratatui",
  "ratatui-image",
+ "rustix 1.1.5",
  "serde",
  "serde_json",
  "signal-hook 0.4.4",

@@ -68,6 +68,24 @@ pub(crate) fn chord_event(code: KeyCode, modifiers: KeyModifiers) -> Event {
     Event::Key(KeyEvent::new(code, modifiers))
 }
 
+/// The key presses crossterm makes of Kitty's answer to the graphics probe,
+/// `ESC _ G i=31;OK ESC \`, when it arrives after the query gave up waiting: Alt+`_`,
+/// the characters in between (upper case with Shift), then Alt+`\`. The other answers
+/// never become key presses (crossterm keeps them to itself or drops them).
+pub(crate) fn late_kitty_answer() -> Vec<Event> {
+    let mut keys = vec![chord_event(KeyCode::Char('_'), KeyModifiers::ALT)];
+    keys.extend("Gi=31;OK".chars().map(|c| {
+        let modifiers = if c.is_uppercase() {
+            KeyModifiers::SHIFT
+        } else {
+            KeyModifiers::NONE
+        };
+        chord_event(KeyCode::Char(c), modifiers)
+    }));
+    keys.push(chord_event(KeyCode::Char('\\'), KeyModifiers::ALT));
+    keys
+}
+
 /// A mouse event at cell (`column`, `row`), as the terminal reports it.
 pub(crate) fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> Event {
     Event::Mouse(MouseEvent {

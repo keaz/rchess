@@ -3,14 +3,16 @@
 //! `crate::core` and `crate::engine`.
 //!
 //! [`run`] is the whole program: it reads the command line and the environment,
-//! builds the computer player, sets up the terminal and runs the main loop
-//! until the user quits or a signal asks it to stop.
+//! builds the computer player, sets up the terminal, asks it about graphics
+//! ([`graphics::detect`]) and runs the main loop until the user quits or a signal
+//! asks it to stop.
 
 pub mod app;
 pub mod board;
 pub mod event;
 pub mod files;
 pub mod glyphs;
+pub mod graphics;
 pub mod input;
 pub mod movetext;
 pub mod panels;
@@ -28,6 +30,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use ratatui::backend::Backend;
 use ratatui::crossterm::event::Event;
 
 use crate::core::Game;
@@ -35,6 +38,7 @@ use crate::engine::{ComputerMove, ComputerPlayer, EngineConfig};
 
 use self::app::{Action, App};
 use self::event::AppEvent;
+use self::graphics::{Graphics, LateAnswers};
 use self::worker::{Engine, EngineOutcome, EngineReply};
 
 /// How long one batch waits for terminal input before its `Tick` (spec 6.5).
@@ -51,11 +55,12 @@ const USAGE: &str = concat!(
     "\n",
     "Usage: ",
     env!("CARGO_PKG_NAME"),
-    " [--glyphs solid|outline|ascii]\n",
+    " [--glyphs image|solid|outline|ascii]\n",
     "\n",
     "Options:\n",
-    "  --glyphs <set>     piece glyphs: solid (default), outline or ascii;\n",
-    "                     `g` cycles them during a game\n",
+    "  --glyphs <set>     how pieces look: image (pictures; the default when the\n",
+    "                     terminal can show them), solid (otherwise the default),\n",
+    "                     outline or ascii; `g` cycles them during a game\n",
     "  -h, --help         show this help and exit\n",
     "\n",
     "Environment:\n",
@@ -65,8 +70,9 @@ const USAGE: &str = concat!(
     "  JEV_MAX_OPTIONS    moves offered to Jev per turn, 1-255 (default 40)\n",
     "  JEV_FILTER_LOSING  keep losing moves off Jev's shortlist (default true)\n",
     "  RCHESS_GLYPHS      glyph set when --glyphs is not given\n",
+    "  RCHESS_IMAGES      off: no piece pictures, and no graphics query at start\n",
     "  NO_COLOR           no colours: start with outline glyphs unless a set is\n",
-    "                     chosen, and mark board highlights with text\n",
+    "                     chosen, mark board highlights with text, no pictures\n",
     "  COLORTERM          truecolor or 24bit selects 24-bit colours\n",
     "\n",
     "In the game press ? for help. Moves can be typed after / (e4, Nf3, e2e4).\n",
@@ -78,8 +84,13 @@ const USAGE: &str = concat!(
 /// `--help` prints the usage and returns without touching the terminal.
 /// Unknown arguments and a missing or invalid `--glyphs` value do not stop the
 /// program: they are listed as warnings on the menu, like invalid engine
-/// settings. The computer player comes from `EngineConfig::from_env()`; with
-/// no `JEV_API_KEY` it plays by local search and never uses the network.
+/// settings, and so is a graphics query that failed. The computer player comes
+/// from `EngineConfig::from_env()`; with no `JEV_API_KEY` it plays by local
+/// search and never uses the network.
+///
+/// Unless images are off ([`glyphs::images_wanted`]), the terminal is asked about
+/// graphics right after it is set up, which takes up to [`graphics::QUERY_TIMEOUT`]
+/// when it does not answer.
 ///
 /// Call it from the main thread (the panic hook restores the terminal only for
 /// a panic on the thread named "main"). The terminal is restored on every exit:
@@ -104,22 +115,20 @@ pub fn run(args: impl IntoIterator<Item = String>) -> io::Result<()> {
     }
 
     let env = |name: &str| std::env::var(name).ok();
-    let (glyph_set, glyph_warnings) = glyphs::initial_glyphs(options.glyphs.as_deref(), env);
-    let mut warnings = options.warnings;
-    warnings.extend(glyph_warnings);
+    let images = glyphs::images_wanted(options.glyphs.as_deref(), env);
     let fault = injected_fault(env("RCHESS_FAULT").as_deref());
     let mut engine: Arc<dyn Engine> =
         Arc::new(ComputerPlayer::from_config(EngineConfig::from_env()));
     if fault == Some(Fault::EnginePanic) {
         engine = Arc::new(PanickingEngine(engine));
     }
-    let mut app = App::new(engine, glyph_set, glyphs::detect_truecolor(env), warnings)
-        .with_no_color(glyphs::no_color(env));
 
     // Before `enter`, so a signal that arrives during setup still ends in a
     // clean restore instead of killing the process with the terminal in raw mode.
     let quit = terminal::register_signals()?;
-    let result = play(&mut app, &quit, fault);
+    let result = play(&quit, images, fault, |graphics| {
+        build_app(options, engine, graphics, env)
+    });
     let signal = if result.is_err() {
         signal_after(&quit, SIGNAL_GRACE)
     } else {
@@ -144,17 +153,58 @@ fn terminal_problem(stdin_is_terminal: bool, stdout_is_terminal: bool) -> Option
     }
 }
 
-/// Sets up the terminal, runs the main loop and restores the terminal (also on
-/// an error) before returning.
-fn play(app: &mut App, quit: &AtomicI32, fault: Option<Fault>) -> io::Result<()> {
+/// The app for the options and environment (`get`), once the terminal has been
+/// asked about graphics: the starting glyph set follows [`Graphics::support`], and
+/// the menu lists the command-line warnings, then the glyph warnings, then the
+/// graphics query's (after the engine's own, which `App::new` adds).
+fn build_app(
+    options: Options,
+    engine: Arc<dyn Engine>,
+    graphics: Graphics,
+    get: impl Fn(&str) -> Option<String>,
+) -> App {
+    let (glyph_set, glyph_warnings) =
+        glyphs::initial_glyphs(options.glyphs.as_deref(), &get, graphics.support());
+    let mut warnings = options.warnings;
+    warnings.extend(glyph_warnings);
+    warnings.extend(graphics.warning);
+    let mut app = App::new(engine, glyph_set, glyphs::detect_truecolor(&get), warnings)
+        .with_no_color(glyphs::no_color(&get))
+        .with_picker(graphics.picker);
+    app.set_cell_size(graphics.cell_size);
+    app
+}
+
+/// Sets up the terminal, asks it about graphics when `images` is true, builds the
+/// app from the result, runs the main loop and restores the terminal (also on an
+/// error) before returning.
+fn play(
+    quit: &AtomicI32,
+    images: bool,
+    fault: Option<Fault>,
+    build: impl FnOnce(Graphics) -> App,
+) -> io::Result<()> {
+    let (screen, graphics) = terminal::enter(|| {
+        if images {
+            graphics::detect(|| quit.load(Ordering::SeqCst) != 0)
+        } else {
+            graphics::without_images()
+        }
+    })?;
     // Never dropped: `Terminal`'s `Drop` shows the cursor and prints when that
     // fails, which panics on a hung-up tty. `terminal::leave` shows the cursor
     // instead, ignoring errors. The process ends soon after, so nothing leaks for
     // long.
-    let mut screen = ManuallyDrop::new(terminal::enter()?);
+    let mut screen = ManuallyDrop::new(screen);
     let _guard = terminal::Guard;
+    // A terminal that does not know a probe may have printed it, and the first draw
+    // writes only the cells that are not blank. (`Terminal::clear` would also ask
+    // for the cursor position, another answer to wait for.)
+    screen.backend_mut().clear()?;
+    let mut late = LateAnswers::after(&graphics, Instant::now());
+    let mut app = build(graphics);
     run_loop(
-        app,
+        &mut app,
         quit,
         |app| {
             screen
@@ -162,13 +212,23 @@ fn play(app: &mut App, quit: &AtomicI32, fault: Option<Fault>) -> io::Result<()>
                 .map(drop)
         },
         |replies| {
-            let batch = event::collect(replies, TICK)?;
+            let mut batch = event::collect(replies, TICK)?;
+            drop_late_answers(&mut batch, &mut late, Instant::now());
             if let Some(fault) = fault {
                 inject_ui_fault(fault, &batch);
             }
             Ok(batch)
         },
     )
+}
+
+/// Removes from `batch` the key presses of a graphics answer that came after the
+/// query stopped waiting ([`LateAnswers`]), so they do not act as keys.
+fn drop_late_answers(batch: &mut Vec<AppEvent>, late: &mut LateAnswers, now: Instant) {
+    batch.retain(|event| match event {
+        AppEvent::Term(term) => late.keep(term, now),
+        _ => true,
+    });
 }
 
 /// The quit signal recorded in `quit`, waiting up to `grace` for one to arrive; 0 if
@@ -283,7 +343,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Cli {
                 Some(value) => options.glyphs = Some(value),
                 None => options
                     .warnings
-                    .push("--glyphs needs a value: solid, outline or ascii".to_string()),
+                    .push("--glyphs needs a value: image, solid, outline or ascii".to_string()),
             },
             _ => match arg.strip_prefix("--glyphs=") {
                 Some(value) => options.glyphs = Some(value.to_string()),
@@ -370,10 +430,14 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, MouseButton, MouseEventKind};
 
+    use ratatui_image::picker::ProtocolType;
+
     use super::app::{Hit, Mode, Screen};
-    use super::glyphs::GlyphSet;
+    use super::board::CellSize;
+    use super::glyphs::{GlyphSet, ImageSupport};
+    use super::graphics::{Graphics, LateAnswers, picker_for};
     use super::test_support::engine::{REPLY_TIMEOUT, chars, key, mouse};
-    use super::test_support::uci_moves;
+    use super::test_support::{late_kitty_answer, uci_moves};
     use super::*;
     use crate::core::Color as Side;
     use crate::engine::{JevClient, MoveSource};
@@ -437,14 +501,23 @@ mod tests {
         let Cli::Play(options) = parse_args(args(&["--glyphs", "fancy"])) else {
             panic!("expected Play");
         };
-        let (set, warnings) = glyphs::initial_glyphs(options.glyphs.as_deref(), |_| None);
+        let (set, warnings) =
+            glyphs::initial_glyphs(options.glyphs.as_deref(), |_| None, ImageSupport::Off);
         assert_eq!(set, GlyphSet::Solid);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
     }
 
     #[test]
+    fn the_image_style_can_be_asked_for() {
+        assert_eq!(
+            parse_args(args(&["--glyphs", "image"])),
+            play(Some("image"), &[])
+        );
+    }
+
+    #[test]
     fn a_missing_glyphs_value_is_a_warning() {
-        let missing = "--glyphs needs a value: solid, outline or ascii";
+        let missing = "--glyphs needs a value: image, solid, outline or ascii";
         assert_eq!(parse_args(args(&["--glyphs"])), play(None, &[missing]));
         assert_eq!(
             parse_args(args(&["--glyphs", "--glyphs=ascii"])),
@@ -496,12 +569,14 @@ mod tests {
             "JEV_MAX_OPTIONS",
             "JEV_FILTER_LOSING",
             "RCHESS_GLYPHS",
+            "RCHESS_IMAGES",
             "NO_COLOR",
             "COLORTERM",
         ] {
             assert!(USAGE.contains(name), "{name}");
         }
         assert!(USAGE.contains("Usage: chess "));
+        assert!(USAGE.contains("[--glyphs image|solid|outline|ascii]"));
         assert!(USAGE.lines().all(|line| line.chars().count() <= 80));
     }
 
@@ -517,6 +592,80 @@ mod tests {
             Some("stdin is not a terminal; run it in a terminal (see --help)")
         );
         assert!(terminal_problem(false, false).is_some());
+    }
+
+    // ----- start-up -----
+
+    fn options(glyphs: Option<&str>, warnings: &[&str]) -> Options {
+        let Cli::Play(options) = play(glyphs, warnings) else {
+            unreachable!("play() builds Cli::Play");
+        };
+        options
+    }
+
+    #[test]
+    fn a_graphics_protocol_starts_the_app_with_piece_images() {
+        let cell = CellSize::new(9, 18);
+        let graphics = Graphics {
+            picker: Some(picker_for(ProtocolType::Kitty, cell)),
+            cell_size: cell,
+            warning: None,
+            answers_pending: false,
+        };
+        let app = build_app(options(None, &[]), local_engine(), graphics, |_| None);
+        assert_eq!(app.glyphs(), GlyphSet::Image);
+        assert!(app.images_available());
+        assert_eq!(
+            app.picker().map(|picker| picker.protocol_type()),
+            Some(ProtocolType::Kitty)
+        );
+        assert_eq!(app.cell_size(), cell);
+        assert!(app.warnings().is_empty(), "{:?}", app.warnings());
+    }
+
+    #[test]
+    fn a_failed_query_starts_solid_and_warns_after_the_other_notes() {
+        let warning = "graphics query: no answer within 1 s; images use half-blocks";
+        let graphics = Graphics {
+            picker: Some(picker_for(ProtocolType::Halfblocks, CellSize::DEFAULT)),
+            cell_size: CellSize::DEFAULT,
+            warning: Some(warning.to_string()),
+            answers_pending: true,
+        };
+        let unknown = r#"ignored unknown argument "--frob" (see --help)"#;
+        let app = build_app(
+            options(Some("fancy"), &[unknown]),
+            local_engine(),
+            graphics,
+            |_| None,
+        );
+        assert_eq!(app.glyphs(), GlyphSet::Solid);
+        assert!(app.images_available(), "Image stays in the cycle");
+        assert_eq!(
+            app.warnings(),
+            [
+                unknown,
+                "--glyphs: unknown glyph set \"fancy\" (expected image, solid, outline or \
+                 ascii); using solid",
+                warning,
+            ]
+        );
+    }
+
+    #[test]
+    fn without_images_the_app_has_no_picker() {
+        let get = |name: &str| (name == "NO_COLOR").then(|| "1".to_string());
+        let cell = CellSize::new(8, 16);
+        let app = build_app(options(None, &[]), local_engine(), Graphics::off(cell), get);
+        assert_eq!(app.glyphs(), GlyphSet::Outline);
+        assert!(!app.images_available());
+        assert!(app.picker().is_none());
+        assert!(app.no_color());
+        assert_eq!(
+            app.cell_size(),
+            cell,
+            "the font size still shapes the squares"
+        );
     }
 
     // ----- main loop -----
@@ -594,6 +743,44 @@ mod tests {
             unused_steps: steps.len(),
             in_flight,
         }
+    }
+
+    #[test]
+    fn a_late_graphics_answer_does_not_start_a_game_from_the_menu() {
+        let answer: Vec<AppEvent> = late_kitty_answer()
+            .into_iter()
+            .map(AppEvent::Term)
+            .collect();
+
+        // Typed as keys, the `3` in the answer starts Human vs Jev as Black.
+        let mut app = new_app();
+        let run = drive(
+            &mut app,
+            &AtomicI32::new(0),
+            vec![Step::Events(answer.clone()), Step::Signal],
+        );
+        run.result.expect("loop ends cleanly");
+        assert_eq!(app.mode(), Mode::HumanVsJev { human: Side::Black });
+
+        let graphics = Graphics {
+            answers_pending: true,
+            ..Graphics::off(CellSize::DEFAULT)
+        };
+        let now = Instant::now();
+        let mut late = LateAnswers::after(&graphics, now);
+        let mut batch = answer;
+        drop_late_answers(&mut batch, &mut late, now);
+        let mut app = new_app();
+        let run = drive(
+            &mut app,
+            &AtomicI32::new(0),
+            vec![Step::Events(batch), Step::Events(chars("q"))],
+        );
+        run.result.expect("q on the menu quits at once");
+        assert_eq!(run.unused_steps, 0);
+        assert!(app.should_quit());
+        assert_eq!(app.screen_name(), "menu");
+        assert!(uci_moves(app.game()).is_empty());
     }
 
     #[test]

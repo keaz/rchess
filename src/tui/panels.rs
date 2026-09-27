@@ -1302,7 +1302,7 @@ mod tests {
     use crate::core::{START_FEN, Square};
     use crate::tui::board::{square_at, square_rect};
     use crate::tui::event::AppEvent;
-    use crate::tui::glyphs::initial_glyphs;
+    use crate::tui::glyphs::{ImageSupport, initial_glyphs};
     use crate::tui::test_support::engine::{FakeEngine, JEV_STATUS};
     use crate::tui::test_support::harness::Harness;
     use crate::tui::test_support::{PROMOTION_FEN, game_from, sq};
@@ -2276,7 +2276,7 @@ mod tests {
     fn snapshot_menu() {
         let engine =
             FakeEngine::local().with_warnings(&["JEV_TIMEOUT_MS is not a number; using 20000"]);
-        let (_, glyph_warnings) = initial_glyphs(Some("fancy"), |_| None);
+        let (_, glyph_warnings) = initial_glyphs(Some("fancy"), |_| None, ImageSupport::Off);
         let h = Harness::build(engine, (80, 24), glyph_warnings, |app| app);
         insta::assert_snapshot!("menu_80x24", h.terminal.backend());
     }

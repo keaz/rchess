@@ -50,6 +50,7 @@ use ratatui::crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::{Position as CellPosition, Rect};
+use ratatui_image::picker::Picker;
 
 use super::board::{BoardGeometry, CellSize, Highlights, square_at};
 use super::event::AppEvent;
@@ -600,6 +601,9 @@ pub struct App {
     /// The terminal shows no colour (`NO_COLOR`): the board marks highlights with text too.
     no_color: bool,
     glyphs: GlyphSet,
+    /// Draws piece images; `None` when images are off, which also keeps
+    /// [`GlyphSet::Image`] out of the `g` cycle.
+    picker: Option<Picker>,
     /// The terminal's font size, which shapes the board's squares.
     cell_size: CellSize,
     pick_side: fn() -> Side,
@@ -675,6 +679,7 @@ impl App {
             palette: glyphs::palette(truecolor),
             no_color: false,
             glyphs,
+            picker: None,
             cell_size: CellSize::DEFAULT,
             pick_side: random_side,
             today,
@@ -713,6 +718,15 @@ impl App {
     #[must_use]
     pub fn with_no_color(mut self, no_color: bool) -> App {
         self.no_color = no_color;
+        self
+    }
+
+    /// Sets the ratatui-image picker from the graphics query (spec 9.3). With one,
+    /// `g` offers [`GlyphSet::Image`]; without one (the default: images are off) it
+    /// cycles the text sets only.
+    #[must_use]
+    pub fn with_picker(mut self, picker: Option<Picker>) -> App {
+        self.picker = picker;
         self
     }
 
@@ -869,6 +883,16 @@ impl App {
     /// The piece glyph set.
     pub fn glyphs(&self) -> GlyphSet {
         self.glyphs
+    }
+
+    /// The picker that draws piece images (see [`with_picker`](Self::with_picker)).
+    pub fn picker(&self) -> Option<&Picker> {
+        self.picker.as_ref()
+    }
+
+    /// True when piece images can be drawn, so [`GlyphSet::Image`] is in the `g` cycle.
+    pub fn images_available(&self) -> bool {
+        self.picker.is_some()
     }
 
     /// The colours in use.
@@ -1735,7 +1759,7 @@ impl App {
     }
 
     fn cycle_glyphs(&mut self) {
-        self.glyphs = self.glyphs.next();
+        self.glyphs = self.glyphs.next(self.images_available());
         self.show(Message::info(format!("glyphs: {}", self.glyphs)));
     }
 
@@ -2309,10 +2333,12 @@ mod tests {
     use std::sync::mpsc;
 
     use ratatui::style::Modifier;
+    use ratatui_image::picker::ProtocolType;
 
     use super::*;
     use crate::core::{Position as ChessPosition, START_FEN};
     use crate::engine::{MoveSource, analyse};
+    use crate::tui::graphics;
     use crate::tui::panels::HELP_LINES;
     use crate::tui::test_support::engine::{FakeEngine, REPLY_TIMEOUT, chord, key, mouse, paste};
     use crate::tui::test_support::harness::{Harness, request};
@@ -3114,6 +3140,60 @@ mod tests {
         assert_eq!(h.app.status_line(), "new game");
         h.char('m');
         assert_eq!(h.app.screen_name(), "menu", "no moves: nothing to lose");
+    }
+
+    #[test]
+    fn without_images_the_glyph_cycle_has_only_text_styles() {
+        let mut h = hvh();
+        assert!(!h.app.images_available());
+        assert!(h.app.picker().is_none());
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            h.char('g');
+            seen.push(h.app.glyphs());
+        }
+        assert_eq!(
+            seen,
+            [
+                GlyphSet::Outline,
+                GlyphSet::Ascii,
+                GlyphSet::Solid,
+                GlyphSet::Outline
+            ]
+        );
+    }
+
+    #[test]
+    fn with_a_picker_the_image_style_joins_the_glyph_cycle() {
+        let picker = graphics::picker_for(ProtocolType::Halfblocks, CellSize::DEFAULT);
+        let mut h = Harness::build(FakeEngine::local(), (80, 24), Vec::new(), |app| {
+            app.with_picker(Some(picker))
+        });
+        h.char('1');
+        assert!(h.app.images_available());
+        assert_eq!(
+            h.app.picker().map(|picker| picker.protocol_type()),
+            Some(ProtocolType::Halfblocks)
+        );
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            h.char('g');
+            seen.push(h.app.glyphs());
+        }
+        assert_eq!(
+            seen,
+            [
+                GlyphSet::Outline,
+                GlyphSet::Ascii,
+                GlyphSet::Image,
+                GlyphSet::Solid
+            ]
+        );
+        h.command(":glyphs");
+        h.command(":glyphs");
+        h.command(":glyphs");
+        assert_eq!(h.app.glyphs(), GlyphSet::Image);
+        assert_eq!(h.app.status_line(), "glyphs: image");
     }
 
     #[test]

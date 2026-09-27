@@ -1,7 +1,8 @@
 //! Terminal setup and teardown (spec 6.6).
 //!
-//! [`enter`] puts the terminal in raw mode on the alternate screen with
-//! click-and-drag mouse reporting and bracketed paste. [`leave`] undoes all of it
+//! [`enter`] puts the terminal in raw mode on the alternate screen, runs the
+//! caller's start-up step (the graphics query), then turns on click-and-drag
+//! mouse reporting and bracketed paste. [`leave`] undoes all of it
 //! and is reached on every exit path: a normal return or `?` error (through
 //! [`Guard`]), a panic on the UI thread (through the panic hook) and SIGINT,
 //! SIGTERM or SIGHUP (through the flag from [`register_signals`], which the main
@@ -95,9 +96,15 @@ impl Command for DisableClickMouse {
 }
 
 /// Sets up the terminal: raw mode and the alternate screen (`ratatui::try_init`),
-/// then click-and-drag mouse reporting and bracketed paste, then a thread-aware
-/// panic hook. Call it once, from the main thread, and hold a [`Guard`] for as
-/// long as the terminal is in use.
+/// then `before_input`, then click-and-drag mouse reporting and bracketed paste,
+/// then a thread-aware panic hook. Returns the terminal with what `before_input`
+/// returned. Call it once, from the main thread, and hold a [`Guard`] for as long
+/// as the terminal is in use.
+///
+/// `before_input` is for the graphics query (spec 9.3): it runs in raw mode, so
+/// the terminal's answers are not echoed, on the alternate screen, so nothing it
+/// writes stays on the main screen, and before any mouse or paste report can mix
+/// into the answers.
 ///
 /// The panic hook replaces the one `try_init` installs (ratatui's prints when its
 /// restore fails, which panics on a hung-up tty). A panic on the "main" thread
@@ -113,8 +120,9 @@ impl Command for DisableClickMouse {
 ///
 /// When there is no usable terminal (for example no controlling tty) or it
 /// rejects the setup sequences. Whatever was set up is restored first, and the
-/// panic hook is put back as it was.
-pub fn enter() -> io::Result<DefaultTerminal> {
+/// panic hook is put back as it was. `before_input` does not run when raw mode or
+/// the alternate screen could not be entered.
+pub fn enter<T>(before_input: impl FnOnce() -> T) -> io::Result<(DefaultTerminal, T)> {
     // Taken before `try_init` wraps it in ratatui's hook, which is then dropped.
     let original = panic::take_hook();
     let terminal = match ratatui::try_init() {
@@ -126,19 +134,21 @@ pub fn enter() -> io::Result<DefaultTerminal> {
         }
     };
     ACTIVE.store(true, Ordering::SeqCst);
+    let value = before_input();
     finish_enter(
         original,
         || execute!(stdout(), EnableClickMouse, EnableBracketedPaste),
         leave,
     )?;
-    Ok(terminal)
+    Ok((terminal, value))
 }
 
 /// The rest of [`enter`] once `try_init` succeeded: `enable` turns on mouse
 /// reporting and bracketed paste. If it fails, `undo` restores the terminal and
 /// `original` becomes the panic hook again (dropping ratatui's); otherwise the
 /// thread-aware hook replaces ratatui's. Until then ratatui's hook is in place,
-/// and nothing in between can panic.
+/// which restores the terminal too (only without the care for a hung-up tty);
+/// the start-up step that runs in between does not panic.
 fn finish_enter(
     original: PanicHook,
     enable: impl FnOnce() -> io::Result<()>,

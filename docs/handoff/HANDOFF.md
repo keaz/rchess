@@ -6,8 +6,8 @@ Read this first. Follow the protocol in section 8 of
 ## Current
 Sub-project: tui-polish | Plan: docs/superpowers/plans/2026-09-27-tui-polish.md
 Branch: feat/tui-polish
-Last completed task: tui-polish task 3 (Full-screen layout with font-shaped squares)
-Next task: tui-polish task 4 (graphics detection and the image style)
+Last completed task: tui-polish task 4 (Graphics detection and the Image style)
+Next task: tui-polish task 5 (board image rendering)
 State: green (except 3 pre-existing old-code test failures)
 
 ## Verify before continuing
@@ -139,6 +139,7 @@ Run `cargo run` in a real terminal (Ghostty, Kitty, WezTerm or Alacritty) and ch
 - None.
 
 ## Log (newest first)
+- 2026-09-28 tui-polish task 4 done: Graphics detection and the Image style
 - 2026-09-27 tui-polish task 3 done: Full-screen layout with font-shaped squares
 - 2026-09-27 tui-polish task 2 done: Engine: record the Jev exchange for debug mode
 - 2026-09-27 tui-polish task 1 done: Piece images, dependencies and the picture compositor
