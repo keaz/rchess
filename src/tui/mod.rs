@@ -6,4 +6,8 @@
 //! builds the computer player, sets up the terminal and runs the main loop
 //! until the user quits or a signal asks it to stop.
 
+pub mod board;
 pub mod glyphs;
+
+#[cfg(test)]
+mod test_support;

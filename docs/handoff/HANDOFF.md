@@ -6,8 +6,8 @@ Read this first. Follow the protocol in section 8 of
 ## Current
 Sub-project: tui | Plan: docs/superpowers/plans/2026-09-27-tui.md
 Branch: feat/tui
-Last completed task: tui task 1 (dependencies, module root and glyphs)
-Next task: tui task 2 (board widget)
+Last completed task: tui task 2 (board widget and hit-testing)
+Next task: tui task 3 (move text and command line)
 State: green (except 3 pre-existing old-code test failures)
 
 ## Verify before continuing
@@ -73,6 +73,7 @@ INSTA_UPDATE=no cargo test --lib tui::
 - None.
 
 ## Log (newest first)
+- 2026-09-27 tui task 2 done: board widget and hit-testing
 - 2026-09-27 tui task 1 done: dependencies, module root and glyphs
 - 2026-09-27 TUI plan written (7 tasks, ~15k lines incl. verified code and 19 snapshots); replay counts 20/39/81/103/139/250/272, pty smoke test green; spec 6 synced with the prototype.
 - 2026-09-27 TUI brainstorming: spec section 6 revised (terminal guard, thread-aware panic hook, signals, stale-reply check, lenient move text, glyph sets, dev opt-level 3, snapshot tests).
