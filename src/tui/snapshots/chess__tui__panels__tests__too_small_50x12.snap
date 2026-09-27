@@ -1,0 +1,16 @@
+---
+source: src/tui/panels.rs
+expression: h.terminal.backend()
+---
+"                                                  "
+"                                                  "
+"                                                  "
+"                                                  "
+"                                                  "
+"          Terminal too small (need 60×20)         "
+"                                                  "
+"                                                  "
+"                                                  "
+"                                                  "
+"                                                  "
+"                                                  "

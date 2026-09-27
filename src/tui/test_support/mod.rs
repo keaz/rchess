@@ -15,6 +15,7 @@
 //! the test itself or by a fake engine on a worker thread.
 
 pub(crate) mod engine;
+pub(crate) mod harness;
 
 use std::fs;
 use std::path::{Path, PathBuf};

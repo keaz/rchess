@@ -6,12 +6,14 @@
 //! builds the computer player, sets up the terminal and runs the main loop
 //! until the user quits or a signal asks it to stop.
 
+pub mod app;
 pub mod board;
 pub mod event;
 pub mod files;
 pub mod glyphs;
 pub mod input;
 pub mod movetext;
+pub mod panels;
 pub mod terminal;
 pub mod worker;
 

@@ -1,0 +1,24 @@
+---
+source: src/tui/panels.rs
+expression: h.terminal.backend()
+---
+"┌ Board ────────────────────┐┌ Status ─── You (B) vs Local ┐"
+"│                           ││ White to move (Local search)│"
+"│                           ││ | Local search... 0.0s      │"
+"│                           ││                             │"
+"│ 1 ♜  ♞  ♝  ♚  ♛  ♝  ♞  ♜  │├ Local search ───────────────┤"
+"│ 2 ♟︎  ♟︎  ♟︎  ♟︎  ♟︎  ♟︎  ♟︎  ♟︎  ││ No JEV_API_KEY — local      │"
+"│ 3                         ││ search                      │"
+"│ 4                         ││ no move yet                 │"
+"│ 5                         │├ Moves ──────────────────────┤"
+"│ 6                         ││ no moves yet                │"
+"│ 7 ♟︎  ♟︎  ♟︎  ♟︎  ♟︎  ♟︎  ♟︎  ♟︎  ││                             │"
+"│ 8 ♜  ♞  ♝  ♚  ♛  ♝  ♞  ♜  ││                             │"
+"│   h  g  f  e  d  c  b  a  ││                             │"
+"│                           ││                             │"
+"│                           ││                             │"
+"│                           ││                             │"
+"└───────────────────────────┘├ Captured ───────────────────┤"
+"┌ Command ──────────────────┐│ White                       │"
+"│ / move  : command  ? help ││ Black                       │"
+"└───────────────────────────┘└─────────────────────────────┘"
