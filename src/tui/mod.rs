@@ -928,6 +928,70 @@ mod tests {
     }
 
     #[test]
+    fn debug_mode_from_the_environment_logs_an_exchange_privately() {
+        // What `run` does with `RCHESS_DEBUG=1`: `build_app` finds the log path in the
+        // environment, and the first traced move creates the folders and the file. The
+        // binary cannot make a Jev request offline, so a fake engine records one.
+        let dir = TempDir::new("debug-env");
+        let (state, home) = (dir.join("state"), dir.join("home"));
+        let explicit = state.join("explicit").join("jev.jsonl");
+        let default = state.join("rchess").join("jev-debug.jsonl");
+        for (log_var, expected) in [(Some(&explicit), &explicit), (None, &default)] {
+            let mut vars = vec![
+                ("RCHESS_DEBUG", "1".to_string()),
+                ("XDG_STATE_HOME", state.display().to_string()),
+                ("HOME", home.display().to_string()),
+            ];
+            if let Some(path) = log_var {
+                vars.push(("RCHESS_DEBUG_LOG", path.display().to_string()));
+            }
+            let get = |name: &str| {
+                vars.iter()
+                    .find(|(var, _)| *var == name)
+                    .map(|(_, value)| value.clone())
+            };
+            let engine = Arc::new(FakeEngine::jev().scripted([Turn::Traced("e2e4")]));
+            let mut app = build_app(
+                Options::default(),
+                engine,
+                Graphics::off(CellSize::DEFAULT),
+                get,
+            );
+            assert!(app.debug_mode(), "RCHESS_DEBUG=1 without --debug");
+            let run = drive(
+                &mut app,
+                &AtomicI32::new(0),
+                vec![Step::Events(chars("3")), Step::AwaitEngine, Step::Signal],
+            );
+            run.result.expect("loop ends cleanly");
+            assert_eq!(uci_moves(app.game()), ["e2e4"]);
+            app.close_debug_log(Duration::from_secs(10));
+
+            let log = std::fs::read_to_string(expected).expect("log written");
+            let lines: Vec<&str> = log.lines().collect();
+            assert_eq!(lines.len(), 1, "{log}");
+            let line: serde_json::Value = serde_json::from_str(lines[0]).expect("JSON line");
+            assert_eq!(line["played"], "e4");
+            assert_eq!(line["stale"], false);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = |path: &std::path::Path| {
+                    std::fs::metadata(path)
+                        .expect("exists")
+                        .permissions()
+                        .mode()
+                        & 0o777
+                };
+                assert_eq!(mode(expected), 0o600, "{}", expected.display());
+                assert_eq!(mode(expected.parent().expect("folder")), 0o700);
+                assert_eq!(mode(&state), 0o700, "missing folders are made private");
+            }
+        }
+        assert!(!home.exists(), "HOME is the last resort");
+    }
+
+    #[test]
     fn a_human_vs_human_session_plays_e4_and_quits_after_confirmation() {
         let mut app = new_app();
         let quit = AtomicI32::new(0);

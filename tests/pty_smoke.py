@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pseudo-terminal smoke test for the rchess TUI (spec 6.6/6.7, contract A7).
+"""Pseudo-terminal smoke test for the rchess TUI (spec 6.6/6.7 and 9.3/9.4).
 
 Not run by cargo: `python3 tests/pty_smoke.py [--release] [--no-build]`.
 
@@ -9,11 +9,29 @@ nothing touches the network), drives it with keystrokes or signals, and checks:
 
 * setup writes ?1049h, then ?1000h ?1002h ?1006h (click-and-drag mouse, SGR)
   and ?2004h (bracketed paste), and never ?1003h (any-motion) or ?1015h;
+* RCHESS_IMAGES=off is set unless a scenario is about the graphics query, so
+  the query is skipped and none of its bytes are written;
 * the menu and the game render (a tiny terminal emulator rebuilds the screen);
 * `1`, `/e4<Enter>`, `Esc`, `q`, `y` plays 1. e4 and quits after confirmation,
   and `qh5<Enter>` typed on the board does not quit (the question defaults to No);
 * `3` (play Black against the computer) gets a first move from the engine
   thread, and without a key the screen calls the computer "Local search";
+  without debug mode `d` says so;
+* --debug (and RCHESS_DEBUG=1) against the local search: the Status border says
+  DEBUG, `d` shows an exchange view with "no Jev requests yet", and no debug log
+  is created, since no Jev request was made;
+* the graphics query (spec 9.3), on a pty that
+  - never answers: the query is written once, in raw mode, between ?1049h and
+    ?1000h; start-up goes on after about 1 s with a menu warning, keys typed
+    afterwards work, half-block pictures are in the `g` cycle, and the terminal
+    is restored;
+  - answers late, while the menu is up: the answer does not act as key presses
+    (its `3` would start a game);
+  - gets SIGTERM or hangs up while the query waits: the process ends by that
+    signal at once, SIGTERM with the terminal restored;
+  - answers like Kitty: start-up goes on at once, the answer is not echoed,
+    Image is the starting style and pieces are kitty pictures (unicode
+    placeholders);
 * exit writes ?1006l ?1002l ?1000l ?2004l and then ?1049l, then only shows the
   cursor again (?25h) and draws nothing on the main screen, exits with status 0,
   and leaves the pty's termios exactly as it was before the program started
@@ -61,6 +79,17 @@ SETUP = [b"\x1b[?1049h", b"\x1b[?1000h", b"\x1b[?1002h", b"\x1b[?1006h", b"\x1b[
 TEARDOWN = [b"\x1b[?1006l", b"\x1b[?1002l", b"\x1b[?1000l", b"\x1b[?2004l", b"\x1b[?1049l"]
 FORBIDDEN = [b"\x1b[?1003h", b"\x1b[?1015h"]
 SHOW_CURSOR = b"\x1b[?25h"
+# The graphics query (ratatui-image's Parser::query): the kitty probe comes first
+# and the status report request ends it.
+QUERY_START = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\"
+QUERY_END = b"\x1b[5n"
+QUERY_PARTS = [QUERY_START, b"\x1b[c", b"\x1b[16t", QUERY_END]
+# What Kitty answers: graphics OK, device attributes without sixel, a 9x18 pixel
+# cell and the status report.
+KITTY_ANSWER = b"\x1b_Gi=31;OK\x1b\\\x1b[?62;c\x1b[6;18;9t\x1b[0n"
+QUERY_WARNING = "graphics query: no answer within 1 s"
+# Kitty's unicode placeholder: every cell of a kitty picture holds one.
+PLACEHOLDER = "\U0010EEEE"
 SECRET_VARS = ("JEV_API_KEY", "TYPESAFE_API_KEY")
 
 failures = []
@@ -93,8 +122,10 @@ CSI = re.compile(r"\x1b\[([0-9;?]*)[ -/]*([@-~])")
 class Screen:
     """Replays the byte stream onto a grid: cursor moves, clears and printable text.
 
-    Colours are ignored. Zero-width characters (such as U+FE0E after the pawn) join
-    the previous cell. Only the alternate screen is kept.
+    Colours are ignored. Zero-width characters (such as U+FE0E after the pawn, or
+    the diacritics after a kitty placeholder) join the previous cell. Kitty and
+    sixel pictures (APC and DCS strings) are skipped; their placeholder cells are
+    text. Only the alternate screen is kept.
     """
 
     def __init__(self, text):
@@ -166,6 +197,12 @@ class Screen:
                     if not ends:
                         return
                     i = min(ends) + (1 if text[min(ends)] == "\x07" else 2)
+                elif text[i + 1 : i + 2] in ("_", "P", "^", "X"):
+                    # APC (kitty graphics), DCS (sixel), PM and SOS run to ST.
+                    end = text.find("\x1b\\", i + 2)
+                    if end < 0:
+                        return
+                    i = end + 2
                 else:
                     i += 2
                 continue
@@ -198,6 +235,8 @@ HOME = tempfile.TemporaryDirectory(prefix="rchess-pty-home-")
 
 
 def child_env(extra=None):
+    """The child's whole environment. Images are off, so the graphics query is
+    skipped, unless `extra` maps RCHESS_IMAGES to None (None removes a variable)."""
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": HOME.name,
@@ -205,10 +244,19 @@ def child_env(extra=None):
         "LANG": "en_US.UTF-8",
         "LC_ALL": "en_US.UTF-8",
         "COLORTERM": "truecolor",
+        "RCHESS_IMAGES": "off",
     }
-    env.update(extra or {})
+    for name, value in (extra or {}).items():
+        if value is None:
+            env.pop(name, None)
+        else:
+            env[name] = value
     assert not any(v in env for v in SECRET_VARS)
     return env
+
+
+# The environment for the scenarios that ask the terminal about graphics.
+QUERY_ENV = {"RCHESS_IMAGES": None}
 
 
 class App:
@@ -328,7 +376,9 @@ class App:
 # ----- checks shared by the scenarios -----
 
 
-def check_setup(app):
+def check_setup(app, query=False):
+    """Checks the setup sequences; with `query`, that the graphics query is written
+    once, between ?1049h and ?1000h, and otherwise that none of it is written."""
     check(app.wait_bytes(SETUP[-1]), "setup sequences arrive")
     offsets = ordered(app.stream, SETUP)
     check(
@@ -336,6 +386,17 @@ def check_setup(app):
         "setup order: ?1049h, ?1000h, ?1002h, ?1006h, ?2004h",
         f"offsets {offsets}",
     )
+    if query:
+        offsets = ordered(app.stream, SETUP[:1] + QUERY_PARTS + SETUP[1:2])
+        check(
+            offsets is not None,
+            "graphics query between ?1049h and ?1000h, status report last",
+            f"offsets {offsets}",
+        )
+        check(app.stream.count(QUERY_START) == 1, "the query is written once")
+    else:
+        sent = [part for part in QUERY_PARTS if part in app.stream]
+        check(not sent, "images off: no graphics query", f"found {sent}")
 
 
 def check_teardown(app, after, label):
@@ -429,7 +490,13 @@ def scenario_computer_opens(binary):
             "Jev" not in text.replace("JEV_API_KEY", ""),
             "without a key the screen never says Jev",
         )
+        check("DEBUG" not in text, "no DEBUG tag without debug mode")
         app.screen().show("computer opened")
+        app.send(b"d")
+        check(
+            app.wait_screen("debug mode is off (start with"),
+            "d says debug mode is off",
+        )
         app.send(b"q")
         check(app.wait_screen("Quit the game in progress?"), "q asks for confirmation")
         quit_at = len(app.stream)
@@ -622,6 +689,222 @@ def scenario_arguments(binary):
         app.close()
 
 
+def scenario_debug(binary, via_env):
+    how = "RCHESS_DEBUG=1" if via_env else "--debug"
+    print(f"scenario: {how} against the local search: DEBUG tag, an empty exchange view, no log")
+    state = tempfile.TemporaryDirectory(prefix="rchess-pty-debug-")
+    log = os.path.join(state.name, "logs", "jev.jsonl")
+    env = {"RCHESS_DEBUG_LOG": log}
+    if via_env:
+        env["RCHESS_DEBUG"] = "1"
+    app = App(binary, args=[] if via_env else ["--debug"], env=env)
+    try:
+        check_setup(app)
+        check(app.wait_screen("1. Human vs Human"), "menu renders")
+        app.send(b"3", settle=0)
+        check(app.wait_screen("Black to move", timeout=10.0), "the computer played White's first move")
+        check("DEBUG" in app.screen().text(), "the Status border says DEBUG")
+        app.send(b"d")
+        check(app.wait_screen("no Jev requests yet"), "d opens the exchange view, which has nothing yet")
+        app.screen().show("exchange view")
+        app.send(b"\x1b", settle=0.3)
+        text = app.screen().text()
+        check(
+            "no Jev requests yet" not in text and "Black to move" in text,
+            "Esc goes back to the board",
+        )
+        app.send(b"q")
+        check(app.wait_screen("Quit the game in progress?"), "q asks for confirmation")
+        quit_at = len(app.stream)
+        app.send(b"y", settle=0)
+        check(app.wait_exit(), "process exits after y")
+        check(app.status == 0, "exit status 0", f"status {app.status}")
+        check_teardown(app, quit_at, f"quit in {how}")
+        check(
+            not os.path.exists(os.path.dirname(log)),
+            "no Jev request, so no debug log (not even its folder)",
+        )
+        check(
+            not os.path.exists(os.path.join(HOME.name, ".local")),
+            "nothing under ~/.local/state either",
+        )
+    finally:
+        app.close()
+        state.cleanup()
+
+
+def wait_for_query(app):
+    """Waits for the whole graphics query; the time it arrived, or None."""
+    if not app.wait_bytes(QUERY_END):
+        return None
+    return time.monotonic()
+
+
+def check_no_query_text(app, label):
+    """The rebuilt screen shows no piece of the query or of an answer as text."""
+    text = app.screen().text()
+    parts = ("Gi=31", "AAAA", "[16t", "[5n", "i=31;OK", "62;c", "6;18;9t", "[0n")
+    shown = [part for part in parts if part in text]
+    check(not shown, f"{label}: no query or answer text on screen", f"found {shown}")
+
+
+def scenario_query_unanswered(binary):
+    print("scenario: the graphics query on a pty that never answers; start-up goes on after 1 s")
+    app = App(binary, env=QUERY_ENV)
+    try:
+        asked = wait_for_query(app)
+        check(asked is not None, "the graphics query is written")
+        lflag = termios.tcgetattr(app.master)[3]
+        check(
+            not lflag & termios.ECHO and not lflag & termios.ICANON,
+            "the query is written in raw mode, so no answer would be echoed",
+        )
+        check(app.wait_bytes(SETUP[1]), "mouse capture follows the query")
+        if asked is not None:
+            waited = time.monotonic() - asked
+            check(0.9 <= waited <= 2.0, "start-up goes on after about 1 s", f"{waited:.2f}s")
+        check_setup(app, query=True)
+        check(app.wait_screen("1. Human vs Human"), "menu renders")
+        check(QUERY_WARNING in app.screen().text(), "the menu warns that the query got no answer")
+        check_no_query_text(app, "menu")
+        app.screen().show("menu after an unanswered query")
+        app.send(b"1")
+        check(app.wait_screen("White to move"), "keys typed after start-up work (1 starts a game)")
+        app.send(b"g")
+        check(app.wait_screen("glyphs: outline"), "the style was Solid (g goes on to Outline)")
+        app.send(b"gg")
+        check(app.wait_screen("glyphs: image"), "Image is still in the g cycle")
+        text = app.screen().text()
+        check("▀" in text or "▄" in text, "pieces are drawn with half-blocks")
+        app.screen().show("half-block pictures")
+        app.send(b"q")
+        check(app.wait_screen("Quit the game in progress?"), "q asks for confirmation")
+        quit_at = len(app.stream)
+        app.send(b"y", settle=0)
+        check(app.wait_exit(), "process exits after y")
+        check(app.status == 0, "exit status 0", f"status {app.status}")
+        check_teardown(app, quit_at, "quit after an unanswered query")
+    finally:
+        app.close()
+
+
+def scenario_query_late_answer(binary):
+    print("scenario: the terminal answers the graphics query after the deadline, on the menu")
+    app = App(binary, env=QUERY_ENV)
+    try:
+        asked = wait_for_query(app)
+        check(asked is not None, "the graphics query is written")
+        check(app.wait_screen(QUERY_WARNING), "the menu is up, with the query warning")
+        if asked is not None:
+            app.idle(max(0.0, asked + 1.3 - time.monotonic()))
+        # Read as keys, the answer's `3` would start Human vs Jev as Black.
+        os.write(app.master, KITTY_ANSWER)
+        app.idle(1.0)
+        text = app.screen().text()
+        check(
+            "1. Human vs Human" in text and "to move" not in text,
+            "the late answer does not act as key presses",
+        )
+        check_no_query_text(app, "menu after the late answer")
+        quit_at = len(app.stream)
+        sent = time.monotonic()
+        app.send(b"q", settle=0)
+        check(app.wait_exit(), "q quits from the menu")
+        check(app.status == 0, "exit status 0", f"status {app.status}")
+        if app.exited_at is not None:
+            check(app.exited_at - sent < 1.0, "at once", f"{app.exited_at - sent:.2f}s")
+        check_teardown(app, quit_at, "quit after a late answer")
+    finally:
+        app.close()
+
+
+def scenario_query_signal(binary):
+    print("scenario: SIGTERM while the graphics query waits; restored at once, dies by SIGTERM")
+    app = App(binary, env=QUERY_ENV)
+    try:
+        check(wait_for_query(app) is not None, "the graphics query is written")
+        app.idle(0.2)
+        signal_at = len(app.stream)
+        sent = time.monotonic()
+        os.kill(app.pid, signal.SIGTERM)
+        exited = app.wait_exit(timeout=3.0)
+        check(exited, "process exits after SIGTERM")
+        if exited:
+            took = app.exited_at - sent
+            check(app.status == -signal.SIGTERM, "terminated by SIGTERM", f"status {app.status}")
+            # The query checks for a quit signal every 50 ms instead of waiting out its 1 s.
+            check(took < 0.5, "without waiting for the query's deadline", f"{took:.2f}s")
+        check_teardown(app, signal_at, "SIGTERM during the query")
+    finally:
+        app.close()
+
+
+def scenario_query_hangup(binary):
+    print("scenario: the terminal hangs up while the graphics query waits; it dies by SIGHUP")
+    app = App(binary, env=QUERY_ENV)
+    try:
+        check(wait_for_query(app) is not None, "the graphics query is written")
+        app.idle(0.2)
+        for name in ("slave", "master"):
+            os.close(getattr(app, name))
+            setattr(app, name, None)
+        sent = time.monotonic()
+        status = None
+        while status is None and time.monotonic() < sent + 5.0:
+            pid, raw = os.waitpid(app.pid, os.WNOHANG)
+            if pid:
+                status = os.waitstatus_to_exitcode(raw)
+            else:
+                time.sleep(0.01)
+        app.status = status
+        check(status is not None, "process exits after the hangup")
+        if status is not None:
+            took = time.monotonic() - sent
+            check(status == -signal.SIGHUP, "terminated by SIGHUP", f"status {status}, {took:.3f}s")
+    finally:
+        app.close()
+
+
+def scenario_query_kitty(binary):
+    print("scenario: the pty answers the graphics query like Kitty; pieces are pictures")
+    app = App(binary, env=QUERY_ENV)
+    try:
+        check(wait_for_query(app) is not None, "the graphics query is written")
+        answered_at = len(app.stream)
+        answered = time.monotonic()
+        os.write(app.master, KITTY_ANSWER)
+        check(app.wait_bytes(SETUP[1]), "mouse capture follows the answer")
+        waited = time.monotonic() - answered
+        check(waited < 0.5, "start-up goes on as soon as the answer is complete", f"{waited:.2f}s")
+        check_setup(app, query=True)
+        check(app.wait_screen("1. Human vs Human"), "menu renders")
+        check(QUERY_WARNING not in app.screen().text(), "no query warning")
+        app.send(b"1")
+        check(app.wait_screen("White to move"), "Human vs Human starts")
+        check(
+            b"i=31;OK" not in app.stream and b"6;18;9t" not in app.stream,
+            "the answer is not echoed",
+        )
+        check(b"a=T,U=1" in app.stream[answered_at:], "pieces are sent as kitty pictures")
+        check_no_query_text(app, "board")
+        board = app.screen().text()
+        check(board.count(PLACEHOLDER) > 0, "the board shows the pictures' placeholder cells")
+        check("♜" not in board, "no solid glyphs while the pictures are shown")
+        app.screen().show("kitty pictures (placeholders show as their character)")
+        app.send(b"g")
+        check(app.wait_screen("glyphs: solid"), "the style was Image (g goes on to Solid)")
+        check("♜" in app.screen().text(), "then the pieces are solid glyphs")
+        app.send(b"q")
+        check(app.wait_screen("Quit the game in progress?"), "q asks for confirmation")
+        quit_at = len(app.stream)
+        app.send(b"y", settle=0)
+        check(app.wait_exit(), "process exits after y")
+        check(app.status == 0, "exit status 0", f"status {app.status}")
+        check_teardown(app, quit_at, "quit after kitty pictures")
+    finally:
+        app.close()
+
+
 def scenario_help(binary):
     print("scenario: --help prints usage without touching the terminal")
     app = App(binary, args=["--help"])
@@ -698,10 +981,17 @@ def main():
     if not os.access(binary, os.X_OK):
         sys.exit(f"no binary at {binary}; build it first")
     print(f"binary: {binary}")
-    print(f"pty: {COLS}x{ROWS}, env without {' / '.join(SECRET_VARS)}")
+    print(f"pty: {COLS}x{ROWS}, env without {' / '.join(SECRET_VARS)}; RCHESS_IMAGES=off but for the query")
 
     scenario_play_and_quit(binary)
     scenario_computer_opens(binary)
+    for via_env in (False, True):
+        scenario_debug(binary, via_env)
+    scenario_query_unanswered(binary)
+    scenario_query_late_answer(binary)
+    scenario_query_signal(binary)
+    scenario_query_hangup(binary)
+    scenario_query_kitty(binary)
     for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         scenario_signal(binary, signum)
     scenario_signal(binary, signal.SIGTERM, repeat=2)
