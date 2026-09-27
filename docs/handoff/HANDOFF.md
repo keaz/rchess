@@ -6,8 +6,8 @@ Read this first. Follow the protocol in section 8 of
 ## Current
 Sub-project: tui-polish | Plan: docs/superpowers/plans/2026-09-27-tui-polish.md
 Branch: feat/tui-polish
-Last completed task: tui-polish task 4 (Graphics detection and the Image style)
-Next task: tui-polish task 5 (board image rendering)
+Last completed task: tui-polish task 5 (Draw pieces as pictures)
+Next task: tui-polish task 6 (debug mode)
 State: green (except 3 pre-existing old-code test failures)
 
 ## Verify before continuing
@@ -91,6 +91,7 @@ Run `cargo run` in a real terminal (Ghostty, Kitty, WezTerm or Alacritty) and ch
   - 6.2 layout: the move list writes a game that starts with Black to move as `12. ...  Kd7` (B6), not `12... Kd7`; PGN export is unchanged.
   - 6.1: `run` also refuses a non-terminal stdin, not only stdout (B5).
 - TUI task 6 fix round 1: `app.rs`'s `apply_outcome` now clears `self.message` in the `EngineOutcome::Move` arm (before the `recovered` check) once the computer's move has been played, so an error set while the engine was thinking (a stray typed move, "asking the engine again", "took back N move(s)") no longer survives into the human's next turn. Deviation from the plan's code (the brief's `apply_outcome` omits this clear), by fix-round ruling to close a verified review finding.
+- TUI task 5 (draw pieces as pictures): implemented as specified in the brief, no deviations. `INSTA_UPDATE=no cargo test --lib tui::` reports 371 passed (brief said 369); the extra 2 tests carry forward from the task 4 fix round's baseline (355 passed there vs. the brief's 353), same 16-test delta both times.
 - TUI task 4 fix round 1: `graphics.rs`'s `ask` no longer writes the capability query at all on non-unix platforms (it used to write it, then call `read_stdin_byte`, whose non-unix stub errors without reading anything, so the terminal's reply landed on the wire for crossterm to read as key presses once the event loop started). `ask` is now a thin wrapper around a new `ask_with(readable, write, read_byte, query, stop)` that returns `QueryError::Io(Unsupported)` before writing when `readable` (the platform constant `ANSWERS_READABLE`, true only on unix) is false; two new tests (`ask_writes_nothing_where_the_answers_cannot_be_read`, `ask_writes_then_reads_where_the_answers_can_be_read`) cover both branches on any platform via the injected writer/reader. Deviation from the plan's code (the brief's `ask` is unconditional), by fix-round ruling to close a verified review finding.
 
 ## Known open issues
@@ -140,6 +141,7 @@ Run `cargo run` in a real terminal (Ghostty, Kitty, WezTerm or Alacritty) and ch
 - None.
 
 ## Log (newest first)
+- 2026-09-28 tui-polish task 5 done: Draw pieces as pictures
 - 2026-09-28 tui-polish task 4 fix round 1: non-unix `ask` no longer writes the graphics query it cannot read the answer to (verified review finding); `tui::` 355 passed
 - 2026-09-28 tui-polish task 4 done: Graphics detection and the Image style
 - 2026-09-27 tui-polish task 3 done: Full-screen layout with font-shaped squares

@@ -1,4 +1,4 @@
-//! Board widget and flip-aware hit-testing (spec sections 6.3 and 9.2).
+//! Board widget and flip-aware hit-testing (spec sections 6.3, 9.2 and 9.3).
 //!
 //! [`layout_board`] picks a square size and places the board inside an area;
 //! the resulting [`BoardGeometry`] is used both to draw ([`BoardView`]) and to
@@ -11,21 +11,40 @@
 //!
 //! The widget draws only the 8×8 grid plus a rank-label column on the left and
 //! a file-label row underneath; any enclosing block is the caller's.
+//!
+//! In the [`GlyphSet::Image`] style a piece is a picture: the Cburnett image
+//! composited onto the square's colour
+//! ([`composite`](super::pieces::composite)) and drawn by the terminal's
+//! graphics protocol through a ratatui-image [`Picker`], in the square's
+//! [`image_area`]. Squares smaller than [`MIN_IMAGE_SQUARE`] show the Solid
+//! glyph instead. [`PieceImages`] keeps the encoded pictures between frames.
 
+use std::fmt;
+
+use image::DynamicImage;
 use ratatui::{
     buffer::{Buffer, Cell},
-    layout::{Position as CellPosition, Rect},
+    layout::{Position as CellPosition, Rect, Size},
     style::{Color, Modifier},
-    widgets::Widget,
+    widgets::{self, Widget},
 };
+use ratatui_image::picker::{Picker, ProtocolType};
+use ratatui_image::protocol::Protocol;
+use ratatui_image::{Image, Resize};
 
 use super::glyphs::{self, GlyphSet, Palette};
-use crate::core::{Color as Side, PieceKind, Position as ChessPosition, Square};
+use super::pieces::{ImageCache, ImageKey};
+use crate::core::{Color as Side, Piece, PieceKind, Position as ChessPosition, Square};
 
 /// The smallest square `(width, height)` in cells: one row, with room for the
 /// glyph and the cursor's `[` `]` on either side of it. A font so narrow that
 /// even one-row squares come out too wide for the area still gets this size.
 pub const MIN_SQUARE: (u16, u16) = (3, 1);
+
+/// The smallest square `(width, height)` in cells that shows a piece as a picture
+/// in the [`GlyphSet::Image`] style; smaller squares show the Solid glyph. Its
+/// [`image_area`] is 3×2 cells.
+pub const MIN_IMAGE_SQUARE: (u16, u16) = (5, 2);
 
 /// A terminal cell's size in pixels, which is the font size. It makes squares
 /// look square: see [`square_width`].
@@ -176,6 +195,105 @@ pub const fn is_light(sq: Square) -> bool {
     (sq.file() + sq.rank()) % 2 == 1
 }
 
+/// Where a picture of the piece on `square` goes: the square without its leftmost
+/// and rightmost columns, which stay text for the cursor's `[` `]` and the marks
+/// drawn without colour. `None` for a square smaller than [`MIN_IMAGE_SQUARE`].
+pub fn image_area(square: Rect) -> Option<Rect> {
+    let (min_width, min_height) = MIN_IMAGE_SQUARE;
+    (square.width >= min_width && square.height >= min_height)
+        .then(|| Rect::new(square.x + 1, square.y, square.width - 2, square.height))
+}
+
+/// Piece pictures kept between frames for the [`GlyphSet::Image`] style: the
+/// ratatui-image [`Protocol`] a picker made of each
+/// [`composite`](super::pieces::composite), one per [`ImageKey`], so a picture is
+/// scaled and encoded once and a piece that moves to a square of the same colour
+/// reuses it. A picture the picker could not encode is kept as `None`, and its
+/// square shows the glyph.
+///
+/// Every picture on a board has the same image area size. When a frame needs
+/// another size, or the picker another font or protocol, the pictures are dropped
+/// first (the squares or the font changed), so the cache holds at most one entry
+/// per piece and square colour in use.
+#[derive(Default)]
+pub struct PieceImages {
+    cache: ImageCache<Option<Protocol>>,
+    /// What the pictures in `cache` were made for.
+    made_for: Option<PictureFormat>,
+}
+
+/// Everything a board's pictures share, besides the piece and the colour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PictureFormat {
+    /// The image area in cells.
+    cells: (u16, u16),
+    /// The picker's font size in pixels.
+    font: (u16, u16),
+    protocol: ProtocolType,
+}
+
+impl PieceImages {
+    /// No pictures yet.
+    pub fn new() -> PieceImages {
+        PieceImages::default()
+    }
+
+    /// Number of pictures kept.
+    pub fn len(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// True when no picture is kept.
+    pub fn is_empty(&self) -> bool {
+        self.cache.is_empty()
+    }
+
+    /// The picture of `piece` on `background` (RGB) for an image area of `cells`,
+    /// drawn by `picker`: made on first use, `None` when the picker cannot encode it.
+    fn picture(
+        &mut self,
+        picker: &Picker,
+        piece: Piece,
+        background: [u8; 3],
+        cells: Size,
+    ) -> Option<&Protocol> {
+        let font = picker.font_size();
+        let format = PictureFormat {
+            cells: (cells.width, cells.height),
+            font: (font.width, font.height),
+            protocol: picker.protocol_type(),
+        };
+        if self.made_for != Some(format) {
+            self.cache.clear();
+            self.made_for = Some(format);
+        }
+        // The composite is exactly the area's size in pixels, so the picker encodes it
+        // as it is, without scaling it again.
+        let key = ImageKey::new(
+            piece,
+            background,
+            u32::from(cells.width) * u32::from(font.width),
+            u32::from(cells.height) * u32::from(font.height),
+        );
+        self.cache
+            .get_or_insert_with(key, |key| {
+                let image = DynamicImage::ImageRgba8(key.composite());
+                picker.new_protocol(image, cells, Resize::Fit(None)).ok()
+            })
+            .as_ref()
+    }
+}
+
+impl fmt::Debug for PieceImages {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Protocols hold encoded image data, and are not `Debug`.
+        f.debug_struct("PieceImages")
+            .field("len", &self.len())
+            .field("made_for", &self.made_for)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The cell that holds a square's glyph or target mark: the middle column
 /// and, for even heights, the upper of the two middle rows.
 fn glyph_cell(rect: Rect) -> CellPosition {
@@ -196,6 +314,9 @@ fn glyph_cell(rect: Rect) -> CellPosition {
 /// selected square is reversed, the last move's squares are underlined, a
 /// capture target gets `(` `)` and a king in check `+` `+` beside its glyph
 /// (the cursor's `[` `]` still win there).
+///
+/// A picture ([`GlyphSet::Image`]) is composited onto the square's background,
+/// highlight tints included.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Highlights {
     /// Origin and destination of the last move played (tinted).
@@ -214,6 +335,13 @@ pub struct Highlights {
 
 /// The board widget. Render it with any area: it draws into
 /// `geometry.outer` and clips to the area it is given.
+///
+/// In the [`GlyphSet::Image`] style with a [`picker`](Self::picker), pieces are
+/// pictures. Render it as a [`StatefulWidget`](widgets::StatefulWidget) with
+/// [`PieceImages`] to keep them between frames; as a plain [`Widget`] every
+/// picture is made afresh. A picture is drawn only when its whole image area is
+/// inside the area rendered to and clear of the [`overlays`](Self::overlays), so
+/// nothing is drawn over it.
 #[derive(Clone, Copy, Debug)]
 pub struct BoardView<'a> {
     /// Position to draw.
@@ -229,6 +357,16 @@ pub struct BoardView<'a> {
     /// The terminal shows no colour (`NO_COLOR`, see [`glyphs::no_color`]): mark
     /// the highlights with text and attributes as well as tints.
     pub no_color: bool,
+    /// Draws the pieces as pictures in the [`GlyphSet::Image`] style; without one
+    /// that style shows the Solid glyphs.
+    pub picker: Option<&'a Picker>,
+    /// Boxes drawn over the board after it (a dialog, the game-over box). A piece
+    /// whose image area meets one shows its glyph instead of its picture while the
+    /// box is up: a box would wipe the kitty picture's one-time transmission, or
+    /// leave its text on an iTerm2 or Sixel picture whose first cell it missed
+    /// (only that cell is ever sent). When the box closes, the picture is drawn
+    /// and sent whole.
+    pub overlays: &'a [Rect],
 }
 
 impl Widget for BoardView<'_> {
@@ -239,6 +377,22 @@ impl Widget for BoardView<'_> {
 
 impl Widget for &BoardView<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        widgets::StatefulWidget::render(self, area, buf, &mut PieceImages::new());
+    }
+}
+
+impl widgets::StatefulWidget for BoardView<'_> {
+    type State = PieceImages;
+
+    fn render(self, area: Rect, buf: &mut Buffer, images: &mut PieceImages) {
+        widgets::StatefulWidget::render(&self, area, buf, images);
+    }
+}
+
+impl widgets::StatefulWidget for &BoardView<'_> {
+    type State = PieceImages;
+
+    fn render(self, area: Rect, buf: &mut Buffer, images: &mut PieceImages) {
         let clip = area.intersection(*buf.area());
         if clip.is_empty() {
             return;
@@ -252,14 +406,14 @@ impl Widget for &BoardView<'_> {
             }
         }
         for sq in Square::all() {
-            self.render_square(sq, clip, buf);
+            self.render_square(sq, clip, buf, images);
         }
         self.render_labels(clip, buf);
     }
 }
 
 impl BoardView<'_> {
-    fn render_square(&self, sq: Square, clip: Rect, buf: &mut Buffer) {
+    fn render_square(&self, sq: Square, clip: Rect, buf: &mut Buffer, images: &mut PieceImages) {
         let rect = square_rect(&self.geometry, sq);
         let piece = self.position.piece_at(sq);
         let is_target = self.highlights.targets.contains(&sq);
@@ -273,7 +427,11 @@ impl BoardView<'_> {
                 cell.modifier = modifier;
             }
         }
-        if let Some(cell) = cell_in(buf, clip, glyph_cell(rect)) {
+        let picture = piece.and_then(|piece| self.picture(piece, rect, bg, clip, images));
+        let pictured = picture.is_some();
+        if let Some((area, protocol)) = picture {
+            Image::new(protocol).render(area, buf);
+        } else if let Some(cell) = cell_in(buf, clip, glyph_cell(rect)) {
             if let Some(piece) = piece {
                 let fg = match piece.color {
                     Side::White => self.palette.white_piece,
@@ -291,8 +449,36 @@ impl BoardView<'_> {
             self.render_cursor(rect, clip, buf);
         }
         if let Some((left, right)) = self.side_marks(sq, is_capture) {
-            self.render_side_marks(rect, (left, right), cursor, clip, buf);
+            // A picture leaves no room between the cursor's brackets.
+            let inside = rect.width >= 5 && !pictured;
+            self.render_side_marks(rect, (left, right), cursor, inside, clip, buf);
         }
+    }
+
+    /// The picture of `piece` on the square at `rect`, whose background is `bg`, and
+    /// the area it goes in. Only in the Image style with a picker, on a square of at
+    /// least [`MIN_IMAGE_SQUARE`] whose image area lies wholly inside `clip` and meets
+    /// none of the [`overlays`](Self::overlays), and on a background with a known RGB
+    /// value ([`glyphs::xterm_rgb`]); `None` otherwise, and the square shows the glyph.
+    fn picture<'i>(
+        &self,
+        piece: Piece,
+        rect: Rect,
+        bg: Color,
+        clip: Rect,
+        images: &'i mut PieceImages,
+    ) -> Option<(Rect, &'i Protocol)> {
+        if self.glyphs != GlyphSet::Image {
+            return None;
+        }
+        let picker = self.picker?;
+        let area = image_area(rect).filter(|&area| {
+            clip.intersection(area) == area
+                && !self.overlays.iter().any(|overlay| overlay.intersects(area))
+        })?;
+        let background = glyphs::xterm_rgb(bg)?;
+        let protocol = images.picture(picker, piece, background, area.as_size())?;
+        Some((area, protocol))
     }
 
     /// True when `sq` is the en passant square and the selected piece is a
@@ -353,14 +539,16 @@ impl BoardView<'_> {
     }
 
     /// Writes the `(left, right)` marks in the square's outer columns on the glyph row. Under
-    /// the cursor, whose `[` `]` hold the outer columns, they go just inside them (`[(p)]`);
-    /// a square too narrow for both keeps the cursor's `[` and the mark's right side
-    /// (`[p)`), so the cursor never hides the mark.
+    /// the cursor, whose `[` `]` hold the outer columns, they go just inside them (`[(p)]`)
+    /// when `inside` says there is room; a square too narrow for both, or with a picture
+    /// in its middle, keeps the cursor's `[` and the mark's right side (`[p)`), so the
+    /// cursor never hides the mark.
     fn render_side_marks(
         &self,
         rect: Rect,
         (left, right): (&'static str, &'static str),
         cursor: bool,
+        inside: bool,
         clip: Rect,
         buf: &mut Buffer,
     ) {
@@ -368,7 +556,7 @@ impl BoardView<'_> {
             return;
         }
         let (first, last) = (rect.left(), rect.right() - 1);
-        let columns = match (cursor, rect.width >= 5) {
+        let columns = match (cursor, inside) {
             (false, _) => [Some((first, left)), Some((last, right))],
             (true, true) => [Some((first + 1, left)), Some((last - 1, right))],
             (true, false) => [None, Some((last, right))],
@@ -439,10 +627,16 @@ fn cell_in(buf: &mut Buffer, clip: Rect, pos: CellPosition) -> Option<&mut Cell>
 
 #[cfg(test)]
 mod tests {
-    use ratatui::{Terminal, backend::TestBackend, style::Modifier, text::Span};
+    use image::DynamicImage;
+    use ratatui::{Terminal, backend::TestBackend, layout::Size, style::Modifier, text::Span};
+    use ratatui_image::picker::{Picker, ProtocolType};
+    use ratatui_image::{Image, Resize};
 
     use super::*;
-    use crate::tui::glyphs::{SOLID_PAWN, palette};
+    use crate::core::Piece;
+    use crate::tui::glyphs::{SOLID_PAWN, palette, xterm_rgb};
+    use crate::tui::graphics::picker_for;
+    use crate::tui::pieces::composite;
     use crate::tui::test_support::sq;
 
     /// Square sizes the default font gives for heights 1 to 4.
@@ -495,6 +689,8 @@ mod tests {
                         palette: &pal,
                         highlights,
                         no_color,
+                        picker: None,
+                        overlays: &[],
                     },
                     area,
                 );
@@ -1158,6 +1354,8 @@ mod tests {
             palette: &pal,
             highlights: &highlights,
             no_color: false,
+            picker: None,
+            overlays: &[],
         };
         view.render(Rect::new(0, 0, 10, 5), &mut buf);
         assert_eq!(buf[(9, 1)].bg, pal.dark, "b8 is dark");
@@ -1177,5 +1375,569 @@ mod tests {
 
     fn geometry_at(x: u16, y: u16) -> BoardGeometry {
         geometry(3, 1, x, y, false)
+    }
+
+    // ----- pictures (the Image style) -----
+
+    /// Kings on e1 (dark) and e8 (light) and White's knight on g1 (dark).
+    const KINGS_AND_KNIGHT: &str = "4k3/8/8/8/8/8/8/4K1N1 w - - 0 1";
+    /// Black's rook on a1 (dark) checks White's king on e1 (dark).
+    const ROOK_CHECK: &str = "4k3/8/8/8/8/8/8/r3K3 w - - 0 1";
+
+    const WHITE_KING: Piece = Piece::new(Side::White, PieceKind::King);
+
+    fn fen(fen: &str) -> ChessPosition {
+        ChessPosition::from_fen(fen).expect("valid FEN")
+    }
+
+    fn halfblocks(font: CellSize) -> Picker {
+        picker_for(ProtocolType::Halfblocks, font)
+    }
+
+    /// A board in the Image style, drawn by a half-blocks picker.
+    struct Scene {
+        size: (u16, u16),
+        /// The font the squares are shaped for.
+        cell: CellSize,
+        position: ChessPosition,
+        highlights: Highlights,
+        palette: Palette,
+        no_color: bool,
+        picker: Option<Picker>,
+        /// Boxes drawn over the board.
+        overlays: Vec<Rect>,
+    }
+
+    impl Scene {
+        /// `fen` on a `width`×`height` terminal with the default font and truecolor.
+        fn new(width: u16, height: u16, position: &str) -> Scene {
+            Scene {
+                size: (width, height),
+                cell: CellSize::DEFAULT,
+                position: fen(position),
+                highlights: Highlights::default(),
+                palette: palette(true),
+                no_color: false,
+                picker: Some(halfblocks(CellSize::DEFAULT)),
+                overlays: Vec::new(),
+            }
+        }
+
+        fn view(&self, geometry: BoardGeometry) -> BoardView<'_> {
+            BoardView {
+                position: &self.position,
+                geometry,
+                glyphs: GlyphSet::Image,
+                palette: &self.palette,
+                highlights: &self.highlights,
+                no_color: self.no_color,
+                picker: self.picker.as_ref(),
+                overlays: &self.overlays,
+            }
+        }
+
+        /// Draws the board into a fresh `TestBackend`, keeping the pictures in `images`.
+        fn draw(&self, images: &mut PieceImages) -> (Terminal<TestBackend>, BoardGeometry) {
+            let (width, height) = self.size;
+            let mut terminal =
+                Terminal::new(TestBackend::new(width, height)).expect("test backend");
+            let mut saved = None;
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    let geometry = layout_board(area, false, self.cell).expect("board fits");
+                    saved = Some(geometry);
+                    frame.render_stateful_widget(self.view(geometry), area, images);
+                })
+                .expect("draw");
+            (terminal, saved.expect("drawn"))
+        }
+    }
+
+    /// `piece` on `background` drawn by `picker` into `area` on its own: what the board
+    /// should show there.
+    fn picture(picker: &Picker, piece: Piece, background: Color, area: Rect) -> Buffer {
+        let font = picker.font_size();
+        let image = composite(
+            piece,
+            xterm_rgb(background).expect("a palette colour"),
+            u32::from(area.width) * u32::from(font.width),
+            u32::from(area.height) * u32::from(font.height),
+        );
+        let protocol = picker
+            .new_protocol(
+                DynamicImage::ImageRgba8(image),
+                area.as_size(),
+                Resize::Fit(None),
+            )
+            .expect("half-blocks always encode");
+        assert_eq!(protocol.size(), Size::new(area.width, area.height));
+        let mut buf = Buffer::empty(area);
+        Image::new(&protocol).render(area, &mut buf);
+        buf
+    }
+
+    /// The cells of `area` in `buf`, as a buffer of their own.
+    fn cut(buf: &Buffer, area: Rect) -> Buffer {
+        let mut part = Buffer::empty(area);
+        for pos in area.positions() {
+            part[pos] = buf[pos].clone();
+        }
+        part
+    }
+
+    /// The half-block picture in `area` as text between `|`, two lines per row of
+    /// cells: ` ` for the square's colour `background`, `#` for dark pixels (Black's
+    /// pieces, White's outlines), `o` for light ones (White's fill) and `+` for the
+    /// tones between.
+    fn pixels(buf: &Buffer, area: Rect, background: Color) -> String {
+        let [r, g, b] = xterm_rgb(background).expect("a palette colour");
+        let background = Color::Rgb(r, g, b);
+        let shade = |color: Color| match color {
+            _ if color == background => ' ',
+            Color::Rgb(r, g, b) => {
+                let luma =
+                    (2126 * u32::from(r) + 7152 * u32::from(g) + 722 * u32::from(b)) / 10_000;
+                match luma {
+                    0..64 => '#',
+                    64..=192 => '+',
+                    _ => 'o',
+                }
+            }
+            other => panic!("{other:?} is not a half-block colour"),
+        };
+        let mut lines = Vec::new();
+        for row in area.rows() {
+            let (mut upper, mut lower) = (String::from("|"), String::from("|"));
+            for pos in row.positions() {
+                let cell = &buf[pos];
+                // `▄` draws the lower half in the foreground; `▀` and ` ` the upper one.
+                let (top, bottom) = if cell.symbol() == "\u{2584}" {
+                    (cell.bg, cell.fg)
+                } else {
+                    (cell.fg, cell.bg)
+                };
+                upper.push(shade(top));
+                lower.push(shade(bottom));
+            }
+            lines.push(upper + "|");
+            lines.push(lower + "|");
+        }
+        lines.join("\n")
+    }
+
+    /// True when a half-block cell shows nothing but `background`.
+    fn plain(cell: &Cell, background: Color) -> bool {
+        let [r, g, b] = xterm_rgb(background).expect("a palette colour");
+        let rgb = Color::Rgb(r, g, b);
+        cell.symbol() == " " && cell.fg == rgb && cell.bg == rgb
+    }
+
+    #[test]
+    fn the_image_area_leaves_the_outer_columns_to_text() {
+        assert_eq!(MIN_IMAGE_SQUARE, (5, 2));
+        assert_eq!(
+            image_area(Rect::new(10, 5, 5, 2)),
+            Some(Rect::new(11, 5, 3, 2))
+        );
+        assert_eq!(
+            image_area(Rect::new(0, 0, 15, 7)),
+            Some(Rect::new(1, 0, 13, 7))
+        );
+        for (width, height) in [(3, 1), (3, 2), (5, 1), (4, 2), (0, 0)] {
+            assert_eq!(
+                image_area(Rect::new(0, 0, width, height)),
+                None,
+                "{width}x{height}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_half_blocks_picture_fills_the_image_area() {
+        let scene = Scene::new(185, 89, KINGS_AND_KNIGHT);
+        let picker = scene.picker.clone().expect("a picker");
+        let pal = scene.palette;
+        let knight = Piece::new(Side::White, PieceKind::Knight);
+        let (terminal, g) = scene.draw(&mut PieceImages::new());
+        assert_eq!((g.square_w, g.square_h), (23, 11));
+        let buf = terminal.backend().buffer();
+
+        // g1 is dark; its outer columns are plain text cells.
+        let g1 = square_rect(&g, sq("g1"));
+        for y in g1.top()..g1.bottom() {
+            for x in [g1.left(), g1.right() - 1] {
+                let cell = &buf[(x, y)];
+                assert_eq!((cell.symbol(), cell.bg), (" ", pal.dark), "({x}, {y})");
+            }
+        }
+        // Between them is exactly the picture the picker makes of the composite: the
+        // square's colour around the knight, the knight in the middle, no glyph.
+        let area = image_area(g1).expect("a 23x11 square has room");
+        assert_eq!(cut(buf, area), picture(&picker, knight, pal.dark, area));
+        for corner in [
+            (area.left(), area.top()),
+            (area.right() - 1, area.top()),
+            (area.left(), area.bottom() - 1),
+            (area.right() - 1, area.bottom() - 1),
+        ] {
+            assert!(
+                plain(&buf[corner], pal.dark),
+                "{corner:?}: {:?}",
+                buf[corner]
+            );
+        }
+        assert!(!plain(&buf[glyph_cell(area)], pal.dark));
+        assert!(
+            area.positions()
+                .all(|pos| ["\u{2580}", "\u{2584}", " "].contains(&buf[pos].symbol())),
+            "only half-blocks"
+        );
+        insta::assert_snapshot!("image_halfblocks_knight_23x11", pixels(buf, area, pal.dark));
+
+        // Drawn again from scratch, and as a plain widget without a cache: the same cells.
+        let (again, _) = scene.draw(&mut PieceImages::new());
+        assert_eq!(again.backend().buffer(), buf);
+        let mut uncached = Buffer::empty(*buf.area());
+        scene.view(g).render(*buf.area(), &mut uncached);
+        assert_eq!(&uncached, buf);
+    }
+
+    #[test]
+    fn pictures_are_kept_and_reused_on_squares_of_the_same_colour() {
+        let mut images = PieceImages::new();
+        // White's king on dark e1, Black's on light e8, a white pawn on light a2.
+        let mut scene = Scene::new(57, 25, "4k3/8/8/8/8/8/P7/4K3 w - - 0 1");
+        let picker = scene.picker.clone().expect("a picker");
+        scene.draw(&mut images);
+        assert_eq!(images.len(), 3);
+
+        // The king steps to d2, dark too, and the pawn is gone: nothing new is built, the
+        // king's picture is reused, and the pawn's is kept.
+        scene.position = fen("4k3/8/8/8/8/8/3K4/8 w - - 0 1");
+        let (terminal, g) = scene.draw(&mut images);
+        assert_eq!(images.len(), 3);
+        let d2 = image_area(square_rect(&g, sq("d2"))).expect("room");
+        assert_eq!(
+            cut(terminal.backend().buffer(), d2),
+            picture(&picker, WHITE_KING, scene.palette.dark, d2)
+        );
+
+        // On light e2 the king needs another picture; back home, it needs none.
+        scene.position = fen("4k3/8/8/8/8/8/4K3/8 w - - 0 1");
+        scene.draw(&mut images);
+        assert_eq!(images.len(), 4);
+        scene.position = fen("4k3/8/8/8/8/8/P7/4K3 w - - 0 1");
+        scene.draw(&mut images);
+        assert_eq!(images.len(), 4);
+    }
+
+    #[test]
+    fn each_highlight_colour_gets_its_own_picture() {
+        let mut scene = Scene::new(57, 25, ROOK_CHECK);
+        let picker = scene.picker.clone().expect("a picker");
+        let pal = scene.palette;
+        let mut images = PieceImages::new();
+        scene.draw(&mut images);
+        assert_eq!(images.len(), 3);
+
+        let steps = [
+            (
+                Highlights {
+                    check: Some(sq("e1")),
+                    ..Highlights::default()
+                },
+                "e1",
+                pal.check,
+            ),
+            (
+                Highlights {
+                    selected: Some(sq("e1")),
+                    check: Some(sq("e1")),
+                    ..Highlights::default()
+                },
+                "e1",
+                pal.selected,
+            ),
+            (
+                Highlights {
+                    targets: vec![sq("a1")],
+                    ..Highlights::default()
+                },
+                "a1",
+                pal.target,
+            ),
+            (
+                Highlights {
+                    last_move: Some((sq("a8"), sq("a1"))),
+                    ..Highlights::default()
+                },
+                "a1",
+                pal.last_move,
+            ),
+        ];
+        for (count, (highlights, name, tint)) in (4..).zip(steps) {
+            scene.highlights = highlights;
+            let (terminal, g) = scene.draw(&mut images);
+            assert_eq!(images.len(), count, "{name} on {tint:?}");
+            let area = image_area(square_rect(&g, sq(name))).expect("room");
+            let piece = scene.position.piece_at(sq(name)).expect("a piece");
+            assert_eq!(
+                cut(terminal.backend().buffer(), area),
+                picture(&picker, piece, tint, area),
+                "{name} on {tint:?}"
+            );
+        }
+
+        // Plain colours again: the first pictures are still there.
+        scene.highlights = Highlights::default();
+        scene.draw(&mut images);
+        assert_eq!(images.len(), 7);
+    }
+
+    #[test]
+    fn squares_too_small_for_a_picture_show_the_solid_glyph() {
+        let glyph = glyphs::glyph(GlyphSet::Solid, WHITE_KING);
+        // (terminal, font the squares are shaped for, square size)
+        let cases = [
+            ((31, 11), CellSize::DEFAULT, (3, 1)),
+            ((41, 9), CellSize::new(5, 20), (5, 1)),
+            ((25, 17), CellSize::new(12, 12), (3, 2)),
+        ];
+        for ((width, height), cell, size) in cases {
+            let mut scene = Scene::new(width, height, KINGS_AND_KNIGHT);
+            scene.cell = cell;
+            let mut images = PieceImages::new();
+            let (terminal, g) = scene.draw(&mut images);
+            assert_eq!((g.square_w, g.square_h), size);
+            let e1 = &terminal.backend().buffer()[glyph_cell(square_rect(&g, Square::E1))];
+            assert_eq!(
+                (e1.symbol(), e1.fg),
+                (glyph, scene.palette.white_piece),
+                "{size:?}"
+            );
+            assert!(images.is_empty(), "{size:?}: a picture was built");
+        }
+
+        // From 5×2 on, pictures.
+        let mut scene = Scene::new(41, 17, KINGS_AND_KNIGHT);
+        let mut images = PieceImages::new();
+        let (terminal, g) = scene.draw(&mut images);
+        assert_eq!((g.square_w, g.square_h), MIN_IMAGE_SQUARE);
+        assert_eq!(images.len(), 3);
+        let e1 = glyph_cell(square_rect(&g, Square::E1));
+        assert_ne!(terminal.backend().buffer()[e1].symbol(), glyph);
+
+        // Without a picker the Image style is the Solid glyphs.
+        scene.picker = None;
+        let mut images = PieceImages::new();
+        let (terminal, _) = scene.draw(&mut images);
+        assert_eq!(terminal.backend().buffer()[e1].symbol(), glyph);
+        assert!(images.is_empty());
+    }
+
+    #[test]
+    fn another_square_size_or_font_replaces_the_pictures() {
+        let mut images = PieceImages::new();
+        let mut scene = Scene::new(41, 17, KINGS_AND_KNIGHT);
+        scene.draw(&mut images);
+        assert_eq!(images.len(), 3);
+
+        // Bigger squares: the small pictures are dropped, not kept beside the new ones.
+        scene.size = (57, 25);
+        scene.draw(&mut images);
+        assert_eq!(images.len(), 3);
+
+        // Another font gives the same squares other pixel sizes.
+        let font = CellSize::new(8, 16);
+        scene.picker = Some(halfblocks(font));
+        let (terminal, g) = scene.draw(&mut images);
+        assert_eq!(images.len(), 3);
+        let area = image_area(square_rect(&g, Square::E1)).expect("room");
+        assert_eq!(
+            cut(terminal.backend().buffer(), area),
+            picture(&halfblocks(font), WHITE_KING, scene.palette.dark, area)
+        );
+    }
+
+    #[test]
+    fn the_cursor_and_the_no_colour_marks_stay_beside_a_picture() {
+        let mut scene = Scene::new(57, 25, ROOK_CHECK);
+        let picker = scene.picker.clone().expect("a picker");
+        let pal = scene.palette;
+        let rook = Piece::new(Side::Black, PieceKind::Rook);
+
+        // The cursor's brackets and tint take the outer columns; the picture is whole.
+        scene.highlights.cursor = Some(sq("e1"));
+        let (terminal, g) = scene.draw(&mut PieceImages::new());
+        let buf = terminal.backend().buffer();
+        let e1 = square_rect(&g, sq("e1"));
+        for y in e1.top()..e1.bottom() {
+            assert_eq!(buf[(e1.left(), y)].bg, pal.cursor);
+            assert_eq!(buf[(e1.right() - 1, y)].bg, pal.cursor);
+        }
+        let row = glyph_cell(e1).y;
+        assert_eq!(buf[(e1.left(), row)].symbol(), "[");
+        assert_eq!(buf[(e1.right() - 1, row)].symbol(), "]");
+        let area = image_area(e1).expect("room");
+        assert_eq!(cut(buf, area), picture(&picker, WHITE_KING, pal.dark, area));
+
+        // Without colour the marks sit in the outer columns too, and under the cursor,
+        // which holds those, the mark keeps its right side, as on a narrow square.
+        scene.no_color = true;
+        let cases = [
+            ("a1", None, "(", ")", rook, pal.target),
+            ("a1", Some("a1"), "[", ")", rook, pal.target),
+            ("e1", None, "+", "+", WHITE_KING, pal.check),
+            ("e1", Some("e1"), "[", "+", WHITE_KING, pal.check),
+        ];
+        for (name, cursor, left, right, piece, tint) in cases {
+            scene.highlights = Highlights {
+                targets: vec![sq("a1")],
+                check: Some(sq("e1")),
+                cursor: cursor.map(sq),
+                ..Highlights::default()
+            };
+            let (terminal, g) = scene.draw(&mut PieceImages::new());
+            let buf = terminal.backend().buffer();
+            let rect = square_rect(&g, sq(name));
+            let row = glyph_cell(rect).y;
+            assert_eq!(
+                (
+                    buf[(rect.left(), row)].symbol(),
+                    buf[(rect.right() - 1, row)].symbol()
+                ),
+                (left, right),
+                "{name} cursor {cursor:?}"
+            );
+            let area = image_area(rect).expect("room");
+            assert_eq!(
+                cut(buf, area),
+                picture(&picker, piece, tint, area),
+                "{name} cursor {cursor:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_targets_keep_their_dots_beside_pictures() {
+        let mut scene = Scene::new(57, 25, KINGS_AND_KNIGHT);
+        scene.highlights = Highlights {
+            selected: Some(sq("g1")),
+            targets: vec![sq("e2"), sq("f3"), sq("h3")],
+            ..Highlights::default()
+        };
+        let (terminal, g) = scene.draw(&mut PieceImages::new());
+        let buf = terminal.backend().buffer();
+        for name in ["e2", "f3", "h3"] {
+            let rect = square_rect(&g, sq(name));
+            let dot = glyph_cell(rect);
+            assert_eq!(
+                (buf[dot].symbol(), buf[dot].fg),
+                (".", scene.palette.black_piece),
+                "{name}"
+            );
+            assert!(
+                rect.positions()
+                    .all(|pos| pos == dot || buf[pos].symbol() == " "),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn pictures_on_the_256_colour_palette_use_the_xterm_colours() {
+        // Big squares, so the picture's corners are far enough from the king to be exact.
+        let mut scene = Scene::new(121, 57, KINGS_AND_KNIGHT);
+        scene.palette = palette(false);
+        let picker = scene.picker.clone().expect("a picker");
+        let (terminal, g) = scene.draw(&mut PieceImages::new());
+        let buf = terminal.backend().buffer();
+        let e1 = square_rect(&g, Square::E1);
+        // The text cells keep the index; the picture is composited onto xterm's #875F00.
+        assert_eq!(buf[(e1.left(), e1.top())].bg, Color::Indexed(94));
+        let area = image_area(e1).expect("room");
+        let corner = &buf[(area.left(), area.top())];
+        assert_eq!(
+            (corner.symbol(), corner.fg, corner.bg),
+            (
+                " ",
+                Color::Rgb(0x87, 0x5F, 0x00),
+                Color::Rgb(0x87, 0x5F, 0x00)
+            )
+        );
+        assert_eq!(
+            cut(buf, area),
+            picture(&picker, WHITE_KING, Color::Indexed(94), area)
+        );
+    }
+
+    #[test]
+    fn a_picture_the_area_cuts_off_is_drawn_as_the_glyph() {
+        let scene = Scene::new(57, 25, KINGS_AND_KNIGHT);
+        let full = Rect::new(0, 0, 57, 25);
+        let g = layout_board(full, false, CellSize::DEFAULT).expect("fits");
+        // Rank 1 takes rows 21 to 23; the area stops after row 22.
+        let e1 = square_rect(&g, Square::E1);
+        assert_eq!((e1.y, e1.height), (21, 3));
+        let mut buf = Buffer::empty(full);
+        let mut images = PieceImages::new();
+        ratatui::widgets::StatefulWidget::render(
+            scene.view(g),
+            Rect::new(0, 0, 57, 23),
+            &mut buf,
+            &mut images,
+        );
+        let glyph = &buf[glyph_cell(e1)];
+        assert_eq!(
+            (glyph.symbol(), glyph.fg),
+            (
+                glyphs::glyph(GlyphSet::Solid, WHITE_KING),
+                scene.palette.white_piece
+            )
+        );
+        assert_eq!(buf[(e1.x, 23)], Cell::EMPTY);
+        // Only Black's king, on rank 8, has its whole image area inside.
+        assert_eq!(images.len(), 1);
+    }
+
+    #[test]
+    fn a_piece_under_a_box_shows_its_glyph_until_the_box_closes() {
+        let mut scene = Scene::new(57, 25, KINGS_AND_KNIGHT);
+        let picker = scene.picker.clone().expect("a picker");
+        let full = Rect::new(0, 0, 57, 25);
+        let g = layout_board(full, false, CellSize::DEFAULT).expect("fits");
+        let (e1, g1) = (square_rect(&g, Square::E1), square_rect(&g, sq("g1")));
+        // A box over one cell of g1's picture, its last one, and nothing of e1's.
+        let g1_area = image_area(g1).expect("room");
+        scene.overlays = vec![Rect::new(g1_area.right() - 1, g1_area.bottom() - 1, 4, 2)];
+        let mut images = PieceImages::new();
+        let (terminal, _) = scene.draw(&mut images);
+        let buf = terminal.backend().buffer();
+        let knight = Piece::new(Side::White, PieceKind::Knight);
+        let glyph = &buf[glyph_cell(g1)];
+        assert_eq!(
+            (glyph.symbol(), glyph.fg),
+            (
+                glyphs::glyph(GlyphSet::Solid, knight),
+                scene.palette.white_piece
+            )
+        );
+        let e1_area = image_area(e1).expect("room");
+        assert_eq!(
+            cut(buf, e1_area),
+            picture(&picker, WHITE_KING, scene.palette.dark, e1_area)
+        );
+        // No picture is made for the covered knight.
+        assert_eq!(images.len(), 2);
+
+        // The box closes: the knight is a picture again.
+        scene.overlays.clear();
+        let (terminal, _) = scene.draw(&mut images);
+        assert_eq!(
+            cut(terminal.backend().buffer(), g1_area),
+            picture(&picker, knight, scene.palette.dark, g1_area)
+        );
+        assert_eq!(images.len(), 3);
     }
 }

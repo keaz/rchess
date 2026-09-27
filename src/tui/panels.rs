@@ -3,7 +3,9 @@
 //! [`draw`] renders an [`App`] through its public accessors only: the menu, the playing
 //! screen's panels, the game-over overlay, the top dialog and the too-small notice. It
 //! returns the [`HitMap`] of everything clickable, which the app keeps for the next mouse
-//! event, and the move-list scroll clamped to what the list can show.
+//! event, and the move-list scroll clamped to what the list can show. The board's piece
+//! pictures (the Image style) are kept in the [`PieceImages`] the app lends it, and are
+//! not drawn where the game-over box or a dialog will cover them.
 //!
 //! Playing layout: the screen fills the terminal. The left column holds the Board block,
 //! sized for the largest board that fits beside the narrowest side column
@@ -43,7 +45,7 @@ use super::app::{
     Message, Mode, PROMOTION_CHOICES, Question, Screen, SidePick, TOO_SMALL, WAITING_FOR_ENGINE,
     is_too_small, move_rows, outcome_text,
 };
-use super::board::{BoardGeometry, BoardView, CellSize, layout_board};
+use super::board::{BoardGeometry, BoardView, CellSize, PieceImages, layout_board};
 use super::glyphs::{self, ELLIPSIS, GlyphSet, Palette, char_width};
 use super::input::LineEditor;
 use crate::core::{Color as Side, Game, Piece, PieceKind, Position as ChessPosition};
@@ -112,8 +114,9 @@ pub struct Drawn {
 }
 
 /// Draws `app` into `frame` and returns the click targets and the clamped move-list
-/// scroll. `now` is used for the thinking spinner only.
-pub fn draw(app: &App, frame: &mut Frame, now: Instant) -> Drawn {
+/// scroll. `images` keeps the board's piece pictures between frames (the Image style).
+/// `now` is used for the thinking spinner only.
+pub fn draw(app: &App, images: &mut PieceImages, frame: &mut Frame, now: Instant) -> Drawn {
     let mut drawn = Drawn {
         hits: HitMap::default(),
         move_scroll: app.move_scroll(),
@@ -123,11 +126,12 @@ pub fn draw(app: &App, frame: &mut Frame, now: Instant) -> Drawn {
         too_small(frame, area);
         return drawn;
     }
+    let overlays = overlays(app, area);
     match app.screen() {
         Screen::Menu => menu(frame, area, app, &mut drawn.hits),
-        Screen::Playing => playing(frame, area, app, now, &mut drawn),
+        Screen::Playing => playing(frame, area, app, images, &overlays, now, &mut drawn),
         Screen::GameOver => {
-            playing(frame, area, app, now, &mut drawn);
+            playing(frame, area, app, images, &overlays, now, &mut drawn);
             game_over(frame, area, app, &mut drawn.hits);
         }
     }
@@ -389,8 +393,17 @@ fn playing_layout(
     }
 }
 
-/// The board, the command box and the side panels.
-fn playing(frame: &mut Frame, area: Rect, app: &App, now: Instant, drawn: &mut Drawn) {
+/// The board, the command box and the side panels. `overlays` are the boxes drawn over
+/// them afterwards (see [`overlays`]).
+fn playing(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    images: &mut PieceImages,
+    overlays: &[Rect],
+    now: Instant,
+    drawn: &mut Drawn,
+) {
     let text_width = side_text_width(area, app.cell_size());
     let jev = (app.mode() != Mode::HumanVsHuman)
         .then(|| JevText::new(app.last_computer(), app.engine_status(), text_width));
@@ -400,7 +413,7 @@ fn playing(frame: &mut Frame, area: Rect, app: &App, now: Instant, drawn: &mut D
         status_rows(app.mode(), area.height),
         jev.as_ref().map(JevText::rows),
     );
-    drawn.hits.board = board_panel(frame, layout.board, app);
+    drawn.hits.board = board_panel(frame, layout.board, app, images, overlays);
     command_panel(
         frame,
         layout.command,
@@ -429,8 +442,15 @@ fn playing(frame: &mut Frame, area: Rect, app: &App, now: Instant, drawn: &mut D
     );
 }
 
-/// The Board block with the board centred in it; returns the geometry for hit-testing.
-fn board_panel(frame: &mut Frame, area: Rect, app: &App) -> Option<BoardGeometry> {
+/// The Board block with the board centred in it, its pictures clear of `overlays`; returns
+/// the geometry for hit-testing.
+fn board_panel(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    images: &mut PieceImages,
+    overlays: &[Rect],
+) -> Option<BoardGeometry> {
     let block = Block::bordered()
         .title(" Board ")
         .padding(Padding::horizontal(1));
@@ -438,7 +458,7 @@ fn board_panel(frame: &mut Frame, area: Rect, app: &App) -> Option<BoardGeometry
     frame.render_widget(block, area);
     let geometry = layout_board(inner, app.flipped(), app.cell_size())?;
     let highlights = app.highlights();
-    frame.render_widget(
+    frame.render_stateful_widget(
         BoardView {
             position: app.game().position(),
             geometry,
@@ -446,8 +466,11 @@ fn board_panel(frame: &mut Frame, area: Rect, app: &App) -> Option<BoardGeometry
             palette: app.palette(),
             highlights: &highlights,
             no_color: app.no_color(),
+            picker: app.picker(),
+            overlays,
         },
         inner,
+        images,
     );
     Some(geometry)
 }
@@ -926,12 +949,27 @@ fn piece_span(piece: Piece, glyph_set: GlyphSet, palette: &Palette) -> Span<'sta
 
 // ----- overlays -----
 
+/// Where the boxes drawn over the playing screen go in `area`: the game-over box (on its
+/// screen, once the game has an outcome) and the top dialog. The board keeps its pictures
+/// clear of them ([`BoardView::overlays`]).
+fn overlays(app: &App, area: Rect) -> Vec<Rect> {
+    let game_over = (app.screen() == Screen::GameOver && app.game().outcome().is_some())
+        .then(|| game_over_rect(area));
+    let dialog = app.dialog().map(|top| dialog_rect(area, top));
+    game_over.into_iter().chain(dialog).collect()
+}
+
+/// Where the game-over box goes in `area`.
+fn game_over_rect(area: Rect) -> Rect {
+    centered(area, 46, 7)
+}
+
 /// The game-over overlay: the result and the New game / Save PGN / Menu buttons.
 fn game_over(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap) {
     let Some(outcome) = app.game().outcome() else {
         return;
     };
-    let inner = dialog_frame(frame, centered(area, 46, 7), "Game over");
+    let inner = dialog_frame(frame, game_over_rect(area), "Game over");
     frame.render_widget(
         Line::from(outcome_text(outcome)).bold().centered(),
         row_of(inner, 0),
@@ -961,18 +999,40 @@ fn game_over(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap) {
     frame.render_widget(Line::from(hint).dim().centered(), row_of(inner, 4));
 }
 
+/// Where the dialog `top` goes in `area`.
+fn dialog_rect(area: Rect, top: &Dialog) -> Rect {
+    match top {
+        Dialog::Help => {
+            let height = u16::try_from(HELP_LINES.len()).map_or(u16::MAX, |n| n.saturating_add(2));
+            centered(area, 60, height)
+        }
+        Dialog::Promotion { .. } => centered(area, 58, 5),
+        Dialog::Input { .. } => centered(area, 66, 8),
+        Dialog::Confirm { question, .. } => {
+            let text_width = CONFIRM_WIDTH.saturating_sub(4);
+            let text_rows = confirm_lines(question)
+                .iter()
+                .map(|line| wrapped_height(line, text_width))
+                .fold(0u16, u16::saturating_add);
+            // Borders, text, gap, buttons.
+            centered(area, CONFIRM_WIDTH, text_rows.saturating_add(4))
+        }
+    }
+}
+
 /// Draws the top dialog and records its targets (none for help: any click closes it).
 fn dialog(frame: &mut Frame, area: Rect, app: &App, top: &Dialog, hits: &mut HitMap) {
+    let rect = dialog_rect(area, top);
     match top {
-        Dialog::Help => help(frame, area),
-        Dialog::Promotion { choice, .. } => promotion(frame, area, *choice, app, hits),
+        Dialog::Help => help(frame, rect),
+        Dialog::Promotion { choice, .. } => promotion(frame, rect, *choice, app, hits),
         Dialog::Input {
             purpose,
             editor,
             error,
         } => input(
             frame,
-            area,
+            rect,
             top.title(),
             *purpose,
             editor,
@@ -980,15 +1040,13 @@ fn dialog(frame: &mut Frame, area: Rect, app: &App, top: &Dialog, hits: &mut Hit
             hits,
         ),
         Dialog::Confirm { question, yes } => {
-            confirm(frame, area, top.title(), question, *yes, hits)
+            confirm(frame, rect, top.title(), question, *yes, hits)
         }
     }
 }
 
-/// Keys and commands.
-fn help(frame: &mut Frame, area: Rect) {
-    let height = u16::try_from(HELP_LINES.len()).map_or(u16::MAX, |n| n.saturating_add(2));
-    let rect = centered(area, 60, height);
+/// Keys and commands, in `rect`.
+fn help(frame: &mut Frame, rect: Rect) {
     frame.render_widget(Clear, rect);
     let block =
         dialog_block("Help").title_bottom(Line::from(" Esc or click closes ").right_aligned());
@@ -1008,11 +1066,11 @@ fn help(frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/// The promotion picker: Queen, Rook, Bishop and Knight buttons in the colour of the side
-/// to move (the one promoting), `choice` highlighted.
-fn promotion(frame: &mut Frame, area: Rect, choice: usize, app: &App, hits: &mut HitMap) {
+/// The promotion picker in `rect`: Queen, Rook, Bishop and Knight buttons in the colour
+/// of the side to move (the one promoting), `choice` highlighted.
+fn promotion(frame: &mut Frame, rect: Rect, choice: usize, app: &App, hits: &mut HitMap) {
     let side = app.game().position().side_to_move();
-    let inner = dialog_frame(frame, centered(area, 58, 5), "Promote to");
+    let inner = dialog_frame(frame, rect, "Promote to");
     let buttons = PROMOTION_CHOICES
         .iter()
         .enumerate()
@@ -1039,17 +1097,18 @@ fn promotion(frame: &mut Frame, area: Rect, choice: usize, app: &App, hits: &mut
     );
 }
 
-/// A text field dialog: prompt, field with the terminal cursor, error and buttons.
+/// A text field dialog in `rect`: prompt, field with the terminal cursor, error and
+/// buttons.
 fn input(
     frame: &mut Frame,
-    area: Rect,
+    rect: Rect,
     title: &str,
     purpose: InputPurpose,
     editor: &LineEditor,
     error: Option<&Message>,
     hits: &mut HitMap,
 ) {
-    let inner = dialog_frame(frame, centered(area, 66, 8), title);
+    let inner = dialog_frame(frame, rect, title);
     let (prompt, action) = match purpose {
         InputPurpose::LoadFen { .. } => ("Paste or type a FEN:".to_string(), "Load"),
         InputPurpose::Save(kind) => (
@@ -1083,18 +1142,13 @@ fn input(
     render_buttons(frame, last_row(inner), buttons, hits);
 }
 
-/// A yes/no question; the dialog grows with the question's text.
-fn confirm(
-    frame: &mut Frame,
-    area: Rect,
-    title: &str,
-    question: &Question,
-    yes: bool,
-    hits: &mut HitMap,
-) {
-    const WIDTH: u16 = 56;
+/// Width of the yes/no question dialog.
+const CONFIRM_WIDTH: u16 = 56;
+
+/// The text of a yes/no question, one entry per paragraph.
+fn confirm_lines(question: &Question) -> Vec<String> {
     let text = question.text();
-    let lines = match question {
+    match question {
         // The path on its own rows, so a long one never splits the question.
         Question::Overwrite { path, .. } => {
             let path = path.display().to_string();
@@ -1103,18 +1157,20 @@ fn confirm(
             vec![path, rest]
         }
         Question::Quit | Question::Resign | Question::NewGame | Question::Menu => vec![text],
-    };
-    let text_width = WIDTH.saturating_sub(4);
-    let text_rows = lines
-        .iter()
-        .map(|line| wrapped_height(line, text_width))
-        .fold(0u16, u16::saturating_add);
-    // Borders, text, gap, buttons.
-    let inner = dialog_frame(
-        frame,
-        centered(area, WIDTH, text_rows.saturating_add(4)),
-        title,
-    );
+    }
+}
+
+/// A yes/no question in `rect`, which [`dialog_rect`] makes grow with the question's text.
+fn confirm(
+    frame: &mut Frame,
+    rect: Rect,
+    title: &str,
+    question: &Question,
+    yes: bool,
+    hits: &mut HitMap,
+) {
+    let lines = confirm_lines(question);
+    let inner = dialog_frame(frame, rect, title);
     let text_area = Rect {
         height: inner.height.saturating_sub(2),
         ..inner
@@ -1290,6 +1346,7 @@ const fn piece_name(kind: PieceKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::time::Duration;
 
     use ratatui::Terminal;
@@ -1297,12 +1354,14 @@ mod tests {
     use ratatui::buffer::Buffer;
     use ratatui::crossterm::event::KeyCode;
     use ratatui::widgets::Widget;
+    use ratatui_image::picker::ProtocolType;
 
     use super::*;
     use crate::core::{START_FEN, Square};
-    use crate::tui::board::{square_at, square_rect};
+    use crate::tui::board::{image_area, square_at, square_rect};
     use crate::tui::event::AppEvent;
     use crate::tui::glyphs::{ImageSupport, initial_glyphs};
+    use crate::tui::graphics::picker_for;
     use crate::tui::test_support::engine::{FakeEngine, JEV_STATUS};
     use crate::tui::test_support::harness::Harness;
     use crate::tui::test_support::{PROMOTION_FEN, game_from, sq};
@@ -2417,5 +2476,143 @@ mod tests {
     fn snapshot_too_small() {
         let h = jev(50, 12);
         insta::assert_snapshot!("too_small_50x12", h.terminal.backend());
+    }
+
+    // ----- pictures under the boxes drawn over the board -----
+
+    /// An app against Jev in a 120×40 terminal, started from the menu with `key` and
+    /// switched to the Image style, its pictures drawn by a `protocol` picker.
+    fn pictures(protocol: ProtocolType, key: char) -> Harness {
+        let picker = picker_for(protocol, CellSize::DEFAULT);
+        let mut h = Harness::build(FakeEngine::jev(), (120, 40), Vec::new(), |app| {
+            app.with_picker(Some(picker))
+        });
+        h.char(key);
+        for _ in 0..3 {
+            h.char('g');
+        }
+        assert_eq!(h.app.glyphs(), GlyphSet::Image);
+        h
+    }
+
+    /// Adds to `ids` the kitty pictures whose image data `buffer` sends to the terminal
+    /// (the `i=` of each transmit).
+    fn transmitted(buffer: &Buffer, ids: &mut HashSet<String>) {
+        for cell in buffer.content() {
+            if let Some((_, rest)) = cell.symbol().split_once("_Gq=2,i=") {
+                let id = rest.split(',').next().unwrap_or_default();
+                ids.insert(id.to_string());
+            }
+        }
+    }
+
+    /// Draws the app again and returns the whole frame, Skip cells included (the
+    /// backend keeps only what the diff sent it).
+    fn frame(h: &mut Harness) -> Buffer {
+        let now = h.now;
+        h.terminal
+            .draw(|frame| h.app.render(frame, now))
+            .expect("draw")
+            .buffer
+            .clone()
+    }
+
+    /// The image area of `square` as last drawn.
+    fn picture_area(h: &Harness, square: Square) -> Rect {
+        let geometry = h.app.hit_map().board.expect("the board is drawn");
+        image_area(square_rect(&geometry, square)).expect("room for a picture")
+    }
+
+    #[test]
+    fn a_kitty_picture_first_drawn_under_the_help_still_reaches_the_terminal() {
+        let mut h = pictures(ProtocolType::Kitty, '2');
+        let mut ids = HashSet::new();
+        transmitted(h.buffer(), &mut ids);
+        h.command("e4");
+        transmitted(h.buffer(), &mut ids);
+        h.press(KeyCode::Esc);
+        h.char('?');
+        transmitted(h.buffer(), &mut ids);
+        // Jev answers while the help is open: its pawn on the last move's tint is a new
+        // picture, under the help box.
+        h.reply("e7e5");
+        transmitted(h.buffer(), &mut ids);
+        let [help] = overlays(&h.app, h.buffer().area)[..] else {
+            panic!("the help box alone is over the board");
+        };
+        assert!(picture_area(&h, sq("e5")).intersects(help));
+        h.char('?');
+        assert_eq!(h.app.dialog_name(), None);
+        transmitted(h.buffer(), &mut ids);
+        h.draw();
+        transmitted(h.buffer(), &mut ids);
+        assert_eq!(
+            ids.len(),
+            h.app.piece_images().len(),
+            "a picture never sent"
+        );
+    }
+
+    #[test]
+    fn a_kitty_picture_first_drawn_under_the_game_over_box_still_reaches_the_terminal() {
+        let mut h = pictures(ProtocolType::Kitty, '1');
+        let mut ids = HashSet::new();
+        transmitted(h.buffer(), &mut ids);
+        for mv in ["f3", "e5", "g4", "Qh4#"] {
+            h.command(mv);
+            transmitted(h.buffer(), &mut ids);
+        }
+        assert_eq!(h.app.screen(), Screen::GameOver);
+        let [game_over] = overlays(&h.app, h.buffer().area)[..] else {
+            panic!("the game-over box alone is over the board");
+        };
+        assert!(picture_area(&h, sq("h4")).intersects(game_over));
+        h.press(KeyCode::Esc);
+        assert_eq!(h.app.screen(), Screen::Playing);
+        transmitted(h.buffer(), &mut ids);
+        assert_eq!(
+            ids.len(),
+            h.app.piece_images().len(),
+            "a picture never sent"
+        );
+    }
+
+    #[test]
+    fn closing_the_help_sends_the_pictures_it_covered_again() {
+        for protocol in [ProtocolType::Iterm2, ProtocolType::Sixel] {
+            let mut h = pictures(protocol, '1');
+            // Black's pawn on d6 has its first row above the help box and the rest in it.
+            h.moves(&["e4", "d6"]);
+            h.char('?');
+            let open = frame(&mut h);
+            let [help] = overlays(&h.app, open.area)[..] else {
+                panic!("the help box alone is over the board");
+            };
+            h.char('?');
+            let closed = frame(&mut h);
+            let sent: Vec<(u16, u16)> =
+                open.diff(&closed).iter().map(|&(x, y, _)| (x, y)).collect();
+            // Pictures the box covered only part of, leaving their first cell alone.
+            let mut partly = 0;
+            for square in Square::all() {
+                let area = picture_area(&h, square);
+                let first = area.as_position();
+                // A picture's image data is all in its first cell.
+                if closed[first].symbol().len() < 16 || !area.intersects(help) {
+                    continue;
+                }
+                assert!(
+                    sent.contains(&(first.x, first.y)),
+                    "{protocol:?}: {square:?} is not sent again"
+                );
+                if !help.contains(first) {
+                    partly += 1;
+                }
+            }
+            assert!(
+                partly > 0,
+                "{protocol:?}: the help covers no picture partly"
+            );
+        }
     }
 }

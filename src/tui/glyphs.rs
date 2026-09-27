@@ -274,6 +274,57 @@ pub const fn palette(truecolor: bool) -> Palette {
     }
 }
 
+/// The RGB value of a palette colour, which piece pictures are composited onto (spec
+/// 9.3): an RGB colour as it is, a 256-colour index as xterm shows it by default (the 16
+/// system colours, the 6×6×6 cube, the grey ramp). `None` for the named ANSI colours
+/// and [`Color::Reset`], which the terminal's theme decides; the palettes never use
+/// them.
+pub const fn xterm_rgb(color: Color) -> Option<[u8; 3]> {
+    match color {
+        Color::Rgb(r, g, b) => Some([r, g, b]),
+        Color::Indexed(index) => Some(indexed_rgb(index)),
+        _ => None,
+    }
+}
+
+/// xterm's default RGB for colour `index` of the 256-colour palette.
+const fn indexed_rgb(index: u8) -> [u8; 3] {
+    /// Colours 0 to 15.
+    const SYSTEM: [[u8; 3]; 16] = [
+        [0, 0, 0],
+        [205, 0, 0],
+        [0, 205, 0],
+        [205, 205, 0],
+        [0, 0, 238],
+        [205, 0, 205],
+        [0, 205, 205],
+        [229, 229, 229],
+        [127, 127, 127],
+        [255, 0, 0],
+        [0, 255, 0],
+        [255, 255, 0],
+        [92, 92, 255],
+        [255, 0, 255],
+        [0, 255, 255],
+        [255, 255, 255],
+    ];
+    /// One channel of the cube: 0, then 95 to 255 in steps of 40.
+    const fn level(step: u8) -> u8 {
+        if step == 0 { 0 } else { 55 + 40 * step }
+    }
+    match index {
+        0..=15 => SYSTEM[index as usize],
+        16..=231 => {
+            let cube = index - 16;
+            [level(cube / 36), level(cube / 6 % 6), level(cube % 6)]
+        }
+        232..=255 => {
+            let grey = 8 + 10 * (index - 232);
+            [grey, grey, grey]
+        }
+    }
+}
+
 /// True when `COLORTERM` is `truecolor` or `24bit` (any case).
 ///
 /// `get` reads an environment variable; pass `|k| std::env::var(k).ok()`.
@@ -697,6 +748,48 @@ mod tests {
             }
             rgb(p.white_piece);
             rgb(p.black_piece);
+        }
+    }
+
+    #[test]
+    fn pictures_are_composited_onto_the_xterm_value_of_each_colour() {
+        // Every colour a square can have, in both palettes, has a known RGB value.
+        for p in [palette(true), palette(false)] {
+            for (name, bg) in backgrounds(&p) {
+                let (r, g, b) = rgb(bg);
+                assert_eq!(xterm_rgb(bg), Some([r, g, b]), "{name} {bg:?}");
+            }
+        }
+        // RGB passes through; indexes get xterm's defaults, as the palette's comments give them.
+        let cases = [
+            (Color::Rgb(0xB5, 0x88, 0x63), [0xB5, 0x88, 0x63]),
+            (Color::Indexed(137), [0xAF, 0x87, 0x5F]),
+            (Color::Indexed(94), [0x87, 0x5F, 0x00]),
+            (Color::Indexed(100), [0x87, 0x87, 0x00]),
+            (Color::Indexed(65), [0x5F, 0x87, 0x5F]),
+            (Color::Indexed(67), [0x5F, 0x87, 0xAF]),
+            (Color::Indexed(133), [0xAF, 0x5F, 0xAF]),
+            (Color::Indexed(160), [0xD7, 0x00, 0x00]),
+            (Color::Indexed(16), [0, 0, 0]),
+            (Color::Indexed(231), [255, 255, 255]),
+            // The grey ramp.
+            (Color::Indexed(232), [8, 8, 8]),
+            (Color::Indexed(255), [238, 238, 238]),
+            // The 16 system colours.
+            (Color::Indexed(0), [0, 0, 0]),
+            (Color::Indexed(1), [205, 0, 0]),
+            (Color::Indexed(4), [0, 0, 238]),
+            (Color::Indexed(7), [229, 229, 229]),
+            (Color::Indexed(8), [127, 127, 127]),
+            (Color::Indexed(12), [92, 92, 255]),
+            (Color::Indexed(15), [255, 255, 255]),
+        ];
+        for (color, expected) in cases {
+            assert_eq!(xterm_rgb(color), Some(expected), "{color:?}");
+        }
+        // Named colours and the default are the terminal theme's to decide.
+        for color in [Color::Reset, Color::Red, Color::White, Color::DarkGray] {
+            assert_eq!(xterm_rgb(color), None, "{color:?}");
         }
     }
 

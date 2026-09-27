@@ -52,7 +52,7 @@ use ratatui::crossterm::event::{
 use ratatui::layout::{Position as CellPosition, Rect};
 use ratatui_image::picker::Picker;
 
-use super::board::{BoardGeometry, CellSize, Highlights, square_at};
+use super::board::{BoardGeometry, CellSize, Highlights, PieceImages, square_at};
 use super::event::AppEvent;
 use super::files::{SaveError, pgn_export, resolve_path, tilde_path, today, write_file};
 use super::glyphs::{self, GlyphSet, Palette};
@@ -606,6 +606,8 @@ pub struct App {
     picker: Option<Picker>,
     /// The terminal's font size, which shapes the board's squares.
     cell_size: CellSize,
+    /// The board's piece pictures, kept between draws.
+    piece_images: PieceImages,
     pick_side: fn() -> Side,
     today: fn() -> String,
     home: Option<PathBuf>,
@@ -681,6 +683,7 @@ impl App {
             glyphs,
             picker: None,
             cell_size: CellSize::DEFAULT,
+            piece_images: PieceImages::new(),
             pick_side: random_side,
             today,
             home: std::env::var_os("HOME").map(PathBuf::from),
@@ -908,6 +911,12 @@ impl App {
     /// The terminal's font size (see [`App::set_cell_size`]).
     pub fn cell_size(&self) -> CellSize {
         self.cell_size
+    }
+
+    /// The piece pictures the board has drawn in the Image style and keeps for the next
+    /// draws.
+    pub fn piece_images(&self) -> &PieceImages {
+        &self.piece_images
     }
 
     /// The command box text.
@@ -2199,7 +2208,10 @@ impl App {
     /// and notes whether only [`TOO_SMALL`] fitted (input is ignored until more does).
     pub fn render(&mut self, frame: &mut Frame, now: Instant) {
         self.too_small = is_too_small(frame.area());
-        let drawn = panels::draw(self, frame, now);
+        // Lent to the draw, which reads the rest of the app and keeps new pictures in it.
+        let mut images = std::mem::take(&mut self.piece_images);
+        let drawn = panels::draw(self, &mut images, frame, now);
+        self.piece_images = images;
         self.hits = drawn.hits;
         self.move_scroll = drawn.move_scroll;
     }
@@ -2336,8 +2348,9 @@ mod tests {
     use ratatui_image::picker::ProtocolType;
 
     use super::*;
-    use crate::core::{Position as ChessPosition, START_FEN};
+    use crate::core::{Piece, Position as ChessPosition, START_FEN};
     use crate::engine::{MoveSource, analyse};
+    use crate::tui::board::square_rect;
     use crate::tui::graphics;
     use crate::tui::panels::HELP_LINES;
     use crate::tui::test_support::engine::{FakeEngine, REPLY_TIMEOUT, chord, key, mouse, paste};
@@ -3194,6 +3207,57 @@ mod tests {
         h.command(":glyphs");
         assert_eq!(h.app.glyphs(), GlyphSet::Image);
         assert_eq!(h.app.status_line(), "glyphs: image");
+    }
+
+    #[test]
+    fn the_image_style_draws_pictures_and_keeps_them_between_draws() {
+        let picker = graphics::picker_for(ProtocolType::Halfblocks, CellSize::DEFAULT);
+        let mut h = Harness::build(FakeEngine::local(), (120, 40), Vec::new(), |app| {
+            app.with_picker(Some(picker))
+        });
+        h.char('1');
+        assert!(
+            h.app.piece_images().is_empty(),
+            "text styles need no pictures"
+        );
+        let e1 = |h: &Harness| -> String {
+            let g = h.app.hit_map().board.expect("the board is drawn");
+            let buf = h.terminal.backend().buffer();
+            square_rect(&g, Square::E1)
+                .positions()
+                .map(|pos| buf[pos].symbol())
+                .collect()
+        };
+        let king = glyphs::glyph(GlyphSet::Solid, Piece::new(Side::White, PieceKind::King));
+        assert!(e1(&h).contains(king));
+
+        for _ in 0..3 {
+            h.char('g');
+        }
+        assert_eq!(h.app.glyphs(), GlyphSet::Image);
+        assert!(!e1(&h).contains(king), "the king is a picture");
+        // Each side's six kinds of piece on the square colours they stand on: 10 each.
+        assert_eq!(h.app.piece_images().len(), 20);
+        // A move tints its destination, which needs a picture of the piece on that tint.
+        h.moves(&["e2e4"]);
+        assert_eq!(h.app.piece_images().len(), 21);
+        h.moves(&["e7e5"]);
+        assert_eq!(h.app.piece_images().len(), 22);
+
+        // A text style and back: nothing is built again.
+        h.char('g');
+        assert!(e1(&h).contains(king));
+        for _ in 0..3 {
+            h.char('g');
+        }
+        assert_eq!(h.app.glyphs(), GlyphSet::Image);
+        assert_eq!(h.app.piece_images().len(), 22);
+
+        // A bigger terminal gets bigger squares: only what is on the board now is built.
+        h.terminal.backend_mut().resize(200, 60);
+        h.draw();
+        assert_eq!(h.app.piece_images().len(), 21);
+        assert!(!e1(&h).contains(king));
     }
 
     #[test]
