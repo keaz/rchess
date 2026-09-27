@@ -8,7 +8,9 @@
 //! against the pins of the position after the first capture, so a pin that capture
 //! releases (the pinning piece itself captures and leaves the line) or creates (the
 //! capturer uncovers a line to the enemy king) is honoured. Pins created or released
-//! by later captures in the exchange are not modelled.
+//! by later captures in the exchange are not modelled. A pinned piece still guards
+//! the square against a king: a king never captures onto a square an enemy piece
+//! attacks, pinned or not.
 
 use crate::core::{
     Bitboard, Color, Move, PieceKind, Position, Square, between, bishop_attacks, line, rook_attacks,
@@ -175,8 +177,8 @@ pub fn capture_gain(pos: &Position, sq: Square) -> i32 {
     };
     // The first capturer must be free to move in the position as it stands; the
     // recaptures are judged in the position after its capture.
-    let attackers = pin_aware_capturers(pos, &pins(pos), sq, pos.occupied(), !target.color);
-    let Some((from, kind)) = least_valuable(pos, attackers) else {
+    let Some((from, kind)) = next_capturer(pos, &pins(pos), sq, pos.occupied(), !target.color)
+    else {
         return 0;
     };
     let pins = pins_after_capture(pos, from, sq, kind, None);
@@ -219,6 +221,29 @@ fn pin_aware_capturers(
     attackers
 }
 
+/// The least valuable piece of `side` that can capture on `target` given
+/// `occupied`, with its square. A pinned piece does not capture off its pin line,
+/// but it still guards the square against a king: a king captures only when no
+/// enemy piece, pinned or not, attacks `target` once the king has left its square.
+fn next_capturer(
+    pos: &Position,
+    pins: &Pins,
+    target: Square,
+    occupied: Bitboard,
+    side: Color,
+) -> Option<(Square, PieceKind)> {
+    let attackers = pin_aware_capturers(pos, pins, target, occupied, side);
+    let (from, kind) = least_valuable(pos, attackers)?;
+    if kind == PieceKind::King {
+        let after = occupied ^ from.bb();
+        let guards = pos.attackers_to(target, after) & after & pos.occupied_by(!side);
+        if guards.any() {
+            return None;
+        }
+    }
+    Some((from, kind))
+}
+
 /// Pieces of `color` (not the king) the opponent can win by SEE, as
 /// `(value, square, kind)`: most valuable first, ties in a1..h8 order.
 pub fn winnable_pieces(pos: &Position, color: Color) -> Vec<(i32, Square, PieceKind)> {
@@ -255,12 +280,8 @@ fn swap(
     let mut gain = [0i32; 32];
     gain[0] = first_gain;
     let mut depth = 0;
-    loop {
-        // Removing pieces from `occupied` uncovers x-ray attackers behind them.
-        let attackers = pin_aware_capturers(pos, pins, target, occupied, side);
-        let Some((from, kind)) = least_valuable(pos, attackers) else {
-            break;
-        };
+    // Removing pieces from `occupied` uncovers x-ray attackers behind them.
+    while let Some((from, kind)) = next_capturer(pos, pins, target, occupied, side) {
         depth += 1;
         gain[depth] = on_square - gain[depth - 1];
         on_square = exchange_value(kind);
@@ -377,6 +398,19 @@ mod tests {
         // Nxd5 opens the a1-h8 diagonal: the knight on f6 is now pinned to the
         // king on h8 by the bishop on a1 and cannot take back on d5.
         assert_eq!(see_of("7k/8/5n2/3p4/8/2N5/8/B3K3 w - - 0 1", "c3d5"), 100);
+    }
+
+    #[test]
+    fn a_king_does_not_capture_onto_a_square_a_pinned_piece_guards() {
+        // Re1 pins Be6 to the king on e8, but the bishop still guards d5: Kxd5 is illegal.
+        assert_eq!(gain_on("4k3/8/4b3/3n4/2K5/8/8/4R3 b - - 0 1", "d5"), 0);
+    }
+
+    #[test]
+    fn a_king_does_not_recapture_onto_a_square_a_pinned_piece_guards() {
+        // Qe1 pins Be5 to the king on e8, but the bishop still guards d4: after
+        // Rxd4 Rxd4 the king cannot take back, so White only trades rooks.
+        assert_eq!(see_of("3rk3/8/8/4b3/3r4/2K5/8/3RQ3 w - - 0 1", "d1d4"), 0);
     }
 
     #[test]

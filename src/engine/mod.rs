@@ -12,6 +12,8 @@ mod see;
 pub use annotate::{Annotation, Bucket};
 pub use config::EngineConfig;
 pub use describe::JevState;
-pub use jev::{ChoiceAnswer, ChoiceOption, ChoiceRequest, JevClient, JevError, MoveChooser};
+pub use jev::{
+    ChoiceAnswer, ChoiceOption, ChoiceRequest, JEV_ENDPOINT, JevClient, JevError, MoveChooser,
+};
 pub use player::{ComputerMove, ComputerPlayer, MoveSource};
 pub use search::{MATE, ScoredMove, analyse};

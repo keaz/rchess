@@ -362,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn a_capture_that_releases_a_pin_loses_the_capturer() {
+    fn released_pin_makes_the_capture_lose_and_no_false_rescue() {
         // Qe1 pins Be5 to the king on e8; Qxc3 leaves the e-file and Bxc3 wins the queen.
         let fen = "4k3/8/8/4b3/8/2p5/8/4QK2 w - - 0 1";
         let (pos, list) = annotations(fen);

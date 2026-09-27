@@ -1,6 +1,6 @@
 //! Engine configuration from environment variables (spec 5.7). Parsing never
 //! fails: an invalid value falls back to its default and adds a warning. The Jev
-//! endpoint is fixed (`jev::JEV_ENDPOINT`) and has no variable.
+//! endpoint is fixed ([`JEV_ENDPOINT`](super::JEV_ENDPOINT)) and has no variable.
 
 use std::fmt;
 use std::time::Duration;

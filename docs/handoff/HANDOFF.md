@@ -5,7 +5,7 @@ Read this first. Follow the protocol in section 8 of
 
 ## Current
 Sub-project: tui (not started) | Plan: to be written — docs/superpowers/plans/2026-09-26-tui.md
-Branch: fix/engine-pin-and-endpoint (from main @ 86e1ed5) — ready for the user to merge into main
+Branch: fix/engine-pin-and-endpoint (from main @ 86e1ed5; head is the commit after 6a520fc, "fix(engine): let kings respect pinned guards in SEE and tidy follow-up tests") — ready for the user to merge into main
 Last completed task: engine follow-up — SEE pin release fixed, `new_attack` pin-aware, Jev endpoint fixed (no `JEV_*` URL variable)
 Next task: TUI brainstorming, then plan, from spec section 6 (read "Core API caveats", the engine caveats and "Known open issues" first)
 State: green (except 3 pre-existing old-code test failures)
@@ -59,6 +59,7 @@ cargo test --lib engine:: && cargo test --lib core:: && cargo test --test core_p
 - The ignored live Jev round-trip test (`engine::jev::tests::live_choice_round_trip`) passed once during Task 7, with the user's key.
 - Test counts after the final fix wave: `cargo test --lib engine::` 87 passed, 2 ignored; `cargo test --lib core::` 51 passed, 1 ignored; `core_properties` 2 passed; whole lib 193 passed, 3 failed (old code), 3 ignored.
 - Engine follow-up (2026-09-27): SEE judges the first capturer by the pins of the position as it stands and the recaptures by the pins after the first capture (pins changed by later captures are still not modelled); `new_attack`'s "defended" check is pin-aware. The Jev endpoint is fixed, not configurable (user decision): `jev::JEV_ENDPOINT` = `https://api.typesafe.ai/v1/systemone`, the TypeSafe quickstart URL, with `Authorization: Bearer <key>` and `Content-Type: application/json`; an offline test pins that wire format. Test counts: `cargo test --lib engine::` 93 passed, 2 ignored; whole lib 199 passed, 3 failed (old code), 3 ignored.
+- Follow-up review fixes (2026-09-27): in SEE a king captures only onto a square no enemy piece attacks, pinned or not (a pinned piece still guards against a king), so `capture_gain(d5)` in `4k3/8/4b3/3n4/2K5/8/8/4R3 b` and `see(d1d4)` in `3rk3/8/8/4b3/3r4/2K5/8/3RQ3 w` are now 0; `JEV_ENDPOINT` is re-exported as `engine::JEV_ENDPOINT` (no engine rustdoc warnings); the wire-format test compares body keys as a set and the endpoint test checks host and path. Test counts: `cargo test --lib engine::` 96 passed, 2 ignored; whole lib 202 passed, 3 failed (old code), 3 ignored.
 - Final-review fix wave: a mate on the 100th half-move now outranks the fifty-move rule; SEE ignores pinned pieces off their pin line; annotation facts corrected ("exposed to capture" wording, no such fact for the capturing piece, a king only attacks undefended pieces); base-URL variable validated (since removed by the engine follow-up); transport errors classified (new `JevError::Request`), 1 MiB body cap and offline TcpListener tests; notes stripped of control characters; public docs, `ComputerPlayer` Debug and `MoveSource` Display; harness `jev pick` column and answered-only latency.
 
 ## Known open issues

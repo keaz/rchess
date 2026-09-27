@@ -329,6 +329,7 @@ impl MoveChooser for JevClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
@@ -618,13 +619,13 @@ mod tests {
         assert_eq!(header("authorization"), vec!["Bearer test-key"], "{head}");
         assert_eq!(header("content-type"), vec!["application/json"], "{head}");
         let body: Value = serde_json::from_str(body).expect("a JSON body");
-        let keys: Vec<&str> = body
+        let keys: BTreeSet<&str> = body
             .as_object()
             .expect("a JSON object")
             .keys()
             .map(String::as_str)
             .collect();
-        assert_eq!(keys, vec!["model", "questions", "state"]);
+        assert_eq!(keys, BTreeSet::from(["model", "questions", "state"]));
         assert_eq!(body, request().to_body("jev-latest"));
     }
 
@@ -708,7 +709,12 @@ mod tests {
 
     #[test]
     fn the_endpoint_is_the_quickstart_url() {
-        assert_eq!(JEV_ENDPOINT, "https://api.typesafe.ai/v1/systemone");
+        // The host and scheme the offline transport tests cannot see; they check the path.
+        assert!(
+            JEV_ENDPOINT.starts_with("https://api.typesafe.ai/"),
+            "{JEV_ENDPOINT}"
+        );
+        assert!(JEV_ENDPOINT.ends_with("/v1/systemone"), "{JEV_ENDPOINT}");
     }
 
     /// Real API round trip. Run with: cargo test --lib engine::jev -- --ignored

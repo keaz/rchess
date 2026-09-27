@@ -332,11 +332,12 @@ State fields, all computed by `describe.rs`:
 
 ### 5.7 Client, retries and configuration
 
-- `JevClient` posts with `ureq` 3.x to the fixed endpoint `jev::JEV_ENDPOINT` =
+- `JevClient` posts with `ureq` 3.x to the fixed endpoint `engine::JEV_ENDPOINT` =
   `https://api.typesafe.ai/v1/systemone` (the TypeSafe quickstart URL), with
   `Authorization: Bearer <key>` and `Content-Type: application/json`. The endpoint is not
-  configurable (user decision, 2026-09-27); the offline transport tests use a test-only constructor. Request/response types are plain `serde` structs, so they can be
-  tested without a network.
+  configurable (user decision, 2026-09-27); the offline transport tests use a test-only
+  constructor. Request/response types are plain `serde` structs, so they can be tested without
+  a network.
 - Retries: at most 3 attempts. Retry 429, 5xx (including 529) and transport errors; backoff 250 ms
   then 500 ms, or the `retry-after` value when present, capped at 2 s. No retry on other 4xx.
   Timeout 5 s per attempt.
