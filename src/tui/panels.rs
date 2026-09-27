@@ -841,10 +841,13 @@ fn game_over(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap) {
         })
         .collect();
     render_buttons(frame, row_of(inner, 3), buttons, hits);
-    frame.render_widget(
-        Line::from("Esc: see the board   u: undo").dim().centered(),
-        row_of(inner, 4),
-    );
+    // While the command box has focus, keys are typed into it, not given to the overlay.
+    let hint = if app.command_has_focus() {
+        "Esc: leave the command box"
+    } else {
+        "Esc: see the board   u: undo"
+    };
+    frame.render_widget(Line::from(hint).dim().centered(), row_of(inner, 4));
 }
 
 /// Draws the top dialog and records its targets (none for help: any click closes it).

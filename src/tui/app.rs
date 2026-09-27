@@ -8,8 +8,9 @@
 //!
 //! Screens are [`Screen::Menu`], [`Screen::Playing`] and [`Screen::GameOver`] (an overlay on
 //! the playing screen), with a stack of [`Dialog`]s on top. Input goes to the topmost focus
-//! only: the top dialog, else the game-over overlay, else the command box when it has
-//! focus, else the board. Ctrl+C is the one global key: it asks to quit from anywhere.
+//! only: the top dialog, else the command box when it has focus (also under the game-over
+//! overlay, so keys typed while the computer's move ends the game never act on it), else
+//! the game-over overlay, else the board. Ctrl+C is the one global key: it asks to quit from anywhere.
 //! Ctrl+S opens the PGN save dialog from the board, the command box and the game-over
 //! overlay. Esc typed quickly before a key arrives as Alt+key: outside text fields it is
 //! handled as both keys; in the command box and the text dialogs Alt chords are ignored, so
@@ -811,10 +812,11 @@ impl App {
         self.command_focused
     }
 
-    /// True when typed keys go to the command box right now: it is focused, the playing
-    /// screen is shown and no dialog is open. Draw the terminal cursor only then.
+    /// True when typed keys go to the command box right now: it is focused, a game is
+    /// shown (the game-over overlay included) and no dialog is open. Draw the terminal
+    /// cursor only then.
     pub fn command_has_focus(&self) -> bool {
-        self.command_focused && self.screen == Screen::Playing && self.dialogs.is_empty()
+        self.command_focused && self.screen != Screen::Menu && self.dialogs.is_empty()
     }
 
     /// The last move the computer played, for the Jev panel; `None` once it is undone.
@@ -1011,8 +1013,10 @@ impl App {
         }
         match self.screen {
             Screen::Menu => self.menu_key(key),
+            // The box sits above the overlay: when the computer's move ends the game while
+            // the person is typing, Enter, `n` or `q` must not act on the overlay.
+            Screen::Playing | Screen::GameOver if self.command_focused => self.command_key(key),
             Screen::GameOver => self.game_over_key(key),
-            Screen::Playing if self.command_focused => self.command_key(key),
             Screen::Playing => self.board_key(key),
         }
     }
@@ -1311,7 +1315,12 @@ impl App {
             }
             return;
         }
-        if self.screen != Screen::Playing {
+        let to_box = match self.screen {
+            Screen::Playing => true,
+            Screen::GameOver => self.command_focused,
+            Screen::Menu => false,
+        };
+        if !to_box {
             return;
         }
         // Pasting on the board types into the command box; a line break submits it.
@@ -1435,7 +1444,7 @@ impl App {
         self.step_anchor = None;
         self.cursor = None;
         self.invalidate();
-        self.check_game_over();
+        self.person_ended_turn();
     }
 
     /// True when leaving would throw away moves of an unfinished game.
@@ -1504,6 +1513,17 @@ impl App {
         self.last_computer.take_if(|(ply, _)| *ply > plies);
     }
 
+    /// [`check_game_over`](Self::check_game_over) after the person's own move or command.
+    /// When that ended the game, the command box is left (nothing more is being typed), so
+    /// the overlay gets the next keys at once. After the computer's move the box keeps its
+    /// focus instead: the person may be typing.
+    fn person_ended_turn(&mut self) {
+        self.check_game_over();
+        if self.screen == Screen::GameOver {
+            self.command_focused = false;
+        }
+    }
+
     /// Shows the game-over overlay when the game has ended, and leaves it when it has not.
     fn check_game_over(&mut self) {
         if self.screen == Screen::Menu {
@@ -1544,7 +1564,7 @@ impl App {
         self.drag = None;
         self.move_scroll = 0;
         self.message = None;
-        self.check_game_over();
+        self.person_ended_turn();
         Ok(())
     }
 
@@ -1659,7 +1679,7 @@ impl App {
         };
         self.game.resign(loser);
         self.invalidate();
-        self.check_game_over();
+        self.person_ended_turn();
     }
 
     fn answer(&mut self, yes: bool) {
@@ -3822,6 +3842,75 @@ mod tests {
         assert_eq!(h.app.game().outcome(), None);
         assert_eq!(h.uci(), ["f2f3", "e7e5", "g2g4"]);
         assert_eq!(h.app.screen_name(), "playing");
+    }
+
+    #[test]
+    fn a_mate_by_the_engine_never_takes_keys_typed_into_the_command_box() {
+        let mut h = Harness::new();
+        h.char('2');
+        h.command("f3");
+        h.reply("e7e5");
+        h.command("g4");
+        h.type_text("Nc3");
+        h.reply("d8h4");
+        assert_eq!(h.app.screen_name(), "game over");
+        assert!(h.app.command_has_focus(), "the box keeps its focus");
+        assert_eq!(h.app.command_text(), "Nc3");
+        let screen = h.screen();
+        assert!(screen.contains("Esc: leave the command box"), "{screen}");
+        assert!(!screen.contains("u: undo"), "u would be typed");
+
+        h.press(KeyCode::Enter);
+        assert_eq!(h.app.status_line(), GAME_IS_OVER);
+        assert_eq!(h.app.command_text(), "Nc3", "kept for editing");
+        h.char('n');
+        h.char('q');
+        assert_eq!(h.app.command_text(), "Nc3nq");
+        assert_eq!(h.app.screen_name(), "game over");
+        assert_eq!(h.app.dialog_name(), None);
+        assert!(!h.app.should_quit());
+        assert_eq!(h.uci(), ["f2f3", "e7e5", "g2g4", "d8h4"]);
+
+        // Esc leaves the box; the overlay has the keys from then on.
+        h.press(KeyCode::Esc);
+        assert!(!h.app.command_focused());
+        assert_eq!(h.app.screen_name(), "game over");
+        assert!(h.screen().contains("Esc: see the board   u: undo"));
+        h.press(KeyCode::Right);
+        assert_eq!(h.app.game_over_choice(), 1);
+        h.press(KeyCode::Esc);
+        assert_eq!(h.app.screen_name(), "playing");
+        assert!(!h.app.command_focused(), "the board has focus");
+        h.char('u');
+        assert_eq!(h.uci(), ["f2f3", "e7e5"]);
+    }
+
+    #[test]
+    fn a_game_ended_by_the_persons_own_move_leaves_the_command_box() {
+        // Nothing is being typed: the overlay gets the next keys at once.
+        let mut h = Harness::new();
+        h.char('2');
+        h.command("f3");
+        h.reply("e7e5");
+        h.command(":fen 7k/8/6K1/8/8/8/8/R7 w - - 0 1");
+        h.command("Ra8#");
+        assert_eq!(h.app.screen_name(), "game over");
+        assert!(!h.app.command_focused());
+        h.char('m');
+        assert_eq!(h.app.screen_name(), "menu");
+    }
+
+    #[test]
+    fn paste_goes_to_a_focused_command_box_on_the_game_over_screen() {
+        let mut h = Harness::new();
+        h.char('2');
+        h.command("f3");
+        h.reply("e7e5");
+        h.command("g4");
+        h.reply("d8h4");
+        h.send(paste("Nc3"));
+        assert_eq!(h.app.command_text(), "Nc3");
+        assert_eq!(h.app.screen_name(), "game over");
     }
 
     #[test]
