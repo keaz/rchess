@@ -4,14 +4,14 @@ Read this first. Follow the protocol in section 8 of
 `docs/superpowers/specs/2026-09-26-rchess-redesign-design.md`.
 
 ## Current
-Sub-project: tui (design revised, awaiting spec review) | Plan: to be written — docs/superpowers/plans/2026-09-27-tui.md
-Branch: feat/tui (from main @ 4b7e8f9)
-Last completed task: TUI brainstorming — spec section 6 revised and committed
-Next task: user reviews spec section 6; then write the TUI plan with superpowers:writing-plans
+Sub-project: tui | Plan: docs/superpowers/plans/2026-09-27-tui.md
+Branch: feat/tui (spec section 6 + plan committed; no TUI code yet)
+Last completed task: TUI plan written and verified (prototype built, reviewed with skeptics, replayed task by task: every stage compiles and passes)
+Next task: tui task 1 (dependencies, module root and glyphs)
 State: green (except 3 pre-existing old-code test failures)
 
 ## Verify before continuing
-cargo test --lib engine:: && cargo test --lib core:: && cargo test --test core_properties
+git status && cargo test --lib engine:: && ls docs/superpowers/plans
 
 ## Core API caveats (read before building on core)
 - `Position::play` / `to_san` require a move from `self.legal_moves()`; debug builds assert, release builds may corrupt the position; use `Game::play` for unvalidated input.
@@ -44,6 +44,7 @@ cargo test --lib engine:: && cargo test --lib core:: && cargo test --test core_p
 - No LLM code exists in the repo; "remove LLM code" means deleting the old greedy `ai.rs`.
 - `JEV_API_KEY` is present in the user's environment.
 - Engine design (spec 5, revised): user chose to add the `examples/jev_eval.rs` evaluation harness.
+- TUI plan: plan code blocks are long; implementers should extract fenced blocks from the task brief with a script, not retype. app.rs and panels.rs import each other, so they share Task 6. Test helpers are staged: test_support/mod.rs (Task 2), engine.rs (Task 5), harness.rs (Task 6).
 - Engine plan: capture annotations use a fourth qualifier, "wins material in the exchange" (spec 5.4 updated);
   `analyse`, `ComputerPlayer::from_config` and `ComputerPlayer::config` are public (spec 5.2 updated).
 - Core plan adds `error.rs`, `zobrist.rs` and `san.rs` beyond the spec's file list (split for focus;
@@ -72,6 +73,7 @@ cargo test --lib engine:: && cargo test --lib core:: && cargo test --test core_p
 - None.
 
 ## Log (newest first)
+- 2026-09-27 TUI plan written (7 tasks, ~15k lines incl. verified code and 19 snapshots); replay counts 20/39/81/103/139/250/272, pty smoke test green; spec 6 synced with the prototype.
 - 2026-09-27 TUI brainstorming: spec section 6 revised (terminal guard, thread-aware panic hook, signals, stale-reply check, lenient move text, glyph sets, dev opt-level 3, snapshot tests).
 - 2026-09-27 fix/engine-pin-and-endpoint merged into main: SEE pins recomputed after the first capture, kings respect pinned guards, fixed Jev endpoint (JEV_BASE_URL removed), wire format pinned to the quickstart.
 - 2026-09-27 engine follow-up on fix/engine-pin-and-endpoint: SEE pin release fixed, pin-aware `new_attack`, fixed Jev endpoint (base-URL variable removed); ready to merge; next: TUI brainstorming.

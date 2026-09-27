@@ -423,8 +423,14 @@ src/tui/
 - `Menu`: Human vs Human; Human vs Jev (White, Black or random); Jev vs Jev (watch mode: step
   delay adjustable with `+`/`-`, default 1 s; `space` pauses); Load FEN; Quit. The menu shows the Jev
   status ("Jev ready (jev-latest)" or "No JEV_API_KEY — local search") and any
-  `EngineConfig.warnings`.
-- `Playing`: the main screen (layout below).
+  `EngineConfig.warnings`. Without a key the computer is called "Local search" wherever the UI names
+  it (menu entries, mode label, turn and thinking lines, its panel's title, PGN names), so the screen
+  never says "Jev" while Jev is not playing.
+- `Playing`: the main screen (layout below). The Status panel's top border names the mode, trying
+  shorter forms until one fits beside the title: `You (White) vs Local search`, then
+  `You (W) vs Local`, then `W You · B Local` (`Local search vs Local search`, then `Local vs Local`;
+  with a key the same with `Jev`, and `Jev vs Jev` always fits). The turn and thinking lines drop the
+  player's name rather than wrap.
 - `GameOver` overlay: result and reason; New game, Save PGN, Menu.
 - Dialogs: FEN input, save path, overwrite confirmation, promotion picker (Q R B N, mouse or keys),
   resign confirmation, help. Every dialog renders `Clear` before drawing.
@@ -470,13 +476,22 @@ Playing layout:
   dialogs are clickable. Hit-testing uses the rectangles saved during the last draw.
 - Keyboard: arrows move a cursor; Enter selects/moves; Esc cancels. Hotkeys (board focus only):
   `u` undo, `f` flip, `n` new, `g` glyphs, `?` help, `q` or Ctrl+C quit (asks for confirmation while a
-  game is in progress); Ctrl+S saves PGN.
+  game is in progress); Ctrl+S saves PGN from the board or the command box.
+- Alt chords: Esc typed quickly before a key arrives as Alt+key. Outside text fields (board, menu,
+  yes/no dialogs, game-over overlay) it is handled as Esc followed by the key; while typing (the
+  command box, the FEN and save-path dialogs) Alt chords are ignored, so readline habits (Alt+B,
+  Alt+F, ...) neither change the text nor reach the board.
 - Command box (`/` or `:`): single line with ←/→/Home/End/Backspace/Delete; bracketed paste with
   control characters stripped; a newline in pasted text submits. Commands: `:undo`, `:flip`, `:new`,
-  `:fen <FEN>`, `:savefen <path>`, `:savepgn <path>`, `:resign`, `:glyphs`, `:help`, `:quit`.
+  `:fen <FEN>`, `:savefen <path>`, `:savepgn <path>`, `:resign`, `:glyphs`, `:help`, `:quit`. No move
+  or command starts with a space, so space in an empty command box does what it does on the board:
+  it retries a failed engine, and in Jev vs Jev pauses or resumes; after any text it is a space.
 - Move text: strict `parse_san`, then UCI (case-insensitive), then loose SAN (case-insensitive; `x`,
   `+`, `#`, `=` optional). A move is played only when exactly one legal move matches; otherwise the
-  box shows "ambiguous: Bc3, bxc3" or "not a legal move: <text>". Errors never show FEN text.
+  status panel shows "ambiguous: Bc3, bxc3" or "not a legal move: <text>" and the text stays in the
+  box for editing. Echoed input (a move, an unknown command or argument, a pasted FEN) is cut to its
+  first 24 characters plus "…", so a pasted FEN shows only its start. FEN errors show only core's
+  reason (`invalid FEN: <reason>`), never the FEN text core appends to it.
 - Undo against Jev returns to the human's previous turn (two plies, or one if Jev's reply has not
   arrived). Undo, new game and menu stay available while Jev is thinking; the late reply is discarded.
 - Saving: `~` expanded, `.pgn`/`.fen` appended when missing, an existing file triggers an overwrite
@@ -489,8 +504,15 @@ Playing layout:
   state change or tick. The app sees only `AppEvent`s.
 - One `Arc<ComputerPlayer<JevClient>>` is built from `EngineConfig::from_env()`. Each computer turn
   spawns a thread named "engine" with `(generation, position hash, game.clone())` and runs
-  `choose_move` inside `catch_unwind`. A panic becomes a failure reply; the UI then plays the local
-  search best move itself and says "engine error — local search".
+  `choose_move` inside `catch_unwind`. After a panic the same thread runs the local search and replies
+  with its best move, noted "engine error — local search"; the UI never calls `analyse` (a search can
+  take seconds and must neither block nor crash the UI). Only if the local search panics too is the
+  reply a failure: the UI stops asking and says so until space (on the board or in an empty command
+  box) retries.
+- At most two requests are out at once (`MAX_IN_FLIGHT = 2`: the live one plus one discarded one still
+  running). Threads cannot be cancelled, so undo, new game or menu while the computer thinks leave the
+  old request running; without the cap a held key would start a burst of paid Jev calls (or CPU-bound
+  searches). A request over the cap waits for an old one to answer, and the status panel says so.
 - A reply is applied only when its generation and position hash both match the current game (a legal
   but stale reply must not be played). `None` means the game is over.
 - While the engine thinks, the status panel shows a spinner with elapsed seconds; the Jev panel shows
@@ -499,14 +521,22 @@ Playing layout:
 
 ### 6.6 Terminal safety
 
-- Setup: `ratatui::init`, then a click-and-drag-only mouse capture (`?1000h ?1002h ?1006h`; no
+- Setup: `ratatui::try_init`, then a click-and-drag-only mouse capture (`?1000h ?1002h ?1006h`; no
   `?1003h` motion reporting) and bracketed paste.
-- A guard always disables mouse capture and bracketed paste and calls `ratatui::restore`: on normal
-  exit, on error return, and from the panic hook.
-- The panic hook is installed after `ratatui::init` and is thread-aware: a panic on a thread not named
-  "main" leaves the terminal alone (the engine thread's panic is caught by `catch_unwind`).
+- A guard always disables mouse capture and bracketed paste, calls `ratatui::try_restore` and shows
+  the cursor, ignoring every error: on normal exit, on error return, and from the panic hook. Nothing on
+  the restore path may print: on a hung-up tty `eprintln!` panics, and `ratatui::restore`, ratatui's
+  panic hook and `Terminal`'s `Drop` all print their errors, which turns a closed terminal into an
+  abort. So the `Terminal` is never dropped.
+- The panic hook replaces ratatui's and is thread-aware: on "main" it restores, then calls the hook
+  that was in place before `ratatui::try_init`; a panic on any other thread leaves the terminal alone
+  (the engine thread's panic is caught by `catch_unwind`).
 - `signal-hook` flags for SIGINT, SIGTERM and SIGHUP are checked every tick, so the app exits through
-  the guard.
+  the guard, then ends by that signal. If the UI does not react within 1 s (crossterm keeps polling a
+  hung-up tty), the signal thread restores and ends the process itself. When the UI loop instead ends
+  with an I/O error, it waits up to 100 ms (`SIGNAL_GRACE`) after the restore for a quit signal: a tty
+  that hangs up fails the next write at about the moment its SIGHUP arrives, and the process should
+  end by that signal, not by the error.
 - Logging is never configured to TRACE for `ureq` (it would print the API key).
 
 ### 6.7 Verification
