@@ -680,8 +680,10 @@ what is sent to Jev. Sections 6.x still hold except where this section changes t
   When the query timed out, a kitty answer that arrives later (a slow SSH link) would reach
   crossterm as key presses (`Alt+_`, `G`, `i`, `=`, ...); for 10 s after such a query one run of key
   presses shaped like that answer is dropped. The other answers never become key presses.
-- Font changes: after a Resize, when the protocol is Sixel or iTerm2 (their pictures are encoded at a
-  pixel size; Kitty placeholders and half-blocks scale with the cells), the font size is measured
+- Font changes: after a Resize, when the protocol is Sixel, iTerm2 or Kitty (their pictures are
+  encoded at a pixel size; Kitty and Ghostty size a placeholder picture from its pixel size and the
+  current cell size, so it does not follow a zoom; only half-blocks scale with the cells), the font
+  size is measured
   again the same way (cell-size query and status request, `poll`, 1 s deadline, else window pixels ÷
   cells, else unchanged), once per batch of resize events; a changed size rebuilds the picker and
   clears the picture cache. The font is never guessed from pixel sizes and padding alone. crossterm

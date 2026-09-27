@@ -32,9 +32,11 @@ nothing touches the network), drives it with keystrokes or signals, and checks:
     signal at once, SIGTERM with the terminal restored;
   - answers like Kitty: start-up goes on at once, the answer is not echoed,
     Image is the starting style and pieces are kitty pictures (unicode
-    placeholders), and a resize asks nothing (placeholders scale with the cells)
-    but sends new pictures with new ids; a quit, and a SIGTERM, delete every
-    picture sent by its id;
+    placeholders) of 3x2 cells of 9x18; a font zoom to 8x16 (a resize) asks for
+    the cell size again, as Kitty and Ghostty size a placeholder picture from its
+    pixels and the current cell, and with the answer sends new pictures with new
+    ids whose pixel size (s, v) follows the new font; a quit, and a SIGTERM,
+    delete every picture sent by its id;
   - answers like a Sixel terminal with a 10x20 font, then zooms out to 8x16
     (more cells, and SIGWINCH): the resize asks for the cell size again (CSI 16 t,
     the status request and the device attributes, nothing else), and with the
@@ -109,7 +111,7 @@ SIXEL_ANSWER = b"\x1b[?62;4c\x1b[6;20;10t\x1b[0n"
 # A Sixel picture's raster attributes: its width and height in pixels.
 SIXEL_RASTER = re.compile(rb'\x1bP[0-9;]*q"1;1;(\d+);(\d+)')
 QUERY_WARNING = "graphics query: no answer within 1 s"
-# What the app asks after a resize while its pictures are Sixel or iTerm2: the cell
+# What the app asks after a resize while its pictures are Sixel, iTerm2 or Kitty: the cell
 # size and the status report, which ends the answers the app reads, then the device
 # attributes, whose answer comes last and is left to crossterm.
 FONT_QUERY = b"\x1b[16t\x1b[5n"
@@ -127,6 +129,10 @@ KITTY_DELETE = re.compile(rb"\x1b_Ga=d,d=I,i=(\d+)\x1b\\")
 KITTY_ANY_DELETE = re.compile(rb"\x1b_Ga=d")
 # The first chunk of a kitty picture's transmission, which names its id.
 KITTY_TRANSMIT = re.compile(rb"\x1b_Gq=2,i=(\d+),a=T,U=1")
+# The same, with the picture's width (s) and height (v) in pixels.
+KITTY_TRANSMIT_SIZE = re.compile(rb"\x1b_Gq=2,i=\d+,a=T,U=1,[^;]*?s=(\d+),v=(\d+),")
+# Kitty's answer to the device attributes request (no sixel).
+KITTY_ATTRIBUTES_ANSWER = b"\x1b[?62;c"
 # Kitty's unicode placeholder: every cell of a kitty picture holds one.
 PLACEHOLDER = "\U0010EEEE"
 SECRET_VARS = ("JEV_API_KEY", "TYPESAFE_API_KEY")
@@ -982,12 +988,23 @@ def scenario_query_kitty(binary):
         check(board.count(PLACEHOLDER) > 0, "the board shows the pictures' placeholder cells")
         check("♜" not in board, "no solid glyphs while the pictures are shown")
         app.screen().show("kitty pictures (placeholders show as their character)")
+        # 80x24 gives 5x2 squares, image areas of 3x2 cells: 27x36 pixels at 9x18.
+        first = set(kitty_sizes(app.stream[answered_at:]))
+        check(first == {(27, 36)}, "pictures fit 3x2 cells of 9x18", f"sizes {first}")
+        # A font zoom to 8x16: more cells in the same window. Kitty and Ghostty size a
+        # placeholder picture from its pixels and the current cell, so a picture made for
+        # 9x18 cells would show cropped; the font must be measured again.
         resized_at = len(app.stream)
         set_window(app, 30, 100, 800, 480)
-        end = time.monotonic() + 5
-        while b"a=T,U=1" not in app.stream[resized_at:] and time.monotonic() < end:
-            app.pump(0.05)
-        app.idle(0.3)
+        check(
+            app.wait_bytes(FONT_QUERY, start=resized_at),
+            "a resize asks for the cell size again with kitty pictures",
+        )
+        app.idle(0.1)
+        check(b"Gi=31" not in app.stream[resized_at:], "without the kitty probe")
+        answered_zoom_at = len(app.stream)
+        answer_font(app, resized_at, 8, 16, attributes=KITTY_ATTRIBUTES_ANSWER)
+        wait_kitty(app, answered_zoom_at)
         check(b"a=T,U=1" in app.stream[resized_at:], "a resize redraws the kitty pictures")
         before = set(KITTY_TRANSMIT.findall(app.stream[:resized_at]))
         after = set(KITTY_TRANSMIT.findall(app.stream[resized_at:]))
@@ -996,10 +1013,22 @@ def scenario_query_kitty(binary):
             "the redrawn pictures have new ids (the old ones must be deleted too)",
             f"before {sorted(before)}, after {sorted(after)}",
         )
-        check(b"[16t" not in app.stream[resized_at:], "a resize asks nothing with kitty pictures")
+        # 100x30 gives 7x3 squares, image areas of 5x3 cells: 40x48 pixels at 8x16. At the
+        # old font they would be 45x54, which the terminal would crop.
+        zoomed = set(kitty_sizes(app.stream[answered_zoom_at:]))
+        check(
+            zoomed == {(40, 48)},
+            "the pictures follow the new font (5x3 cells of 8x16)",
+            f"sizes {zoomed}",
+        )
+        check_no_query_text(app, "board after the zoom")
+        second_at = len(app.stream)
         set_window(app, ROWS, COLS, 0, 0)
-        app.idle(0.3)
-        check(b"[16t" not in app.stream[resized_at:], "nor does a second one")
+        check(app.wait_bytes(FONT_QUERY, start=second_at), "a second resize asks again")
+        answer_font(app, second_at, 8, 16, attributes=KITTY_ATTRIBUTES_ANSWER)
+        wait_kitty(app, second_at)
+        kept = set(kitty_sizes(app.stream[second_at:]))
+        check(kept == {(24, 32)}, "and the pictures fit 3x2 cells of 8x16", f"sizes {kept}")
         app.send(b"g")
         check(app.wait_screen("glyphs: solid"), "the style was Image (g goes on to Solid)")
         check("♜" in app.screen().text(), "then the pieces are solid glyphs")
@@ -1056,14 +1085,29 @@ def wait_sixels(app, start, count, timeout=5.0):
     return sixel_sizes(app.stream[start:])
 
 
-def answer_font(app, asked_at, width, height, upto=None):
+def kitty_sizes(stream):
+    """The pixel size of every kitty picture transmitted in `stream`, in order."""
+    return [(int(w), int(h)) for w, h in KITTY_TRANSMIT_SIZE.findall(stream)]
+
+
+def wait_kitty(app, start, timeout=5.0):
+    """Waits for kitty pictures after `start` in the stream, then for the frame to end;
+    their sizes."""
+    end = time.monotonic() + timeout
+    while not kitty_sizes(app.stream[start:]) and time.monotonic() < end:
+        app.pump(0.05)
+    app.idle(0.3)
+    return kitty_sizes(app.stream[start:])
+
+
+def answer_font(app, asked_at, width, height, upto=None, attributes=ATTRIBUTES_ANSWER):
     """Answers the font measurement written after `asked_at` (and before `upto`) as a
     terminal does: a cell of `width` x `height` pixels and the status report, then the
-    device attributes if they were asked for too."""
+    device attributes (`attributes`) if they were asked for too."""
     asked = app.stream[asked_at:upto]
     answer = b"\x1b[6;%d;%dt\x1b[0n" % (height, width)
     if ATTRIBUTES_REQUEST in asked:
-        answer += ATTRIBUTES_ANSWER
+        answer += attributes
     os.write(app.master, answer)
 
 

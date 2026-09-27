@@ -1,6 +1,6 @@
 //! Graphics detection (spec 9.3): which image protocol the terminal speaks and how
 //! large its font is, found out once at start-up. After that only the font size can
-//! change (a font zoom), and it matters only to Sixel and iTerm2 pictures, which are
+//! change (a font zoom), and it matters to Sixel, iTerm2 and Kitty pictures, which are
 //! encoded at a pixel size: after a resize the run loop asks the terminal for it again
 //! ([`FontMeter::measure`]), the same way.
 //!
@@ -257,7 +257,7 @@ pub struct FontMeter {
 
 impl FontMeter {
     /// Asks the terminal for its font size again, after a resize: a font zoom changes
-    /// the cells, not the window, and Sixel and iTerm2 pictures are encoded at the
+    /// the cells, not the window, and Sixel, iTerm2 and Kitty pictures are encoded at the
     /// pixel size of the cells they fill. Call it on the UI thread between batches of
     /// events.
     ///

@@ -251,8 +251,8 @@ pub enum Action {
     RequestEngine(EngineRequest),
     /// Ask the terminal for its font size again (`graphics::FontMeter::measure`) once the
     /// batch is handled, and hand the result to [`App::font_measured`]. Returned for a
-    /// resize while pictures are Sixel or iTerm2, which are encoded at the pixel size
-    /// of their cells, and not again until the result is in, so a batch of resizes
+    /// resize while pictures are Sixel, iTerm2 or Kitty, which are encoded at the pixel
+    /// size of their cells, and not again until the result is in, so a batch of resizes
     /// asks once.
     MeasureFont,
 }
@@ -795,12 +795,14 @@ impl App {
         }
     }
 
-    /// True when the pictures are encoded at a pixel size (Sixel and iTerm2), so a font
-    /// zoom must be followed; Kitty placeholders and half-blocks scale with the cells.
+    /// True when the pictures have a pixel size (Sixel, iTerm2 and Kitty), so a font zoom
+    /// must be followed. Kitty and Ghostty size a placeholder picture from its pixel size
+    /// and the current cell size, so a Kitty picture made for the old font is cropped or
+    /// shrunk; only half-blocks, which are text, scale with the cells.
     fn pictures_follow_the_font(&self) -> bool {
         matches!(
             self.picker.as_ref().map(Picker::protocol_type),
-            Some(ProtocolType::Sixel | ProtocolType::Iterm2)
+            Some(ProtocolType::Sixel | ProtocolType::Iterm2 | ProtocolType::Kitty)
         )
     }
 
@@ -3452,16 +3454,20 @@ mod tests {
     }
 
     #[test]
-    fn a_resize_measures_the_font_only_for_sixel_and_iterm2_pictures() {
-        for protocol in [ProtocolType::Sixel, ProtocolType::Iterm2] {
+    fn a_resize_measures_the_font_for_sixel_iterm2_and_kitty_pictures() {
+        // Kitty and Ghostty size a placeholder picture from its pixel size and the
+        // current cell size, so Kitty pictures follow the font like Sixel and iTerm2.
+        for protocol in [
+            ProtocolType::Sixel,
+            ProtocolType::Iterm2,
+            ProtocolType::Kitty,
+        ] {
             let mut h = picture_app(protocol, CellSize::DEFAULT);
             assert_eq!(measurements(&resize(&mut h, (100, 30))), 1, "{protocol:?}");
         }
-        // Kitty placeholders and half-blocks scale with the cells.
-        for protocol in [ProtocolType::Kitty, ProtocolType::Halfblocks] {
-            let mut h = picture_app(protocol, CellSize::DEFAULT);
-            assert_eq!(measurements(&resize(&mut h, (100, 30))), 0, "{protocol:?}");
-        }
+        // Half-blocks are text cells: they scale with the cells.
+        let mut h = picture_app(ProtocolType::Halfblocks, CellSize::DEFAULT);
+        assert_eq!(measurements(&resize(&mut h, (100, 30))), 0);
         // Images off: no picker, nothing to follow.
         let mut h = Harness::new();
         h.char('1');
@@ -3515,23 +3521,35 @@ mod tests {
 
     #[test]
     fn a_new_font_rebuilds_the_picker_and_drops_the_pictures() {
-        let mut h = picture_app(ProtocolType::Sixel, CellSize::DEFAULT);
-        for _ in 0..3 {
-            h.char('g');
+        for protocol in [
+            ProtocolType::Sixel,
+            ProtocolType::Iterm2,
+            ProtocolType::Kitty,
+        ] {
+            let mut h = picture_app(protocol, CellSize::DEFAULT);
+            while h.app.glyphs() != GlyphSet::Image {
+                h.char('g');
+            }
+            assert!(!h.app.piece_images().is_empty(), "{protocol:?}");
+            // A font zoom: the window keeps its pixels and gets more cells, now 8×16 each.
+            assert_eq!(measurements(&resize(&mut h, (100, 30))), 1, "{protocol:?}");
+            h.app.font_measured(Some(CellSize::new(8, 16)));
+            assert_eq!(h.app.cell_size(), CellSize::new(8, 16), "{protocol:?}");
+            assert_eq!(
+                picker_format(&h.app),
+                Some((protocol, (8, 16))),
+                "the pictures are encoded for the new font"
+            );
+            assert!(
+                h.app.piece_images().is_empty(),
+                "{protocol:?}: the old pictures are gone"
+            );
+            h.draw();
+            assert!(
+                !h.app.piece_images().is_empty(),
+                "{protocol:?}: and drawn again"
+            );
         }
-        assert!(!h.app.piece_images().is_empty());
-        // A font zoom: the window keeps its pixels and gets more cells, now 8×16 each.
-        assert_eq!(measurements(&resize(&mut h, (100, 30))), 1);
-        h.app.font_measured(Some(CellSize::new(8, 16)));
-        assert_eq!(h.app.cell_size(), CellSize::new(8, 16));
-        assert_eq!(
-            picker_format(&h.app),
-            Some((ProtocolType::Sixel, (8, 16))),
-            "the pictures are encoded for the new font"
-        );
-        assert!(h.app.piece_images().is_empty(), "the old pictures are gone");
-        h.draw();
-        assert!(!h.app.piece_images().is_empty(), "and drawn again");
 
         // Without images the font size still shapes the squares.
         let mut h = Harness::new();

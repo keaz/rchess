@@ -941,19 +941,38 @@ mod tests {
     }
 
     #[test]
-    fn kitty_and_half_block_pictures_are_never_measured() {
-        for protocol in [ProtocolType::Kitty, ProtocolType::Halfblocks] {
-            let mut app = picture_game(protocol);
-            let run = drive_with_font(
-                &mut app,
-                &AtomicI32::new(0),
-                vec![resizes(&[(100, 30), (80, 24)]), Step::Signal],
-                Some(CellSize::new(8, 16)),
-            );
-            run.result.expect("loop ends cleanly");
-            assert!(run.measured_after.is_empty(), "{protocol:?}");
-            assert_eq!(app.cell_size(), CellSize::DEFAULT, "{protocol:?}");
-        }
+    fn kitty_pictures_follow_a_font_zoom() {
+        // Kitty and Ghostty size a placeholder picture from its pixel size and the
+        // current cell size, so a picture made for the old font would be cropped or
+        // shrunk after a zoom.
+        let mut app = picture_game(ProtocolType::Kitty);
+        let run = drive_with_font(
+            &mut app,
+            &AtomicI32::new(0),
+            vec![resizes(&[(100, 30), (80, 24)]), Step::Signal],
+            Some(CellSize::new(8, 16)),
+        );
+        run.result.expect("loop ends cleanly");
+        assert_eq!(run.measured_after, [1]);
+        assert_eq!(app.cell_size(), CellSize::new(8, 16));
+        let picker = app.picker().expect("images stay on");
+        assert_eq!(picker.protocol_type(), ProtocolType::Kitty);
+        let font = picker.font_size();
+        assert_eq!((font.width, font.height), (8, 16));
+    }
+
+    #[test]
+    fn half_block_pictures_are_never_measured() {
+        let mut app = picture_game(ProtocolType::Halfblocks);
+        let run = drive_with_font(
+            &mut app,
+            &AtomicI32::new(0),
+            vec![resizes(&[(100, 30), (80, 24)]), Step::Signal],
+            Some(CellSize::new(8, 16)),
+        );
+        run.result.expect("loop ends cleanly");
+        assert!(run.measured_after.is_empty());
+        assert_eq!(app.cell_size(), CellSize::DEFAULT);
     }
 
     #[test]
