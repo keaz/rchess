@@ -684,7 +684,12 @@ what is sent to Jev. Sections 6.x still hold except where this section changes t
   pixel size; Kitty placeholders and half-blocks scale with the cells), the font size is measured
   again the same way (cell-size query and status request, `poll`, 1 s deadline, else window pixels ÷
   cells, else unchanged), once per batch of resize events; a changed size rebuilds the picker and
-  clears the picture cache. The font is never guessed from pixel sizes and padding alone.
+  clears the picture cache. The font is never guessed from pixel sizes and padding alone. crossterm
+  drops the cell-size and status answers but would then block reading until the next input, so a
+  measurement that gives up also asks for the device attributes (`ESC [ c`), whose answer comes last
+  and wakes crossterm; the answers such a measurement still owes are skipped by the next one. Known
+  limits on terminals that answer more than 1 s late: keys typed during a measurement's wait are
+  lost, and a stale font can stay until the next resize.
 - Default style: `Image` when the picker found Kitty, iTerm2 or Sixel; otherwise Solid, with `Image`
   still in the cycle (drawn with half-blocks).
 - Drawing: in `Image` style each occupied square at least 5×2 cells (Kitty, iTerm2, Sixel) or 11×5
