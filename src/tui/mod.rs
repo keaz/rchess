@@ -88,7 +88,7 @@ const USAGE: &str = concat!(
 ///
 /// # Errors
 ///
-/// When stdout is not a terminal, when signal handlers cannot be installed, or
+/// When stdin or stdout is not a terminal, when signal handlers cannot be installed, or
 /// when the terminal cannot be set up, read or drawn. Writing the `--help` text
 /// can fail too.
 pub fn run(args: impl IntoIterator<Item = String>) -> io::Result<()> {
@@ -96,10 +96,10 @@ pub fn run(args: impl IntoIterator<Item = String>) -> io::Result<()> {
         Cli::Help => return io::stdout().lock().write_all(USAGE.as_bytes()),
         Cli::Play(options) => options,
     };
-    if !io::stdout().is_terminal() {
-        return Err(io::Error::other(
-            "stdout is not a terminal; run it in a terminal (see --help)",
-        ));
+    // Before touching the terminal: without a terminal on stdin the key reader fails only
+    // after the menu has been drawn on the alternate screen.
+    if let Some(problem) = terminal_problem(io::stdin().is_terminal(), io::stdout().is_terminal()) {
+        return Err(io::Error::other(problem));
     }
 
     let env = |name: &str| std::env::var(name).ok();
@@ -129,6 +129,18 @@ pub fn run(args: impl IntoIterator<Item = String>) -> io::Result<()> {
         terminal::exit_by_signal(signal);
     }
     result
+}
+
+/// Why the UI cannot run, given whether stdin and stdout are terminals: it reads keys
+/// from one and draws on the other.
+fn terminal_problem(stdin_is_terminal: bool, stdout_is_terminal: bool) -> Option<&'static str> {
+    if !stdout_is_terminal {
+        Some("stdout is not a terminal; run it in a terminal (see --help)")
+    } else if !stdin_is_terminal {
+        Some("stdin is not a terminal; run it in a terminal (see --help)")
+    } else {
+        None
+    }
 }
 
 /// Sets up the terminal, runs the main loop and restores the terminal (also on
@@ -490,6 +502,20 @@ mod tests {
         }
         assert!(USAGE.contains("Usage: chess "));
         assert!(USAGE.lines().all(|line| line.chars().count() <= 80));
+    }
+
+    #[test]
+    fn both_stdin_and_stdout_must_be_terminals() {
+        assert_eq!(terminal_problem(true, true), None);
+        assert_eq!(
+            terminal_problem(true, false),
+            Some("stdout is not a terminal; run it in a terminal (see --help)")
+        );
+        assert_eq!(
+            terminal_problem(false, true),
+            Some("stdin is not a terminal; run it in a terminal (see --help)")
+        );
+        assert!(terminal_problem(false, false).is_some());
     }
 
     // ----- main loop -----
