@@ -4,14 +4,14 @@ Read this first. Follow the protocol in section 8 of
 `docs/superpowers/specs/2026-09-26-rchess-redesign-design.md`.
 
 ## Current
-Sub-project: tui-polish (spec section 9) | Plan: docs/superpowers/plans/2026-09-27-tui-polish.md
-Branch: feat/tui-polish (spec section 9 and the plan committed; no code yet). main has feat/tui merged locally at 575c3f6, not pushed.
-Last completed task: tui-polish plan written from a reviewed prototype and replayed on a fresh clone (every task's patches apply, tests patches fail as stated, counts match, pty smoke green)
-Next task: user reviews the plan and picks an execution method; then tui-polish task 1
+Sub-project: tui-polish | Plan: docs/superpowers/plans/2026-09-27-tui-polish.md
+Branch: feat/tui-polish
+Last completed task: tui-polish task 1 (Piece images, dependencies and the picture compositor)
+Next task: tui-polish task 2 (engine exchange recording)
 State: green (except 3 pre-existing old-code test failures)
 
 ## Verify before continuing
-git status && env -u JEV_API_KEY -u TYPESAFE_API_KEY INSTA_UPDATE=no cargo test --lib tui:: && cargo test --lib engine::
+env -u JEV_API_KEY -u TYPESAFE_API_KEY INSTA_UPDATE=no cargo test --lib tui:: && cargo test --lib engine::
 
 ## Manual smoke test (TUI, by the user)
 Run `cargo run` in a real terminal (Ghostty, Kitty, WezTerm or Alacritty) and check:
@@ -139,6 +139,7 @@ Run `cargo run` in a real terminal (Ghostty, Kitty, WezTerm or Alacritty) and ch
 - None.
 
 ## Log (newest first)
+- 2026-09-27 tui-polish task 1 done: Piece images, dependencies and the picture compositor
 - 2026-09-27 tui-polish plan written: 8 tasks as git patches from a prototype (per-task 3-lens review with skeptics, whole-prototype 5-lens review, 3 fix rounds), replayed three times on a fresh clone; spec section 9 amended with the rulings made while prototyping
 - 2026-09-27 user smoke-tested the TUI: wants it to fill the terminal, bigger and clearer pieces, and a Jev debug view; tui-polish designed (spec section 9: full-screen layout, Cburnett piece images via ratatui-image, --debug exchange view and JSON-lines log)
 - 2026-09-27 feat/tui merged into main locally (575c3f6); merged result verified: tui:: 293 passed, whole crate only the 3 known old-code failures, pty smoke green

@@ -14,6 +14,7 @@ pub mod glyphs;
 pub mod input;
 pub mod movetext;
 pub mod panels;
+pub mod pieces;
 pub mod terminal;
 #[cfg(test)]
 mod test_support;
