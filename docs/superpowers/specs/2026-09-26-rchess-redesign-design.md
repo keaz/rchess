@@ -627,7 +627,9 @@ what is sent to Jev. Sections 6.x still hold except where this section changes t
 - New dependencies: `ratatui-image = { version = "11.1", default-features = false, features =
   ["crossterm"] }` (MIT; built on ratatui `^0.30.1`; the default `chafa-dyn` feature would need
   libchafa, so default features stay off) and `image = { version = "0.25", default-features = false,
-  features = ["png"] }` for decoding and compositing. Nothing else.
+  features = ["png"] }` for decoding and compositing, and `rustix = { version = "1", features =
+  ["event"] }` (already in the tree through crossterm) for `poll` on stdin during the graphics query
+  (9.3). Nothing else.
 - Piece art: the Cburnett set (Colin M.L. Burnett, Wikimedia Commons `Chess_{k,q,r,b,n,p}{l,d}t45.svg`),
   used under its BSD licence (it is also offered under GPL and GFDL). The licence is confirmed from
   the Commons file pages when the files are fetched; if BSD is not offered, stop and ask the user.
