@@ -105,7 +105,8 @@ Run `cargo run` in a real terminal (Ghostty, Kitty, WezTerm or Alacritty) and ch
 - src/tui/glyphs.rs:278 the CLI and `RCHESS_GLYPHS` branches of `initial_glyphs` repeat the same parse-or-reject shape.
 - src/tui/test_support/mod.rs:87 the doc of `char_events` says "as the terminal reports them", but every character is sent with no modifiers.
 - src/tui/board.rs:182 the label column and row only get a symbol; their style is never reset, unlike square cells.
-- src/tui/board.rs:923 no test renders a full 7×3 board (cursor outline over 3-row squares, the middle-row glyph cell, label rows).
+- src/tui/board.rs:874 no snapshot renders a full 7×3 board; 7×3 squares are covered only by geometry tests, a clipped render and the NO_COLOR cursor-mark test (label rows and the full cursor outline are not).
+- src/tui/panels.rs:564 `fit_message` and `cut_to_fit` are quadratic in the message length and run every frame, so a very long pasted save path makes the UI lag while its error is shown.
 - src/tui/input.rs:69 `insert_str` deletes tabs outright, so a pasted `:fen\t<FEN>` joins words and FEN fields.
 - src/tui/input.rs:69 if the box already holds text, a paste made only of line breaks does not submit it.
 - src/tui/input.rs:158 `is_ignored` misses some invisible format characters (U+061C, U+00AD, U+180E, U+034F, U+FFF9-U+FFFB).
