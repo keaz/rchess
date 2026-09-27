@@ -5,13 +5,13 @@ Read this first. Follow the protocol in section 8 of
 
 ## Current
 Sub-project: tui | Plan: docs/superpowers/plans/2026-09-27-tui.md
-Branch: feat/tui (spec section 6 + plan committed; no TUI code yet)
-Last completed task: TUI plan written and verified (prototype built, reviewed with skeptics, replayed task by task: every stage compiles and passes)
-Next task: tui task 1 (dependencies, module root and glyphs)
+Branch: feat/tui
+Last completed task: tui task 1 (dependencies, module root and glyphs)
+Next task: tui task 2 (board widget)
 State: green (except 3 pre-existing old-code test failures)
 
 ## Verify before continuing
-git status && cargo test --lib engine:: && ls docs/superpowers/plans
+INSTA_UPDATE=no cargo test --lib tui::
 
 ## Core API caveats (read before building on core)
 - `Position::play` / `to_san` require a move from `self.legal_moves()`; debug builds assert, release builds may corrupt the position; use `Game::play` for unvalidated input.
@@ -73,6 +73,7 @@ git status && cargo test --lib engine:: && ls docs/superpowers/plans
 - None.
 
 ## Log (newest first)
+- 2026-09-27 tui task 1 done: dependencies, module root and glyphs
 - 2026-09-27 TUI plan written (7 tasks, ~15k lines incl. verified code and 19 snapshots); replay counts 20/39/81/103/139/250/272, pty smoke test green; spec 6 synced with the prototype.
 - 2026-09-27 TUI brainstorming: spec section 6 revised (terminal guard, thread-aware panic hook, signals, stale-reply check, lenient move text, glyph sets, dev opt-level 3, snapshot tests).
 - 2026-09-27 fix/engine-pin-and-endpoint merged into main: SEE pins recomputed after the first capture, kings respect pinned guards, fixed Jev endpoint (JEV_BASE_URL removed), wire format pinned to the quickstart.
