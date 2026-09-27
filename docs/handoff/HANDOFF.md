@@ -91,6 +91,7 @@ Run `cargo run` in a real terminal (Ghostty, Kitty, WezTerm or Alacritty) and ch
   - 6.2 layout: the move list writes a game that starts with Black to move as `12. ...  Kd7` (B6), not `12... Kd7`; PGN export is unchanged.
   - 6.1: `run` also refuses a non-terminal stdin, not only stdout (B5).
 - TUI task 6 fix round 1: `app.rs`'s `apply_outcome` now clears `self.message` in the `EngineOutcome::Move` arm (before the `recovered` check) once the computer's move has been played, so an error set while the engine was thinking (a stray typed move, "asking the engine again", "took back N move(s)") no longer survives into the human's next turn. Deviation from the plan's code (the brief's `apply_outcome` omits this clear), by fix-round ruling to close a verified review finding.
+- TUI task 4 fix round 1: `graphics.rs`'s `ask` no longer writes the capability query at all on non-unix platforms (it used to write it, then call `read_stdin_byte`, whose non-unix stub errors without reading anything, so the terminal's reply landed on the wire for crossterm to read as key presses once the event loop started). `ask` is now a thin wrapper around a new `ask_with(readable, write, read_byte, query, stop)` that returns `QueryError::Io(Unsupported)` before writing when `readable` (the platform constant `ANSWERS_READABLE`, true only on unix) is false; two new tests (`ask_writes_nothing_where_the_answers_cannot_be_read`, `ask_writes_then_reads_where_the_answers_can_be_read`) cover both branches on any platform via the injected writer/reader. Deviation from the plan's code (the brief's `ask` is unconditional), by fix-round ruling to close a verified review finding.
 
 ## Known open issues
 - Engine minor: annotate's "undefended" qualifier (annotate.rs, capture branch) counts a king as a recapturer even when the recapture would be illegal, e.g. `8/8/8/2k5/3n4/5B2/3QK3/8 w - - 0 1` Qxd4 reads "wins material in the exchange" instead of "undefended". SEE values are correct.
@@ -139,6 +140,7 @@ Run `cargo run` in a real terminal (Ghostty, Kitty, WezTerm or Alacritty) and ch
 - None.
 
 ## Log (newest first)
+- 2026-09-28 tui-polish task 4 fix round 1: non-unix `ask` no longer writes the graphics query it cannot read the answer to (verified review finding); `tui::` 355 passed
 - 2026-09-28 tui-polish task 4 done: Graphics detection and the Image style
 - 2026-09-27 tui-polish task 3 done: Full-screen layout with font-shaped squares
 - 2026-09-27 tui-polish task 2 done: Engine: record the Jev exchange for debug mode

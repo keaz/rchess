@@ -185,13 +185,47 @@ fn query_text(is_tmux: bool, get: impl Fn(&str) -> Option<String>) -> String {
     Parser::query(is_tmux, options)
 }
 
-/// Writes `query` to stdout and reads the answers from stdin.
+/// Writes `query` to stdout and reads the answers from stdin. Where the answers
+/// cannot be read at all ([`ANSWERS_READABLE`] is false: every platform but unix, see
+/// [`read_stdin_byte`]'s stub below), the query is never written either: otherwise the
+/// terminal's reply would still land on the wire with nothing here left to read it, and
+/// crossterm's event reader would pick it up as ordinary key presses once the event
+/// loop starts (`ESC [ ? 1 ; 6 ; ...` reads as `Esc`, `[`, `?`, `1`, ...).
 fn ask(query: &str, stop: impl Fn() -> bool) -> Result<Vec<Response>, QueryError> {
+    ask_with(ANSWERS_READABLE, write_stdout, read_stdin_byte, query, stop)
+}
+
+/// Whether this platform's [`read_stdin_byte`] can actually read stdin. Only the unix
+/// implementation polls and reads; the `#[cfg(not(unix))]` stub always errors without
+/// reading anything, so [`ask`] must not write the query there either.
+#[cfg(unix)]
+const ANSWERS_READABLE: bool = true;
+#[cfg(not(unix))]
+const ANSWERS_READABLE: bool = false;
+
+/// Writes `bytes` to stdout and flushes it.
+fn write_stdout(bytes: &[u8]) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
-    stdout.write_all(query.as_bytes())?;
-    stdout.flush()?;
-    drop(stdout);
-    read_answers(read_stdin_byte, QUERY_TIMEOUT, stop)
+    stdout.write_all(bytes)?;
+    stdout.flush()
+}
+
+/// [`ask`], with `readable`, `write` and `read_byte` injectable so both of its
+/// branches are covered by a test regardless of the platform it runs on: nothing is
+/// written when `readable` is false, otherwise `write` runs before `read_byte` is
+/// asked for the answers.
+fn ask_with(
+    readable: bool,
+    write: impl FnOnce(&[u8]) -> io::Result<()>,
+    read_byte: impl FnMut(Duration) -> io::Result<Option<u8>>,
+    query: &str,
+    stop: impl Fn() -> bool,
+) -> Result<Vec<Response>, QueryError> {
+    if !readable {
+        return Err(QueryError::Io(io::ErrorKind::Unsupported.into()));
+    }
+    write(query.as_bytes())?;
+    read_answers(read_byte, QUERY_TIMEOUT, stop)
 }
 
 /// Feeds the bytes from `read_byte` to the answer parser until the status report
@@ -438,8 +472,10 @@ fn read_stdin_byte(wait: Duration) -> io::Result<Option<u8>> {
     }
 }
 
-/// Reading the answers needs `poll`, so elsewhere the query fails at once and the
-/// picker draws half-blocks.
+/// Reading the answers needs `poll`, which this platform does not have. Passed to
+/// [`ask_with`] as `read_byte` for [`ask`] to compile unchanged on every platform, but
+/// never actually called there: [`ANSWERS_READABLE`] is false here, so `ask_with`
+/// returns before reading (or writing) anything.
 #[cfg(not(unix))]
 fn read_stdin_byte(_wait: Duration) -> io::Result<Option<u8>> {
     Err(io::ErrorKind::Unsupported.into())
@@ -543,6 +579,52 @@ mod tests {
         let query = query_text(true, env(&[]));
         assert!(query.starts_with("\x1bPtmux;\x1b\x1b_Gi=31"), "{query:?}");
         assert!(query.ends_with("\x1b\x1b[5n\x1b\\"), "{query:?}");
+    }
+
+    // ----- asking (writing the query and reading the answers) -----
+
+    #[test]
+    fn ask_writes_nothing_where_the_answers_cannot_be_read() {
+        let mut written = Vec::new();
+        let result = ask_with(
+            false,
+            |bytes| {
+                written.extend_from_slice(bytes);
+                Ok(())
+            },
+            |_| Ok(None),
+            "query bytes",
+            || false,
+        );
+        assert!(
+            written.is_empty(),
+            "nothing must reach the terminal: {written:?}"
+        );
+        let Err(QueryError::Io(error)) = result else {
+            panic!("expected an I/O error, got {result:?}");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn ask_writes_then_reads_where_the_answers_can_be_read() {
+        let mut written = Vec::new();
+        let mut source = VecDeque::from(KITTY.to_vec());
+        let result = ask_with(
+            true,
+            |bytes| {
+                written.extend_from_slice(bytes);
+                Ok(())
+            },
+            |_| Ok(source.pop_front()),
+            "query bytes",
+            || false,
+        );
+        assert_eq!(written, b"query bytes");
+        assert_eq!(
+            result.expect("complete"),
+            [Response::Kitty, Response::CellSize(Some((9, 18)))]
+        );
     }
 
     // ----- reading the answers -----
