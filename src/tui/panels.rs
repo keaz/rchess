@@ -514,7 +514,8 @@ fn fitted(full: String, brief: String, width: u16) -> String {
 /// (the only place the pause and step delay are shown), the thinking spinner (or the wait
 /// for an earlier request), and the latest message in the rows left ([`fit_message`]). The
 /// turn and thinking lines drop words rather than wrap (the computer's name "Local search"
-/// is long), so they keep one row each.
+/// is long), so they keep one row each; a game's outcome has no brief form and may wrap,
+/// and the message gets the rows its wrapped lines leave.
 fn status_lines(app: &App, now: Instant, width: u16, rows: u16) -> Vec<Line<'static>> {
     let game = app.game();
     let in_check = game.outcome().is_none() && game.position().is_check();
@@ -540,7 +541,12 @@ fn status_lines(app: &App, now: Instant, width: u16, rows: u16) -> Vec<Line<'sta
     } else if app.waiting_for_engine(now) {
         lines.push(Line::from(WAITING_FOR_ENGINE).yellow());
     }
-    let used = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    // Rows, not lines: an outcome ("Insufficient material — draw (1/2-1/2)") has no brief
+    // form and may wrap.
+    let used = lines
+        .iter()
+        .map(|line| wrapped_height(&line.to_string(), width))
+        .fold(0, u16::saturating_add);
     if let Some(message) = app.message()
         && rows > used
     {
@@ -1700,6 +1706,30 @@ mod tests {
             status.iter().any(|row| row.ends_with("/folder/game.pgn")),
             "{status:?}"
         );
+    }
+
+    #[test]
+    fn a_save_message_under_a_wrapped_outcome_names_the_file() {
+        // "Black resigned — White wins (1-0)" is wider than the Status panel at 60x20,
+        // so it takes two rows and the save message gets what is left.
+        let dir = crate::tui::test_support::TempDir::new("outcome-save");
+        let folder = dir.path().join("subfolder12");
+        std::fs::create_dir_all(&folder).expect("folder");
+        let mut h = Harness::sized(FakeEngine::local(), 60, 20);
+        h.char('1');
+        h.command("e4");
+        h.command(":resign");
+        h.char('y');
+        assert_eq!(h.app.screen_name(), "game over");
+        h.ctrl('s');
+        h.type_text(folder.join("game").to_str().expect("utf-8 temp path"));
+        h.press(KeyCode::Enter);
+        assert!(folder.join("game.pgn").exists());
+        let status = panel_rows(&h, "Status");
+        assert!(status.iter().any(|row| row.contains("(1-0)")), "{status:?}");
+        let last = status.last().expect("a message row");
+        assert!(last.starts_with("saved "), "{status:?}");
+        assert!(last.ends_with("/game.pgn"), "{status:?}");
     }
 
     #[test]
