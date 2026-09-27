@@ -7,10 +7,13 @@
 //! until the user quits or a signal asks it to stop.
 
 pub mod board;
+pub mod event;
 pub mod files;
 pub mod glyphs;
 pub mod input;
 pub mod movetext;
+pub mod terminal;
+pub mod worker;
 
 #[cfg(test)]
 mod test_support;

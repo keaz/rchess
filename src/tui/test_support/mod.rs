@@ -14,6 +14,8 @@
 //! Nothing here touches the network or a real terminal: engine requests are answered by
 //! the test itself or by a fake engine on a worker thread.
 
+pub(crate) mod engine;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};

@@ -6,8 +6,8 @@ Read this first. Follow the protocol in section 8 of
 ## Current
 Sub-project: tui | Plan: docs/superpowers/plans/2026-09-27-tui.md
 Branch: feat/tui
-Last completed task: tui task 4 (saving FEN and PGN)
-Next task: tui task 5 (engine worker, events, terminal guard)
+Last completed task: tui task 5 (engine worker, events and terminal guard)
+Next task: tui task 6 (app state machine and rendering)
 State: green (except 3 pre-existing old-code test failures)
 
 ## Verify before continuing
@@ -63,6 +63,7 @@ INSTA_UPDATE=no cargo test --lib tui::
 - Follow-up review fixes (2026-09-27): in SEE a king captures only onto a square no enemy piece attacks, pinned or not (a pinned piece still guards against a king), so `capture_gain(d5)` in `4k3/8/4b3/3n4/2K5/8/8/4R3 b` and `see(d1d4)` in `3rk3/8/8/4b3/3r4/2K5/8/3RQ3 w` are now 0; `JEV_ENDPOINT` is re-exported as `engine::JEV_ENDPOINT` (no engine rustdoc warnings); the wire-format test compares body keys as a set and the endpoint test checks host and path. Test counts: `cargo test --lib engine::` 96 passed, 2 ignored; whole lib 202 passed, 3 failed (old code), 3 ignored.
 - Final-review fix wave: a mate on the 100th half-move now outranks the fifty-move rule; SEE ignores pinned pieces off their pin line; annotation facts corrected ("exposed to capture" wording, no such fact for the capturing piece, a king only attacks undefended pieces); base-URL variable validated (since removed by the engine follow-up); transport errors classified (new `JevError::Request`), 1 MiB body cap and offline TcpListener tests; notes stripped of control characters; public docs, `ComputerPlayer` Debug and `MoveSource` Display; harness `jev pick` column and answered-only latency.
 - TUI task 4: implemented as specified in the brief, no deviations. `INSTA_UPDATE=no cargo test --lib tui::` reports 104 passed (brief said 103); the extra test is from task 3's fix round 1, which added a test after the brief text was written.
+- TUI task 5: implemented as specified in the brief, no deviations. `INSTA_UPDATE=no cargo test --lib tui::` reports 140 passed (brief said 139); the extra test carries forward from task 4's count above (104 baseline + 36 new tests in worker.rs/event.rs/terminal.rs = 140).
 - TUI task 3 fix round 1: `movetext.rs`'s `loose_match` no longer short-circuits on the first loose-SAN or piece-spelling match; it now always also computes the promotion-without-piece candidates (renamed `missing_promotion` to `promotion_candidates`, returning candidates rather than a `Result`) and merges them in, so a pawn promotion typed without its piece (`bxc8`) that also matches another piece's move on the same square (`Bxc8`) is reported `MoveTextError::Ambiguous` (`Bxc8`, `bxc8=?`, the latter collapsing all four promotion pieces via new helper `promotion_family_labels`) instead of silently playing the other piece's move. Deviation from the plan's code (the brief's `loose_match`/`missing_promotion` are restructured), by fix-round ruling to close a verified review finding.
 
 ## Known open issues
@@ -75,6 +76,7 @@ INSTA_UPDATE=no cargo test --lib tui::
 - None.
 
 ## Log (newest first)
+- 2026-09-27 tui task 5 done: engine worker, events and terminal guard
 - 2026-09-27 tui task 4 done: saving FEN and PGN
 - 2026-09-27 tui task 3 done: move text and command line
 - 2026-09-27 tui task 2 done: board widget and hit-testing
