@@ -1,9 +1,10 @@
 //! Drawing every screen (spec sections 6.2, 6.3 and 9.2).
 //!
 //! [`draw`] renders an [`App`] through its public accessors only: the menu, the playing
-//! screen's panels, the game-over overlay, the top dialog and the too-small notice. It
-//! returns the [`HitMap`] of everything clickable, which the app keeps for the next mouse
-//! event, and the move-list scroll clamped to what the list can show. The board's piece
+//! screen's panels, the game-over overlay, the Jev exchange view (debug mode), the top
+//! dialog and the too-small notice. It returns the [`HitMap`] of everything clickable,
+//! which the app keeps for the next mouse event, the move-list scroll clamped to what the
+//! list can show, and the exchange view's page size and scroll limit. The board's piece
 //! pictures (the Image style) are kept in the [`PieceImages`] the app lends it, and are
 //! not drawn where the game-over box or a dialog will cover them.
 //!
@@ -20,6 +21,12 @@
 //! latency, model and the note) and takes the rows from Moves, which gets the rest and
 //! keeps at least [`MOVES_MIN_ROWS`]; when even that is not enough, only the note is cut
 //! short, ending in `…`. Menu, dialogs, help and the game-over overlay stay centred boxes.
+//! In debug mode the Status panel's border says `DEBUG`.
+//!
+//! The exchange view takes the whole screen instead of the playing screen (nothing of the
+//! board is drawn under it, so no piece picture is lost under it), with dialogs still on
+//! top. Its body text comes ready-made with the exchange ([`Exchange::body`]); a frame only
+//! wraps the rows it shows.
 //!
 //! The snapshot tests at the bottom of this file render every screen; their files in
 //! `src/tui/snapshots/` (`chess__tui__panels__tests__*.snap`) show the exact output at
@@ -46,6 +53,7 @@ use super::app::{
     is_too_small, move_rows, outcome_text,
 };
 use super::board::{BoardGeometry, BoardView, CellSize, PieceImages, layout_board};
+use super::debug::{Exchange, ExchangeView, LineKind, NO_EXCHANGES, Record};
 use super::glyphs::{self, ELLIPSIS, GlyphSet, Palette, char_width};
 use super::input::LineEditor;
 use crate::core::{Color as Side, Game, Piece, PieceKind, Position as ChessPosition};
@@ -54,7 +62,7 @@ use crate::engine::{ComputerMove, MoveSource};
 /// The help dialog's text. The first [`HELP_KEY_WIDTH`] characters of each line are the
 /// key column (drawn bold); no line is wider than 56 cells, so the dialog fits a 60-column
 /// terminal.
-pub const HELP_LINES: [&str; 13] = [
+pub const HELP_LINES: [&str; 14] = [
     "Mouse     click a piece, then a square, or drag it there",
     "Arrows    move the cursor; Enter picks up and puts down",
     "Esc       drop the piece, or leave the command box",
@@ -64,6 +72,7 @@ pub const HELP_LINES: [&str; 13] = [
     "            :fen <FEN>  :savefen <path>  :savepgn <path>",
     "u  f  n   undo, flip the board, new game",
     "g  m  ?   glyph set, menu, this help",
+    "d         exchange view (start with --debug)",
     "Ctrl+S    save the game as PGN",
     "q         quit (Ctrl+C works everywhere)",
     "Space     pause watching, or retry a failed engine",
@@ -99,6 +108,10 @@ const PROMPT: &str = "> ";
 const PROMPT_WIDTH: u16 = 2;
 /// Dialog borders.
 const ACCENT: Color = Color::Cyan;
+/// The Status panel's border tag in debug mode.
+const DEBUG_TAG: &str = " DEBUG ";
+/// The exchange view's keys, on its bottom border.
+const EXCHANGE_KEYS: &str = " ↑↓ PgUp PgDn Home End · ←→ older/newer · Esc closes ";
 /// Pawn, knight, bishop, rook, queen and king values for the material count; the king
 /// never leaves the board, so its value is irrelevant.
 const PIECE_VALUES: [i32; 6] = [1, 3, 3, 5, 9, 0];
@@ -111,6 +124,9 @@ pub struct Drawn {
     /// The move-list scroll, clamped so the list never scrolls past its first row.
     /// Unchanged when the move list was not drawn.
     pub move_scroll: usize,
+    /// The exchange view with its scroll clamped and its page size and scroll limit as
+    /// drawn. Unchanged when the view was not drawn.
+    pub exchange_view: Option<ExchangeView>,
 }
 
 /// Draws `app` into `frame` and returns the click targets and the clamped move-list
@@ -120,6 +136,7 @@ pub fn draw(app: &App, images: &mut PieceImages, frame: &mut Frame, now: Instant
     let mut drawn = Drawn {
         hits: HitMap::default(),
         move_scroll: app.move_scroll(),
+        exchange_view: app.exchange_view(),
     };
     let area = frame.area();
     if is_too_small(area) {
@@ -127,10 +144,13 @@ pub fn draw(app: &App, images: &mut PieceImages, frame: &mut Frame, now: Instant
         return drawn;
     }
     let overlays = overlays(app, area);
-    match app.screen() {
-        Screen::Menu => menu(frame, area, app, &mut drawn.hits),
-        Screen::Playing => playing(frame, area, app, images, &overlays, now, &mut drawn),
-        Screen::GameOver => {
+    match (app.exchange_view(), app.screen()) {
+        (Some(view), _) => drawn.exchange_view = Some(exchange_screen(frame, area, app, view)),
+        (None, Screen::Menu) => menu(frame, area, app, &mut drawn.hits),
+        (None, Screen::Playing) => {
+            playing(frame, area, app, images, &overlays, now, &mut drawn);
+        }
+        (None, Screen::GameOver) => {
             playing(frame, area, app, images, &overlays, now, &mut drawn);
             game_over(frame, area, app, &mut drawn.hits);
         }
@@ -504,15 +524,22 @@ fn command_panel(frame: &mut Frame, area: Rect, editor: &LineEditor, focused: bo
     }
 }
 
-/// Status: the mode on the top border (the first of [`App::mode_labels`] that fits, so a
-/// narrow panel shows `You (W) vs Local` rather than nothing), then whose turn it is, the
-/// Jev vs Jev pace, the thinking spinner and the latest message.
+/// Status: `DEBUG` in debug mode and the mode on the top border (the first of
+/// [`App::mode_labels`] that fits, so a narrow panel shows `You (W) vs Local` rather than
+/// nothing), then whose turn it is, the Jev vs Jev pace, the thinking spinner and the
+/// latest message.
 fn status_panel(frame: &mut Frame, area: Rect, app: &App, now: Instant) {
     const TITLE: &str = " Status ";
-    let block = side_block("Status");
+    let mut block = side_block("Status");
+    let mut titles = TITLE.len();
+    if app.debug_mode() {
+        block = block.title_top(Line::from(DEBUG_TAG).yellow().bold());
+        // One border cell between the two titles.
+        titles += DEBUG_TAG.len() + 1;
+    }
     let inner = block.inner(area);
     // Two corners and at least two border cells between the titles.
-    let room = usize::from(area.width).saturating_sub(TITLE.len() + 4);
+    let room = usize::from(area.width).saturating_sub(titles + 4);
     let mode = app
         .mode_labels()
         .into_iter()
@@ -947,6 +974,135 @@ fn piece_span(piece: Piece, glyph_set: GlyphSet, palette: &Palette) -> Span<'sta
     )
 }
 
+// ----- exchange view -----
+
+/// The Jev exchange view on the whole of `area` (spec 9.4): the exchange `view` shows,
+/// with a header saying which one it is and how it went, then its body, wrapped and
+/// scrolled; or [`NO_EXCHANGES`]. Returns `view` with its scroll clamped and its page size
+/// and scroll limit for this size.
+fn exchange_screen(frame: &mut Frame, area: Rect, app: &App, view: ExchangeView) -> ExchangeView {
+    let block = Block::bordered()
+        .title(Line::from(" Jev exchange ").bold())
+        .title_bottom(Line::from(EXCHANGE_KEYS).dim())
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    let history = app.exchanges();
+    let shown = history.and_then(|history| {
+        let index = view.index(history)?;
+        Some((index, history.len(), history.get(index)?))
+    });
+    let Some((index, count, record)) = shown else {
+        frame.render_widget(block, area);
+        frame.render_widget(Line::from(NO_EXCHANGES).dim(), row_of(inner, 0));
+        return ExchangeView {
+            scroll: 0,
+            page: usize::from(inner.height),
+            max_scroll: 0,
+            ..view
+        };
+    };
+    let header = pack(exchange_header(record, index, count), " · ", inner.width);
+    let header_rows = header
+        .iter()
+        .map(|line| wrapped_height(&line.to_string(), inner.width))
+        .fold(0u16, u16::saturating_add)
+        .min(inner.height);
+    // One blank row between the header and the body.
+    let body_top = header_rows.saturating_add(1).min(inner.height);
+    let body_area = Rect {
+        y: inner.y + body_top,
+        height: inner.height - body_top,
+        ..inner
+    };
+    let exchange = &record.exchange;
+    let width = usize::from(body_area.width.max(1));
+    let page = usize::from(body_area.height);
+    let total: usize = exchange.body().iter().map(|line| line.rows(width)).sum();
+    let max_scroll = total.saturating_sub(page);
+    let scroll = view.scroll.min(max_scroll);
+    let block = if total > page {
+        let last = (scroll + page).min(total);
+        block.title_top(Line::from(format!(" {}-{last} of {total} ", scroll + 1)).right_aligned())
+    } else {
+        block
+    };
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Paragraph::new(header).wrap(Wrap { trim: true }),
+        Rect {
+            height: header_rows,
+            ..inner
+        },
+    );
+    frame.render_widget(
+        Paragraph::new(body_rows(exchange, width, scroll, page)),
+        body_area,
+    );
+    ExchangeView {
+        scroll,
+        page,
+        max_scroll,
+        ..view
+    }
+}
+
+/// The exchange view's header for `record`, the `index`th of `count` (from 0), as items
+/// for [`pack`]: `exchange N of M`, `move <fullmove>`, the move, how it was chosen, the
+/// last status, the attempts and the latency, and `stale — not played` when it was not.
+fn exchange_header(record: &Record, index: usize, count: usize) -> Vec<Vec<Span<'static>>> {
+    let exchange = &record.exchange;
+    let attempts = match exchange.attempts() {
+        1 => "1 attempt".to_string(),
+        n => format!("{n} attempts"),
+    };
+    let mut items = vec![
+        vec![Span::raw(format!("exchange {} of {count}", index + 1)).bold()],
+        vec![Span::raw(format!("move {}", exchange.fullmove))],
+        vec![Span::raw(exchange.san.clone()).bold()],
+        vec![Span::raw(exchange.source.clone())],
+        vec![Span::raw(exchange.status())],
+        vec![Span::raw(attempts)],
+        vec![Span::raw(format!("{} ms", exchange.latency.as_millis()))],
+    ];
+    if record.stale {
+        items.push(vec![Span::raw("stale — not played").yellow()]);
+    }
+    items
+}
+
+/// The rows of `exchange`'s body wrapped at `width` cells, from row `scroll`, at most
+/// `page` of them. Only the lines on screen are wrapped.
+fn body_rows(exchange: &Exchange, width: usize, scroll: usize, page: usize) -> Vec<Line<'static>> {
+    let mut rows = Vec::new();
+    let mut top = 0;
+    for line in exchange.body() {
+        if rows.len() == page {
+            break;
+        }
+        let height = line.rows(width);
+        if top + height <= scroll {
+            top += height;
+            continue;
+        }
+        let style = match line.kind {
+            LineKind::Heading => Style::new().bold(),
+            LineKind::Error => Style::new().red(),
+            LineKind::Text => Style::new(),
+        };
+        let skip = scroll.saturating_sub(top);
+        let room = page - rows.len();
+        rows.extend(
+            line.wrapped(width)
+                .into_iter()
+                .skip(skip)
+                .take(room)
+                .map(|row| Line::styled(row, style)),
+        );
+        top += height;
+    }
+    rows
+}
+
 // ----- overlays -----
 
 /// Where the boxes drawn over the playing screen go in `area`: the game-over box (on its
@@ -1359,12 +1515,14 @@ mod tests {
     use super::*;
     use crate::core::{START_FEN, Square};
     use crate::tui::board::{image_area, square_at, square_rect};
+    use crate::tui::debug::DebugLog;
     use crate::tui::event::AppEvent;
     use crate::tui::glyphs::{ImageSupport, initial_glyphs};
     use crate::tui::graphics::picker_for;
-    use crate::tui::test_support::engine::{FakeEngine, JEV_STATUS};
+    use crate::tui::test_support::engine::{FakeEngine, JEV_STATUS, traced_jev_move};
     use crate::tui::test_support::harness::Harness;
     use crate::tui::test_support::{PROMOTION_FEN, game_from, sq};
+    use crate::tui::worker::EngineOutcome;
     use crate::tui::worker::LOCAL_SEARCH_STATUS;
 
     /// An app playing against Jev (with a key), in a `width`×`height` terminal.
@@ -2470,6 +2628,83 @@ mod tests {
         let mut h = Harness::sized(FakeEngine::local(), 80, 24);
         h.char('5');
         insta::assert_snapshot!("local_vs_local_80x24", h.terminal.backend());
+    }
+
+    /// Human vs Jev (the person plays White) at `width`×`height` in debug mode: Jev's
+    /// answer to 1. e4 came after an undo (stale), then its answer to 1. e4 played again.
+    fn two_exchanges(width: u16, height: u16) -> Harness {
+        let mut h = Harness::build(FakeEngine::jev(), (width, height), Vec::new(), |app| {
+            app.with_debug(DebugLog::open(None))
+        });
+        h.char('2');
+        h.moves(&["e4"]);
+        let first = h.request.take().expect("Jev asked");
+        h.char('u');
+        h.answer(
+            &first,
+            EngineOutcome::Move(traced_jev_move(first.game.position(), "e7e5")),
+        );
+        h.moves(&["e4"]);
+        h.reply_traced("c7c5");
+        assert_eq!(h.app.exchanges().map(|history| history.len()), Some(2));
+        h
+    }
+
+    #[test]
+    fn snapshot_exchange_view() {
+        let mut h = two_exchanges(80, 24);
+        h.char('d');
+        insta::assert_snapshot!("exchange_80x24", h.terminal.backend());
+    }
+
+    #[test]
+    fn snapshot_exchange_view_large_on_a_stale_reply() {
+        let mut h = two_exchanges(120, 40);
+        h.char('d');
+        h.press(KeyCode::Left);
+        h.press(KeyCode::PageDown);
+        insta::assert_snapshot!("exchange_120x40_stale", h.terminal.backend());
+    }
+
+    #[test]
+    fn the_exchange_header_breaks_between_items() {
+        let mut h = two_exchanges(60, 20);
+        h.char('d');
+        h.press(KeyCode::Left);
+        let rows: Vec<String> = h.screen().lines().map(str::to_string).collect();
+        assert_eq!(
+            rows[1].trim_matches(|c: char| c == '│' || c.is_whitespace()),
+            "exchange 1 of 2 · move 1 · e5 · Jev · HTTP 200"
+        );
+        assert_eq!(
+            rows[2].trim_matches(|c: char| c == '│' || c.is_whitespace()),
+            "2 attempts · 1234 ms · stale — not played"
+        );
+        assert_eq!(rows[3].trim_matches('│').trim(), "", "a blank row");
+        assert!(rows[4].contains("│ REQUEST"), "{}", rows[4]);
+        assert!(rows[0].contains(" 1-15 of "), "{}", rows[0]);
+        let bottom = &rows[19];
+        assert!(bottom.contains("Esc"), "{bottom}");
+    }
+
+    #[test]
+    fn the_exchange_view_draws_only_the_rows_it_shows() {
+        let h = two_exchanges(80, 24);
+        let record = h
+            .app
+            .exchanges()
+            .and_then(|history| history.last())
+            .unwrap();
+        let exchange = &record.exchange;
+        let all = body_rows(exchange, 20, 0, usize::MAX);
+        let total: usize = exchange.body().iter().map(|line| line.rows(20)).sum();
+        assert_eq!(all.len(), total);
+        assert!(all.iter().all(|row| row.width() <= 20));
+        for (scroll, page) in [(0, 5), (7, 10), (total - 3, 10), (total, 4)] {
+            let rows = body_rows(exchange, 20, scroll, page);
+            let expected: Vec<Line> = all.iter().skip(scroll).take(page).cloned().collect();
+            assert_eq!(rows, expected, "scroll {scroll}, page {page}");
+        }
     }
 
     #[test]

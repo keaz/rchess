@@ -39,11 +39,17 @@
 //!
 //! Actions that throw away a game in progress (quit, new game, menu, resign) ask first, and
 //! their confirmation defaults to No, so a stray Enter never confirms one.
+//!
+//! In debug mode ([`App::with_debug`]) every Jev exchange that comes back with an engine
+//! reply is kept in a [`History`], stale replies included, and queued for the debug log.
+//! `d` on the board opens the full-screen exchange view ([`ExchangeView`]), which takes the
+//! keys (after the dialogs and Ctrl+C) until Esc closes it; engine replies are still applied
+//! underneath. The first debug log failure is shown once as a status message.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{
@@ -53,6 +59,7 @@ use ratatui::layout::{Position as CellPosition, Rect};
 use ratatui_image::picker::Picker;
 
 use super::board::{BoardGeometry, CellSize, Highlights, PieceImages, square_at};
+use super::debug::{DebugLog, DebugSession, Exchange, ExchangeView, History};
 use super::event::AppEvent;
 use super::files::{SaveError, pgn_export, resolve_path, tilde_path, today, write_file};
 use super::glyphs::{self, GlyphSet, Palette};
@@ -83,6 +90,8 @@ pub const MAX_IN_FLIGHT: usize = 2;
 pub const ENGINE_FAILED: &str = "the engine failed; space retries unless typing";
 /// Status line while a new request waits for [`MAX_IN_FLIGHT`] to allow it.
 pub const WAITING_FOR_ENGINE: &str = "waiting for an old request";
+/// Status message for `d` when debug mode is off.
+pub const DEBUG_OFF: &str = "debug mode is off (start with --debug)";
 
 /// The computer player's name when it uses Jev.
 pub const JEV_NAME: &str = "Jev";
@@ -133,6 +142,8 @@ pub const GAME_OVER_BUTTONS: [Button; 3] = [Button::NewGame, Button::SavePgn, Bu
 const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
 /// Milliseconds each spinner frame is shown.
 const SPINNER_FRAME_MS: u128 = 100;
+/// Rows one notch of the mouse wheel scrolls the exchange view.
+const WHEEL_ROWS: usize = 3;
 
 const GAME_IS_OVER: &str = "the game is over (u: undo, n: new game)";
 const NOTHING_TO_UNDO: &str = "nothing to undo";
@@ -608,6 +619,10 @@ pub struct App {
     cell_size: CellSize,
     /// The board's piece pictures, kept between draws.
     piece_images: PieceImages,
+    /// Debug mode's exchanges and log; `None` when debug mode is off.
+    debug: Option<DebugSession>,
+    /// The exchange view, while it is open (only in debug mode).
+    exchange_view: Option<ExchangeView>,
     pick_side: fn() -> Side,
     today: fn() -> String,
     home: Option<PathBuf>,
@@ -640,8 +655,9 @@ pub struct App {
     engine_failed: bool,
     /// Jev vs Jev is paused: no request is sent and no move is played.
     paused: bool,
-    /// An answer that arrived while paused, applied when play resumes.
-    held: Option<EngineOutcome>,
+    /// An answer that arrived while paused, applied when play resumes, with its Jev
+    /// exchange.
+    held: Option<(EngineOutcome, Option<Box<Exchange>>)>,
     step_delay: Duration,
     /// When the last Jev vs Jev move was applied; the next request is due one step
     /// delay later. `None` means due now.
@@ -684,6 +700,8 @@ impl App {
             picker: None,
             cell_size: CellSize::DEFAULT,
             piece_images: PieceImages::new(),
+            debug: None,
+            exchange_view: None,
             pick_side: random_side,
             today,
             home: std::env::var_os("HOME").map(PathBuf::from),
@@ -737,6 +755,15 @@ impl App {
     /// (default [`CellSize::DEFAULT`]). The next draw shapes the board's squares for it.
     pub fn set_cell_size(&mut self, cell_size: CellSize) {
         self.cell_size = cell_size;
+    }
+
+    /// Turns debug mode on (spec 9.4): Jev exchanges that arrive with engine replies are
+    /// kept for the exchange view and written to `log`. The engine must record them
+    /// (`EngineConfig::trace`); without debug mode they are dropped.
+    #[must_use]
+    pub fn with_debug(mut self, log: DebugLog) -> App {
+        self.debug = Some(DebugSession::new(log));
+        self
     }
 
     /// Replaces the coin flip used by "Human vs Jev: random side" (tests pass a fixed side).
@@ -919,6 +946,29 @@ impl App {
         &self.piece_images
     }
 
+    /// True in debug mode (see [`with_debug`](Self::with_debug)).
+    pub fn debug_mode(&self) -> bool {
+        self.debug.is_some()
+    }
+
+    /// The Jev exchanges kept in debug mode, oldest first; `None` when it is off.
+    pub fn exchanges(&self) -> Option<&History> {
+        self.debug.as_ref().map(DebugSession::history)
+    }
+
+    /// The exchange view, while it is open.
+    pub fn exchange_view(&self) -> Option<ExchangeView> {
+        self.exchange_view
+    }
+
+    /// Stops the debug log, waiting up to `grace` for it to write the exchanges still
+    /// queued (see [`DebugLog::close`]). Call it once the app is done.
+    pub fn close_debug_log(&mut self, grace: Duration) {
+        if let Some(debug) = &mut self.debug {
+            debug.close_log(grace);
+        }
+    }
+
     /// The command box text.
     pub fn command_text(&self) -> &str {
         self.command.text()
@@ -1089,6 +1139,7 @@ impl App {
             AppEvent::Term(_) | AppEvent::Tick => {}
             AppEvent::Engine(reply) => self.on_engine(reply, now),
         }
+        self.report_log_failure();
         self.release_held(now);
         self.engine_request(now)
             .map(Action::RequestEngine)
@@ -1127,6 +1178,10 @@ impl App {
         }
         if !self.dialogs.is_empty() {
             self.dialog_key(key);
+            return;
+        }
+        if self.exchange_view.is_some() {
+            self.exchange_key(key);
             return;
         }
         if ctrl_char(&key) == Some('s') && self.screen != Screen::Menu {
@@ -1253,6 +1308,7 @@ impl App {
             'f' => self.flipped = !self.flipped,
             'n' => self.ask_new_game(),
             'g' => self.cycle_glyphs(),
+            'd' => self.open_exchanges(),
             'm' => self.ask_menu(),
             '?' => self.dialogs.push(Dialog::Help),
             'q' => self.request_quit(),
@@ -1270,6 +1326,35 @@ impl App {
             ' ' if watching => self.paused = !self.paused,
             '+' | '=' if watching => self.change_step_delay(1),
             '-' if watching => self.change_step_delay(-1),
+            _ => {}
+        }
+    }
+
+    /// Opens the exchange view on the newest exchange, or says debug mode is off.
+    fn open_exchanges(&mut self) {
+        match &self.debug {
+            Some(debug) => self.exchange_view = Some(ExchangeView::open(debug.history())),
+            None => self.show(Message::info(DEBUG_OFF)),
+        }
+    }
+
+    /// Keys in the exchange view: ↑/↓, PgUp/PgDn and Home/End scroll, ←/→ show the
+    /// older or newer exchange, Esc closes it.
+    fn exchange_key(&mut self, key: KeyEvent) {
+        let (Some(view), Some(debug)) = (&mut self.exchange_view, &self.debug) else {
+            return;
+        };
+        let history = debug.history();
+        match key.code {
+            KeyCode::Up => view.up(1),
+            KeyCode::Down => view.down(1),
+            KeyCode::PageUp => view.page_up(),
+            KeyCode::PageDown => view.page_down(),
+            KeyCode::Home => view.home(),
+            KeyCode::End => view.end(),
+            KeyCode::Left => view.older(history),
+            KeyCode::Right => view.newer(history),
+            KeyCode::Esc => self.exchange_view = None,
             _ => {}
         }
     }
@@ -1365,6 +1450,18 @@ impl App {
 
     fn on_mouse(&mut self, mouse: MouseEvent) {
         let (column, row) = (mouse.column, mouse.row);
+        if self.dialogs.is_empty()
+            && let Some(view) = &mut self.exchange_view
+        {
+            // Nothing under the view can be clicked; the wheel scrolls it.
+            match mouse.kind {
+                MouseEventKind::ScrollUp => view.up(WHEEL_ROWS),
+                MouseEventKind::ScrollDown => view.down(WHEEL_ROWS),
+                _ => {}
+            }
+            self.drag = None;
+            return;
+        }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => self.mouse_down(column, row),
             MouseEventKind::Up(MouseButton::Left) => {
@@ -1445,6 +1542,9 @@ impl App {
             }
             return;
         }
+        if self.exchange_view.is_some() {
+            return;
+        }
         let to_box = match self.screen {
             Screen::Playing => true,
             Screen::GameOver => self.command_focused,
@@ -1468,6 +1568,7 @@ impl App {
                 "discarding engine reply for generation {}: no request pending",
                 reply.generation
             );
+            self.record_exchange(reply.exchange, true);
             return;
         }
         if !is_current(&reply, self.generation, self.game.position().hash()) {
@@ -1476,28 +1577,37 @@ impl App {
                 reply.generation,
                 self.generation
             );
+            self.record_exchange(reply.exchange, true);
             return;
         }
         self.pending = None;
         if self.paused {
             // Paused while the engine was thinking: nothing is played until space resumes.
-            self.held = Some(reply.outcome);
+            self.held = Some((reply.outcome, reply.exchange));
             return;
         }
-        self.apply_outcome(reply.outcome, now);
+        self.apply_outcome(reply.outcome, reply.exchange, now);
     }
 
-    /// Plays a move the worker produced, or records why there is none.
-    fn apply_outcome(&mut self, outcome: EngineOutcome, now: Instant) {
+    /// Plays a move the worker produced, or records why there is none. `exchange` is the
+    /// Jev exchange behind the move, kept as played or, for an illegal move, as not.
+    fn apply_outcome(
+        &mut self,
+        outcome: EngineOutcome,
+        exchange: Option<Box<Exchange>>,
+        now: Instant,
+    ) {
         match outcome {
             EngineOutcome::Move(computer) => {
                 if let Err(error) = self.game.play(computer.mv) {
+                    self.record_exchange(exchange, true);
                     self.engine_failure(&format!(
                         "engine returned an illegal move {}: {error}",
                         computer.mv
                     ));
                     return;
                 }
+                self.record_exchange(exchange, false);
                 let recovered = computer.note.as_deref() == Some(ENGINE_ERROR_NOTE);
                 self.last_computer = Some((self.game.moves().len(), computer));
                 // Notes about the turn just played (a move typed too early, an undo) are
@@ -1526,10 +1636,36 @@ impl App {
     /// Plays the answer held while paused, once play has resumed.
     fn release_held(&mut self, now: Instant) {
         if !self.paused
-            && let Some(outcome) = self.held.take()
+            && let Some((outcome, exchange)) = self.held.take()
         {
-            self.apply_outcome(outcome, now);
+            self.apply_outcome(outcome, exchange, now);
         }
+    }
+
+    /// Keeps `exchange` in debug mode (`stale` when its move was not played) and shows it
+    /// in an open view that had nothing to show. Without debug mode it is dropped.
+    fn record_exchange(&mut self, exchange: Option<Box<Exchange>>, stale: bool) {
+        let (Some(debug), Some(exchange)) = (&mut self.debug, exchange) else {
+            return;
+        };
+        let number = debug.record(*exchange, stale, SystemTime::now());
+        if let Some(view) = &mut self.exchange_view {
+            view.follow(number);
+        }
+    }
+
+    /// Shows the debug log's failure, the one time it is reported.
+    fn report_log_failure(&mut self) {
+        let Some(failure) = self.debug.as_mut().and_then(DebugSession::log_failure) else {
+            return;
+        };
+        let text = format!("debug log disabled: {}", failure.reason);
+        let message = match &failure.path {
+            Some(path) => Message::error(format!("{text}: "))
+                .with_path(tilde_path(path, self.home.as_deref())),
+            None => Message::error(text),
+        };
+        self.show(message);
     }
 
     /// True when it is the engine's turn, nothing stops it, and in Jev vs Jev the step
@@ -1623,6 +1759,7 @@ impl App {
     fn go_to_menu(&mut self) {
         self.screen = Screen::Menu;
         self.dialogs.clear();
+        self.exchange_view = None;
         self.command.clear();
         self.command_focused = false;
         self.cursor = None;
@@ -1631,12 +1768,14 @@ impl App {
     }
 
     /// Forgets everything tied to the old position: in-flight requests (by bumping the
-    /// generation), a held answer, an engine failure, the selection, the move-list scroll,
-    /// and the Jev panel's move once it has been taken back.
+    /// generation), a held answer (its exchange kept as stale), an engine failure, the
+    /// selection, the move-list scroll, and the Jev panel's move once it has been taken back.
     fn invalidate(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.pending = None;
-        self.held = None;
+        if let Some((_, exchange)) = self.held.take() {
+            self.record_exchange(exchange, true);
+        }
         self.engine_failed = false;
         self.selected = None;
         self.drag = None;
@@ -2205,7 +2344,8 @@ impl App {
 
     /// Draws the current state (see [`panels::draw`]) and records the [`HitMap`] used by
     /// the next mouse event. Also clamps the move-list scroll to what the list can show,
-    /// and notes whether only [`TOO_SMALL`] fitted (input is ignored until more does).
+    /// keeps the exchange view's page size and scroll limit for its keys, and notes whether
+    /// only [`TOO_SMALL`] fitted (input is ignored until more does).
     pub fn render(&mut self, frame: &mut Frame, now: Instant) {
         self.too_small = is_too_small(frame.area());
         // Lent to the draw, which reads the rest of the app and keeps new pictures in it.
@@ -2214,6 +2354,9 @@ impl App {
         self.piece_images = images;
         self.hits = drawn.hits;
         self.move_scroll = drawn.move_scroll;
+        if self.exchange_view.is_some() {
+            self.exchange_view = drawn.exchange_view;
+        }
     }
 }
 
@@ -2349,13 +2492,17 @@ mod tests {
 
     use super::*;
     use crate::core::{Piece, Position as ChessPosition, START_FEN};
-    use crate::engine::{MoveSource, analyse};
+    use crate::engine::EngineConfig;
+    use crate::engine::{MoveSource, analyse, recorded_exchange};
     use crate::tui::board::square_rect;
     use crate::tui::graphics;
     use crate::tui::panels::HELP_LINES;
-    use crate::tui::test_support::engine::{FakeEngine, REPLY_TIMEOUT, chord, key, mouse, paste};
+    use crate::tui::test_support::engine::{
+        FakeEngine, REPLY_TIMEOUT, SENTINEL_KEY, chord, jev_move, key, mouse, paste,
+        traced_jev_move,
+    };
     use crate::tui::test_support::harness::{Harness, request};
-    use crate::tui::test_support::{PROMOTION_FEN, TempDir, game_from, sq};
+    use crate::tui::test_support::{PROMOTION_FEN, TempDir, buffer_text, game_from, key_event, sq};
     use crate::tui::worker::{LOCAL_SEARCH_STATUS, spawn_request};
 
     const FOOLS_MATE: [&str; 4] = ["f2f3", "e7e5", "g2g4", "d8h4"];
@@ -3550,6 +3697,7 @@ mod tests {
             generation: request.generation,
             hash: request.hash,
             outcome: EngineOutcome::Move(computer),
+            exchange: None,
         }));
         assert_eq!(h.app.game().moves().last(), Some(&best));
         assert_eq!(h.app.status_line(), ENGINE_ERROR_NOTE);
@@ -4433,6 +4581,448 @@ mod tests {
         assert_eq!(
             outcome_text(Outcome::ThreefoldRepetition),
             "Threefold repetition — draw"
+        );
+    }
+
+    // ----- debug mode -----
+
+    /// A `width`×`height` app in debug mode with `engine`, logging to `log`.
+    fn debug_app(engine: FakeEngine, (width, height): (u16, u16), log: DebugLog) -> Harness {
+        Harness::build(engine, (width, height), Vec::new(), |app| {
+            app.with_debug(log)
+        })
+    }
+
+    /// An 80×24 Human vs Jev game (the person plays White) in debug mode, with a log that
+    /// has no file (it reports that at the first exchange).
+    fn debug_game() -> Harness {
+        let mut h = debug_app(FakeEngine::jev(), (80, 24), DebugLog::open(None));
+        h.char('2');
+        h
+    }
+
+    /// Ticks until the status line starts with `start`, for up to 10 s.
+    fn wait_for_status(h: &mut Harness, start: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !h.app.status_line().starts_with(start) {
+            assert!(
+                Instant::now() < deadline,
+                "status never said {start:?}: {:?}",
+                h.app.status_line()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+            h.tick();
+        }
+    }
+
+    /// The exchanges kept, as (move, stale).
+    fn kept(h: &Harness) -> Vec<(String, bool)> {
+        h.app
+            .exchanges()
+            .expect("debug mode")
+            .iter()
+            .map(|record| (record.exchange.san.clone(), record.stale))
+            .collect()
+    }
+
+    #[test]
+    fn d_says_when_debug_mode_is_off() {
+        let mut h = hvh();
+        assert!(!h.app.debug_mode());
+        assert!(h.app.exchanges().is_none());
+        h.char('d');
+        assert_eq!(h.app.exchange_view(), None);
+        assert_eq!(h.app.status_line(), DEBUG_OFF);
+        assert_eq!(DEBUG_OFF, "debug mode is off (start with --debug)");
+    }
+
+    #[test]
+    fn d_opens_the_exchange_view_and_esc_closes_it() {
+        let mut h = debug_game();
+        assert!(h.app.debug_mode());
+        h.char('d');
+        assert_eq!(
+            h.app.exchange_view().map(|view| view.shown),
+            Some(None),
+            "open, with nothing to show"
+        );
+        let screen = h.screen();
+        assert!(screen.contains("Jev exchange"), "{screen}");
+        assert!(screen.contains("no Jev requests yet"), "{screen}");
+        assert!(!screen.contains("Board"), "the view covers the screen");
+        assert!(h.app.hit_map().board.is_none());
+        h.char('e');
+        h.char('/');
+        assert!(!h.app.command_focused(), "keys go to the view");
+        h.press(KeyCode::Esc);
+        assert_eq!(h.app.exchange_view(), None);
+        assert!(h.screen().contains("Board"));
+        assert!(h.app.hit_map().board.is_some());
+    }
+
+    #[test]
+    fn a_traced_reply_is_kept_with_the_move_it_was_for() {
+        let mut h = debug_game();
+        h.moves(&["e4"]);
+        h.reply_traced("e7e5");
+        assert_eq!(h.uci(), ["e2e4", "e7e5"]);
+        assert_eq!(kept(&h), [("e5".to_string(), false)]);
+        let history = h.app.exchanges().unwrap();
+        let record = history.last().unwrap();
+        assert_eq!(record.number, 1);
+        assert_eq!((record.exchange.ply, record.exchange.fullmove), (1, 1));
+        assert_eq!(
+            h.app.last_computer().map(|c| c.exchange.is_none()),
+            Some(true),
+            "the Jev panel's move does not hold it"
+        );
+        // Without debug mode an exchange is dropped.
+        let mut h = Harness::with_engine(FakeEngine::jev());
+        h.char('2');
+        h.moves(&["e4"]);
+        h.reply_traced("e7e5");
+        assert_eq!(h.uci(), ["e2e4", "e7e5"]);
+        assert!(h.app.exchanges().is_none());
+    }
+
+    #[test]
+    fn stale_replies_are_kept_and_marked() {
+        let mut h = debug_game();
+        let first = request(&h.command("e4"));
+        h.press(KeyCode::Esc);
+        h.char('u');
+        // Nothing pending any more.
+        h.answer(
+            &first,
+            EngineOutcome::Move(traced_jev_move(first.game.position(), "e7e5")),
+        );
+        assert!(h.uci().is_empty());
+        let second = request(&h.command("e4"));
+        h.press(KeyCode::Esc);
+        h.char('u');
+        h.command("d4");
+        h.press(KeyCode::Esc);
+        // Another request is pending: this one is from an older generation.
+        h.answer(
+            &second,
+            EngineOutcome::Move(traced_jev_move(second.game.position(), "c7c5")),
+        );
+        assert_eq!(h.uci(), ["d2d4"]);
+        h.reply_traced("d7d5");
+        assert_eq!(h.uci(), ["d2d4", "d7d5"]);
+        assert_eq!(
+            kept(&h),
+            [
+                ("e5".to_string(), true),
+                ("c5".to_string(), true),
+                ("d5".to_string(), false),
+            ]
+        );
+        h.char('d');
+        h.press(KeyCode::Left);
+        assert!(h.screen().contains("stale — not played"), "{}", h.screen());
+        h.press(KeyCode::Right);
+        assert!(!h.screen().contains("stale"), "{}", h.screen());
+    }
+
+    #[test]
+    fn an_answer_held_while_paused_is_kept_when_played_or_dropped() {
+        let mut h = debug_app(FakeEngine::jev(), (80, 24), DebugLog::open(None));
+        h.char('5');
+        h.reply("e2e4");
+        h.at_ms(5_000);
+        h.tick();
+        h.char(' ');
+        h.reply_traced("e7e5");
+        assert!(h.app.has_held_move());
+        assert!(kept(&h).is_empty(), "not decided yet");
+        h.char('u');
+        assert_eq!(h.uci(), Vec::<String>::new());
+        assert_eq!(kept(&h), [("e5".to_string(), true)], "undo dropped it");
+
+        let mut h = debug_app(FakeEngine::jev(), (80, 24), DebugLog::open(None));
+        h.char('5');
+        h.reply("e2e4");
+        h.at_ms(5_000);
+        h.tick();
+        h.char(' ');
+        h.reply_traced("e7e5");
+        h.char(' ');
+        assert_eq!(h.uci(), ["e2e4", "e7e5"]);
+        assert_eq!(kept(&h), [("e5".to_string(), false)]);
+    }
+
+    #[test]
+    fn an_illegal_traced_move_is_kept_as_not_played() {
+        let mut h = debug_game();
+        let request = request(&h.command("e4"));
+        h.press(KeyCode::Esc);
+        // Legal in the start position, not after e4 (the pawn is gone from e2).
+        let mut computer = traced_jev_move(&ChessPosition::startpos(), "e2e4");
+        computer.san = "e4?".to_string();
+        h.answer(&request, EngineOutcome::Move(computer));
+        assert!(h.app.engine_failed());
+        assert_eq!(kept(&h), [("e4?".to_string(), true)]);
+    }
+
+    #[test]
+    fn replies_are_played_under_the_view_and_it_stays_on_its_exchange() {
+        let mut h = debug_app(FakeEngine::jev(), (80, 24), DebugLog::open(None));
+        h.char('5');
+        h.char('d');
+        h.reply_traced("e2e4");
+        assert_eq!(h.uci(), ["e2e4"], "played underneath");
+        assert_eq!(h.app.exchange_view().and_then(|v| v.shown), Some(1));
+        assert!(h.screen().contains("exchange 1 of 1"), "{}", h.screen());
+        h.at_ms(5_000);
+        h.tick();
+        h.reply_traced("e7e5");
+        assert_eq!(h.uci(), ["e2e4", "e7e5"]);
+        let screen = h.screen();
+        assert!(
+            screen.contains("exchange 1 of 2 · move 1 · e4 · Jev"),
+            "{screen}"
+        );
+        h.press(KeyCode::Right);
+        assert!(h.screen().contains("exchange 2 of 2 · move 1 · e5"));
+        h.press(KeyCode::Right);
+        assert!(
+            h.screen().contains("exchange 2 of 2"),
+            "stops at the newest"
+        );
+        h.press(KeyCode::Left);
+        h.press(KeyCode::Left);
+        assert!(
+            h.screen().contains("exchange 1 of 2"),
+            "stops at the oldest"
+        );
+    }
+
+    #[test]
+    fn the_view_scrolls_by_row_page_and_end() {
+        let mut h = debug_game();
+        h.moves(&["e4"]);
+        h.reply_traced("e7e5");
+        h.char('d');
+        let view = h.app.exchange_view().expect("open");
+        let (page, max) = (view.page, view.max_scroll);
+        assert!(page > 10 && max > page, "{view:?}");
+        let scroll = |h: &Harness| h.app.exchange_view().map(|v| v.scroll);
+        assert_eq!(scroll(&h), Some(0));
+        assert!(h.screen().contains("│ REQUEST"), "{}", h.screen());
+        h.press(KeyCode::Down);
+        assert_eq!(scroll(&h), Some(1));
+        assert!(!h.screen().contains("│ REQUEST"));
+        h.press(KeyCode::End);
+        assert_eq!(scroll(&h), Some(max));
+        let last_row = h.screen().lines().nth(22).unwrap_or_default().to_string();
+        assert!(last_row.starts_with("│ }"), "{last_row:?}");
+        h.press(KeyCode::Down);
+        assert_eq!(scroll(&h), Some(max), "stops at the end");
+        h.press(KeyCode::Up);
+        assert_eq!(scroll(&h), Some(max - 1));
+        h.press(KeyCode::PageUp);
+        assert_eq!(scroll(&h), Some(max - page));
+        h.press(KeyCode::Home);
+        assert_eq!(scroll(&h), Some(0));
+        h.press(KeyCode::PageDown);
+        assert_eq!(scroll(&h), Some(page - 1));
+        h.press(KeyCode::Up);
+        h.press(KeyCode::Left);
+        assert_eq!(
+            scroll(&h),
+            Some(page - 2),
+            "no older exchange: nothing moves"
+        );
+    }
+
+    #[test]
+    fn a_resize_keeps_the_view_scroll_within_the_body() {
+        let mut h = debug_game();
+        h.moves(&["e4"]);
+        h.reply_traced("e7e5");
+        h.char('d');
+        h.press(KeyCode::End);
+        let small_end = h.app.exchange_view().unwrap().max_scroll;
+        h.terminal.backend_mut().resize(200, 60);
+        h.draw();
+        let view = h.app.exchange_view().unwrap();
+        assert!(view.max_scroll < small_end);
+        assert_eq!(view.scroll, view.max_scroll, "clamped to the new end");
+    }
+
+    #[test]
+    fn the_mouse_wheel_scrolls_the_view_and_clicks_do_nothing() {
+        let mut h = debug_game();
+        h.moves(&["e4"]);
+        h.reply_traced("e7e5");
+        let e2 = h.square_cell(sq("d2"));
+        h.char('d');
+        h.click(e2.0, e2.1);
+        assert_eq!(h.app.selected(), None);
+        assert!(h.app.exchange_view().is_some());
+        h.mouse(MouseEventKind::ScrollDown, 10, 10);
+        assert_eq!(h.app.exchange_view().map(|v| v.scroll), Some(3));
+        h.mouse(MouseEventKind::ScrollUp, 10, 10);
+        assert_eq!(h.app.exchange_view().map(|v| v.scroll), Some(0));
+        h.send(paste("e4\n"));
+        assert_eq!(
+            h.app.command_text(),
+            "",
+            "a paste is not typed under the view"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_asks_over_the_view_and_no_goes_back_to_it() {
+        let mut h = debug_game();
+        h.moves(&["e4"]);
+        h.reply_traced("e7e5");
+        h.char('d');
+        h.ctrl('c');
+        assert_eq!(h.app.dialog_name(), Some("quit"));
+        assert!(h.screen().contains("Quit the game in progress?"));
+        h.char('n');
+        assert!(h.app.exchange_view().is_some());
+        assert!(h.screen().contains("exchange 1 of 1"));
+    }
+
+    #[test]
+    fn the_status_border_says_debug_in_debug_mode() {
+        let top_row = |h: &Harness| h.screen().lines().next().unwrap_or_default().to_string();
+        let mut h = Harness::sized(FakeEngine::jev(), 120, 40);
+        h.char('2');
+        assert!(!top_row(&h).contains("DEBUG"));
+        let mut h = debug_app(FakeEngine::jev(), (120, 40), DebugLog::open(None));
+        h.char('2');
+        let row = top_row(&h);
+        assert!(row.contains("┌ Status ─ DEBUG ─"), "{row}");
+        assert!(row.contains(" You (White) vs Jev ┐"), "{row}");
+    }
+
+    #[test]
+    fn each_exchange_becomes_a_log_line() {
+        let dir = TempDir::new("debug-app");
+        let path = dir.join("jev.jsonl");
+        let mut h = debug_app(FakeEngine::jev(), (80, 24), DebugLog::start(path.clone()));
+        h.char('2');
+        h.moves(&["e4"]);
+        h.reply_traced("e7e5");
+        h.moves(&["Nf3"]);
+        h.reply_traced("b8c6");
+        h.app.close_debug_log(Duration::from_secs(10));
+        let text = fs::read_to_string(&path).expect("log written");
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("JSON line"))
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["played"], "e5");
+        assert_eq!(lines[0]["ply"], 1);
+        assert_eq!(lines[1]["played"], "Nc6");
+        assert_eq!(lines[1]["ply"], 3);
+        assert_eq!(lines[1]["stale"], false);
+        assert_eq!(h.app.status_line(), "", "no failure to report");
+    }
+
+    #[test]
+    fn a_log_failure_is_shown_once() {
+        let dir = TempDir::new("debug-app");
+        // A folder where the file should be.
+        let mut h = debug_app(
+            FakeEngine::jev(),
+            (120, 40),
+            DebugLog::start(dir.path().to_path_buf()),
+        );
+        h.char('2');
+        h.moves(&["e4"]);
+        h.reply_traced("e7e5");
+        wait_for_status(&mut h, "debug log disabled: it is a folder: ");
+        assert!(h.app.message().is_some_and(|m| m.is_error));
+        assert!(
+            h.app
+                .status_line()
+                .ends_with(&dir.path().display().to_string())
+        );
+        h.moves(&["Nf3"]);
+        assert_eq!(h.app.status_line(), "", "a move clears it");
+        h.reply_traced("b8c6");
+        for _ in 0..10 {
+            std::thread::sleep(Duration::from_millis(5));
+            h.tick();
+        }
+        assert_eq!(h.app.status_line(), "", "reported once");
+        assert_eq!(h.app.exchanges().map(History::len), Some(2), "still kept");
+    }
+
+    #[test]
+    fn a_log_without_a_path_says_so_at_the_first_exchange() {
+        let mut h = debug_game();
+        h.moves(&["e4"]);
+        assert_eq!(h.app.status_line(), "");
+        h.reply_traced("e7e5");
+        assert_eq!(
+            h.app.status_line(),
+            "debug log disabled: no log file (set RCHESS_DEBUG_LOG, XDG_STATE_HOME or HOME)"
+        );
+    }
+
+    #[test]
+    fn the_api_key_never_reaches_the_screen_or_the_log() {
+        let dir = TempDir::new("debug-app");
+        let path = dir.join("jev.jsonl");
+        // The exchange the engine records against a server that echoes the key, carried
+        // by a traced move as the worker delivers it. The player is only the app's engine;
+        // building it is offline, and no move is asked of it.
+        let config = EngineConfig {
+            api_key: Some(SENTINEL_KEY.to_string()),
+            trace: true,
+            ..EngineConfig::default()
+        };
+        let engine = Arc::new(crate::engine::ComputerPlayer::from_config(config));
+        let mut app = App::new(engine, GlyphSet::Solid, true, Vec::new())
+            .with_home(None)
+            .with_debug(DebugLog::start(path.clone()));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))
+            .expect("test terminal");
+        let now = Instant::now();
+        let actions = app.handle(AppEvent::Term(key_event(KeyCode::Char('3'))), now);
+        let request = request(&actions);
+        let computer = ComputerMove {
+            exchange: Some(Box::new(recorded_exchange(SENTINEL_KEY))),
+            ..jev_move(request.game.position(), "e2e4")
+        };
+        let _ = app.handle(
+            AppEvent::Engine(EngineReply::new(&request, EngineOutcome::Move(computer))),
+            now,
+        );
+        let _ = app.handle(AppEvent::Term(key_event(KeyCode::Char('d'))), now);
+        let mut seen = String::new();
+        loop {
+            terminal.draw(|frame| app.render(frame, now)).expect("draw");
+            seen.push_str(&buffer_text(terminal.backend().buffer()));
+            let view = app.exchange_view().expect("open");
+            if view.scroll == view.max_scroll {
+                break;
+            }
+            let _ = app.handle(AppEvent::Term(key_event(KeyCode::PageDown)), now);
+        }
+        assert!(seen.contains("Authorization: Bearer <redacted>"), "{seen}");
+        app.close_debug_log(Duration::from_secs(10));
+        let log = fs::read_to_string(&path).expect("log written");
+        assert!(log.contains("Bearer <redacted>"));
+        for text in [seen, log] {
+            assert!(!text.contains(SENTINEL_KEY));
+        }
+    }
+
+    #[test]
+    fn the_help_lists_the_exchange_view() {
+        let mut h = debug_game();
+        h.char('?');
+        assert!(
+            h.screen()
+                .contains("d         exchange view (start with --debug)")
         );
     }
 }

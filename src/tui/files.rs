@@ -181,7 +181,7 @@ fn sync_parent(path: &Path) {
 }
 
 /// A short, user-facing reason for a failed file operation.
-fn describe(err: &io::Error) -> String {
+pub fn describe(err: &io::Error) -> String {
     match err.kind() {
         ErrorKind::NotFound => "folder does not exist".to_string(),
         ErrorKind::PermissionDenied => "permission denied".to_string(),

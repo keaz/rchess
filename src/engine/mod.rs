@@ -12,6 +12,9 @@ mod see;
 pub use annotate::{Annotation, Bucket};
 pub use config::EngineConfig;
 pub use describe::JevState;
+/// A really recorded, redacted exchange for the TUI's key tests.
+#[cfg(test)]
+pub(crate) use jev::tests::recorded_exchange;
 pub use jev::{
     ChoiceAnswer, ChoiceOption, ChoiceRequest, JEV_ENDPOINT, JevAttempt, JevClient, JevError,
     JevExchange, MoveChooser,

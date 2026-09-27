@@ -157,7 +157,9 @@ pub struct JevAttempt {
     /// The HTTP status, or `None` when no response arrived.
     pub status: Option<u16>,
     /// The response body as text (read under the 1 MiB cap), or `None` when no
-    /// response arrived or its body could not be read.
+    /// response arrived or its body could not be read. A JSON body in which the key
+    /// had to be redacted after decoding is re-encoded, so it is not byte for byte
+    /// what the server sent.
     pub response: Option<String>,
     /// Why the attempt failed, as the `JevError` message; `None` for an answer.
     pub error: Option<String>,
@@ -270,6 +272,23 @@ fn redact(text: &str, secret: &str) -> String {
         text.to_string()
     } else {
         text.replace(secret, REDACTED)
+    }
+}
+
+/// A response body with the key redacted, both in the raw text and, when the body is
+/// JSON, in the text a parser decodes from it: a server can echo the key with `\u`
+/// escapes that the raw text does not match. When decoding shows the key, the body
+/// is re-encoded from the redacted JSON, so no later parse can bring it back.
+fn redact_body(text: &str, secret: &str) -> String {
+    let text = redact(text, secret);
+    let Ok(json) = serde_json::from_str::<Value>(&text) else {
+        return text;
+    };
+    let redacted = redact_value(&json, secret);
+    if redacted == json {
+        text
+    } else {
+        redacted.to_string()
     }
 }
 
@@ -425,8 +444,8 @@ impl JevClient {
         }
     }
 
-    /// One HTTP attempt. The response body is redacted before it is parsed or cut
-    /// into an error snippet, so no error can carry part of the key.
+    /// One HTTP attempt. The response body is redacted ([`redact_body`]) before it is
+    /// parsed or cut into an error snippet, so no error can carry part of the key.
     fn post_once(&self, body: &Value) -> Attempt {
         let sent = self
             .agent
@@ -458,7 +477,7 @@ impl JevClient {
             .with_config()
             .limit(MAX_BODY_BYTES)
             .read_to_string()
-            .map(|text| redact(&text, &self.api_key));
+            .map(|text| redact_body(&text, &self.api_key));
         let (result, response) = match text {
             Ok(text) if status == 200 => (parse_answer(&text), Some(text)),
             Ok(text) => (Err(http_error(status, &text, retry_after)), Some(text)),
@@ -500,7 +519,7 @@ impl MoveChooser for JevClient {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::BTreeSet;
     use std::io::{BufRead, BufReader, Read, Write};
@@ -1005,6 +1024,81 @@ mod tests {
         }
         // The server did receive the key.
         assert!(requests.lock().unwrap()[0].contains(SENTINEL_KEY));
+    }
+
+    /// `text` with every character written as a JSON `\u` escape: text a JSON parser
+    /// reads back as `text`, though it does not contain it.
+    fn json_escaped(text: &str) -> String {
+        text.chars()
+            .map(|c| format!("\\u{:04x}", u32::from(c)))
+            .collect()
+    }
+
+    /// The exchange a traced client sending `api_key` records against a local server
+    /// that echoes the key in a 503 body, then JSON-escaped in another, then answers.
+    /// The TUI's key tests render and log it, so they check an exchange as the engine
+    /// really records it.
+    pub(crate) fn recorded_exchange(api_key: &str) -> JevExchange {
+        let echo = format!(r#"{{"error":"overloaded, key {api_key} is queued"}}"#);
+        let escaped = format!(
+            r#"{{"error":"overloaded, key {} is queued"}}"#,
+            json_escaped(api_key)
+        );
+        let (client, requests) = serve_with_key(
+            vec![
+                response("503 Service Unavailable", "application/json", &echo),
+                response("503 Service Unavailable", "application/json", &escaped),
+                response("200 OK", "application/json", ANSWER),
+            ],
+            api_key,
+        );
+        let mut trace = None;
+        client
+            .choose_traced(&request(), &mut trace)
+            .expect("the server answers the retry");
+        assert!(requests.lock().unwrap()[0].contains(api_key));
+        trace.expect("the client records the exchange")
+    }
+
+    #[test]
+    fn traced_exchange_redacts_a_key_the_server_escapes() {
+        // `\u` escapes do not match the key in the raw text, but every JSON parser, the
+        // exchange view's and the debug log's included, decodes them back into it.
+        let escaped = json_escaped(SENTINEL_KEY);
+        let (client, _requests) = serve_with_key(
+            vec![
+                response(
+                    "401 Unauthorized",
+                    "application/json",
+                    &format!(r#"{{"error":"invalid api key {escaped}"}}"#),
+                ),
+                response(
+                    "200 OK",
+                    "application/json",
+                    &ANSWER.replace("jev-1.13.0", &escaped),
+                ),
+            ],
+            SENTINEL_KEY,
+        );
+
+        let mut trace = None;
+        let error = client.choose_traced(&request(), &mut trace).unwrap_err();
+        assert_eq!(
+            trace.unwrap().attempts[0].response.as_deref(),
+            Some(r#"{"error":"invalid api key <redacted>"}"#)
+        );
+        assert_eq!(
+            error.to_string(),
+            r#"HTTP 401: {"error":"invalid api key <redacted>"}"#
+        );
+
+        let mut trace = None;
+        let answer = client.choose_traced(&request(), &mut trace).unwrap();
+        assert_eq!(answer.model, "<redacted>");
+        let text = trace.unwrap().attempts[0].response.clone().unwrap();
+        let decoded: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(decoded["model"], "<redacted>");
+        assert_eq!(decoded["answers"]["move"]["choice"], "O-O");
     }
 
     #[test]

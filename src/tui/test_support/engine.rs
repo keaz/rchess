@@ -10,9 +10,11 @@ use std::time::Duration;
 
 use ratatui::crossterm::event::{KeyCode, KeyModifiers, MouseEventKind};
 
+use serde_json::json;
+
 use super::{char_events, chord_event, key_event, mouse_event, paste_event};
 use crate::core::{Game, Move, Position as ChessPosition};
-use crate::engine::{ComputerMove, MoveSource};
+use crate::engine::{ComputerMove, JEV_ENDPOINT, JevAttempt, JevExchange, MoveSource};
 use crate::tui::event::AppEvent;
 use crate::tui::worker::{Engine, LOCAL_SEARCH_STATUS};
 
@@ -75,6 +77,68 @@ pub(crate) fn jev_move(pos: &ChessPosition, uci: &str) -> ComputerMove {
     }
 }
 
+/// An API key no recorded exchange, screen or log line may ever contain.
+pub(crate) const SENTINEL_KEY: &str = "sk-sentinel-7f3a9c";
+
+/// A Jev exchange as the engine records it, key redacted: a request body, a 503 answer
+/// whose text holds control characters, then a JSON answer.
+pub(crate) fn jev_exchange() -> JevExchange {
+    let answer = json!({
+        "model": "jev-test",
+        "answers": {
+            "move": {
+                "choice": "e4",
+                "probabilities": { "e4": 0.62, "d4": 0.3 },
+                "confidence": 0.81,
+            }
+        },
+        "usage": { "input_tokens": 512 },
+    });
+    JevExchange {
+        method: "POST".to_string(),
+        url: JEV_ENDPOINT.to_string(),
+        headers: vec![
+            ("Authorization".to_string(), "Bearer <redacted>".to_string()),
+            ("Content-Type".to_string(), "application/json".to_string()),
+        ],
+        body: json!({
+            "model": "jev-test",
+            "state": { "side_to_move": "white", "note": "a quiet opening position" },
+            "questions": {
+                "move": {
+                    "type": "choice",
+                    "criteria": {
+                        "d4": { "assessment": "good", "effect": "takes the centre" },
+                        "e4": { "assessment": "good", "effect": "opens the bishop's diagonal" },
+                    },
+                }
+            },
+        }),
+        attempts: vec![
+            JevAttempt {
+                status: Some(503),
+                response: Some("busy \u{1b}[2J now\n\ttry again".to_string()),
+                error: Some("HTTP 503: busy \u{1b}[2J now".to_string()),
+                elapsed: Duration::from_millis(120),
+            },
+            JevAttempt {
+                status: Some(200),
+                response: Some(answer.to_string()),
+                error: None,
+                elapsed: Duration::from_millis(850),
+            },
+        ],
+    }
+}
+
+/// [`jev_move`] with [`jev_exchange`] recorded, as a traced Jev move arrives.
+pub(crate) fn traced_jev_move(pos: &ChessPosition, uci: &str) -> ComputerMove {
+    ComputerMove {
+        exchange: Some(Box::new(jev_exchange())),
+        ..jev_move(pos, uci)
+    }
+}
+
 /// What a [`FakeEngine`] does with one request.
 pub(crate) enum Turn {
     /// Plays this UCI move, reported as [`jev_move`] reports it.
@@ -89,6 +153,8 @@ pub(crate) enum Turn {
     PanicOther,
     /// Sleeps this long, then panics with a `&str` payload.
     SlowPanic(Duration),
+    /// Plays this UCI move with [`jev_exchange`] recorded ([`traced_jev_move`]).
+    Traced(&'static str),
 }
 
 /// A scripted engine that never touches the network.
@@ -158,6 +224,7 @@ impl Engine for FakeEngine {
         let turn = self.script.lock().expect("script lock").pop_front();
         match turn {
             Some(Turn::Play(uci)) => Some(jev_move(game.position(), uci)),
+            Some(Turn::Traced(uci)) => Some(traced_jev_move(game.position(), uci)),
             Some(Turn::GameOver) => None,
             Some(Turn::Panic(message)) => panic::panic_any(message),
             Some(Turn::PanicString(message)) => panic::panic_any(message),
