@@ -4,14 +4,14 @@ Read this first. Follow the protocol in section 8 of
 `docs/superpowers/specs/2026-09-26-rchess-redesign-design.md`.
 
 ## Current
-Sub-project: tui | Plan: docs/superpowers/plans/2026-09-27-tui.md
-Branch: feat/tui
-Last completed task: tui task 6 (app state machine and rendering)
-Next task: tui task 7 (run loop, main.rs, smoke tests)
+Sub-project: cleanup (not started) | Plan: to be written from spec section 7 step 4
+Branch: feat/tui (complete after the user's manual smoke test; ready for user to merge)
+Last completed task: tui task 7 (run loop, main.rs, smoke tests) — tui sub-project DONE pending manual smoke test
+Next task: user runs `cargo run` for the manual smoke test and merges feat/tui; then plan the cleanup sub-project
 State: green (except 3 pre-existing old-code test failures)
 
 ## Verify before continuing
-INSTA_UPDATE=no cargo test --lib tui::
+INSTA_UPDATE=no cargo test --lib tui:: && cargo test --lib engine:: && cargo test --lib core::
 
 ## Core API caveats (read before building on core)
 - `Position::play` / `to_san` require a move from `self.legal_moves()`; debug builds assert, release builds may corrupt the position; use `Game::play` for unvalidated input.
@@ -78,6 +78,7 @@ INSTA_UPDATE=no cargo test --lib tui::
 - None.
 
 ## Log (newest first)
+- 2026-09-27 tui sub-project complete; pty smoke test green; awaiting manual smoke test
 - 2026-09-27 tui task 6 fix round 1: stale error message no longer survives an engine reply
 - 2026-09-27 tui task 6 done: app state machine and rendering
 - 2026-09-27 tui task 5 done: engine worker, events and terminal guard
