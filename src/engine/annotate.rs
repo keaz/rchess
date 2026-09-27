@@ -168,7 +168,8 @@ fn attacks(kind: PieceKind, color: Color, sq: Square, occupied: Bitboard) -> Bit
 /// The most valuable enemy piece (not the king) the moved piece attacks from its new
 /// square but did not attack before, when it is worth more than the mover or undefended.
 /// A king counts as worth more than anything, so it only "attacks" undefended pieces.
-/// A defender pinned to its king off the line to the attacked piece does not count.
+/// A defender pinned to its king off the line to the attacked piece does not count,
+/// unless the mover is the king: a pinned piece still guards a square against a king.
 fn new_attack(pos: &Position, child: &Position, mv: Move) -> Option<String> {
     let us = pos.side_to_move();
     let before_kind = pos.piece_at(mv.from())?.kind;
@@ -179,8 +180,13 @@ fn new_attack(pos: &Position, child: &Position, mv: Move) -> Option<String> {
     let mut best: Option<(i32, Square, PieceKind)> = None;
     for sq in after & !before & enemies {
         let kind = child.piece_at(sq)?.kind;
-        // A defender pinned to its king off the line to `sq` does not defend it.
-        let defended = capturers(child, sq, child.occupied(), !us).any();
+        // A defender pinned to its king off the line to `sq` does not defend it,
+        // except against a king: a pinned piece still guards the square.
+        let defended = if mover == PieceKind::King {
+            (child.attackers_to(sq, child.occupied()) & child.occupied_by(!us)).any()
+        } else {
+            capturers(child, sq, child.occupied(), !us).any()
+        };
         let value = piece_value(kind);
         if (value > exchange_value(mover) || !defended) && best.is_none_or(|(v, _, _)| value > v) {
             best = Some((value, sq, kind));
@@ -386,6 +392,14 @@ mod tests {
         assert_eq!(find(&pos, &list, "e2e3").effect, "quiet move");
         let (pos, list) = annotations("4k3/8/8/8/3r4/8/4K3/8 w - - 0 1");
         assert_eq!(find(&pos, &list, "e2e3").effect, "attacks the rook on d4");
+    }
+
+    #[test]
+    fn a_pinned_defender_still_guards_against_a_king() {
+        // Re1 pins Be6 to the king on e8, but the bishop still covers d5: Kxd5 is
+        // illegal, so Kc4 does not attack the knight.
+        let (pos, list) = annotations("4k3/8/4b3/1K1n4/8/8/8/4R3 w - - 0 1");
+        assert_eq!(find(&pos, &list, "b5c4").effect, "quiet move");
     }
 
     #[test]
