@@ -148,6 +148,7 @@ Minor findings from the final review, deferred; none blocks the merge.
 - None.
 
 ## Log (newest first)
+- 2026-09-28 README example switched to a position where Jev's choice matters (after 1. d4 Nf6 2. c4: twelve good moves within 50 cp, the search would play Nc6, Jev picked d5); exchange screenshots re-recorded; README notes the possible "no other option within the veto margin" shortcut (not implemented)
 - 2026-09-28 README written on main (user request): architecture, when and how Jev is used, what is sent and why; screenshots (PNG) and low-res gameplay videos (MP4 plus animated WebP) recorded in Ghostty with the release build, stored in docs/media/
 - 2026-09-28 chore/cleanup merged into main locally (ab2383e); merged result verified: cargo test fully green (lib 689), fmt and clippy -D warnings clean, pty smoke green
 - 2026-09-28 cleanup final fix wave: CI matrix on Linux and macOS with an exact toolchain pin and a manual trigger (pty smoke local only), an error on a closed terminal ends by SIGHUP, no "+0 more warnings", HANDOFF follow-ups, CLAUDE.md fixes, stronger fallback and picture-cache tests

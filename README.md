@@ -35,10 +35,10 @@ All captured from the release build running in Ghostty (150×44 cells).
 
 | | |
 | --- | --- |
-| ![Start menu with "Jev ready (jev-latest)"](docs/media/menu.png) | ![Board after 6. Bd3 cxd3: the Jev panel shows "played cxd3 · Jev", cxd3 100%, conf 0.99, 358 ms, jev-1.13.0](docs/media/play-vs-jev.png) |
-| **Menu.** The status line says whether Jev is ready or the computer will use local search. | **Human vs Jev.** The Jev panel shows where the move came from, Jev's top options with probabilities, confidence, latency and model. |
-| ![Debug exchange view: the request, with the Authorization header redacted and the move options with effect and assessment](docs/media/jev-request.png) | ![Debug exchange view: Jev's response with choice, confidence, a probability per option, model and token usage](docs/media/jev-response.png) |
-| **What Jev is asked** (`--debug`, then `d`). Every legal move comes with plain-language facts and an assessment. The API key is always shown as `<redacted>`. | **What Jev answers.** A choice, a probability for every option, a confidence and the input tokens billed. |
+| ![Start menu with "Jev ready (jev-latest)"](docs/media/menu.png) | ![Board after 1. d4 Nf6 2. c4 d5: the Jev panel shows "played d5 · Jev", d5 42%, Nc6 40%, e6 7%, conf 0.39, 336 ms, jev-1.13.0](docs/media/play-vs-jev.png) |
+| **Menu.** The status line says whether Jev is ready or the computer will use local search. | **Human vs Jev.** After `1. d4 Nf6 2. c4`, Jev chose `d5` over `Nc6` and `e6`. The Jev panel shows where the move came from, Jev's top options with probabilities, confidence, latency and model. |
+| ![Debug exchange view of that request: move options with effect and assessment, most of them good quiet moves](docs/media/jev-request.png) | ![Debug exchange view: Jev's response with choice, confidence, a probability per option, model and token usage](docs/media/jev-response.png) |
+| **What Jev is asked** (`--debug`, then `d`). Every shortlisted move comes with plain-language facts and an assessment; here twelve of them are `good`. The API key is always shown as `<redacted>`. | **What Jev answers.** A choice, a probability for every option, a confidence and the tokens billed. |
 
 **Jev vs Jev.** Watch mode plays both sides with a pause between moves (`+` and `-` change it,
 Space pauses). In this recording Jev settles into a knight-and-queen shuffle that ends in a
@@ -271,8 +271,25 @@ the move number, the phase (opening, middlegame, endgame), the material balance 
 we are in check, our pieces and theirs, the last six plies, and up to three of our pieces the
 opponent can win.
 
-This is the real request for Black's sixth move in the game from the screenshots, after
-`6. Bd3?` (26 options; most are cut here):
+### An example where Jev's choice matters
+
+After `1. d4 Nf6 2. c4`, Black has 22 legal moves. The search scores them like this (centipawns
+for Black, best first):
+
+| Score | Moves |
+| --- | --- |
+| +50 | `Nc6`, `d5` |
+| +40 | `d6`, `e6` |
+| +20 | `Rg8`, `a6`, `h6` |
+| +15 | `Na6`, `a5`, `h5` |
+| +5 | `b6`, `g6` |
+
+All twelve are within 50 cp of the best, so all twelve are `good`. A 3-ply search with a
+material and piece-square evaluation cannot really tell them apart: it rates `Rg8` and `h5`
+(moves no strong player would consider here) close to `d5` and `e6`, and it breaks the tie at
+the top by move-generation order. On its own, the local search would answer `Nc6`. This is the
+decision the app hands to Jev. The real request, from the game in the screenshots (`Nd5`, which
+loses the knight to `cxd5`, was rated `losing` and left off the shortlist):
 
 ```json
 {
@@ -285,31 +302,63 @@ This is the real request for Black's sixth move in the game from the screenshots
         "guidance": "Each option says what the move does and the engine's assessment: winning, good, neutral, bad or losing. Prefer winning and good moves. Among similar moves, prefer ones that remove threats against our pieces and keep our king safe."
       },
       "criteria": {
-        "Bd5":  { "assessment": "bad",     "effect": "leaves the bishop on d5 exposed to capture" },
-        "Nd5":  { "assessment": "bad",     "effect": "leaves the pawn on c4 exposed to capture" },
-        "Nxd4": { "assessment": "bad",     "effect": "captures the pawn on d4, loses material in the exchange" },
-        "cxd3": { "assessment": "winning", "effect": "captures the bishop on d3, wins material in the exchange" },
-        "g6":   { "assessment": "bad",     "effect": "quiet move" }
+        "Na6":  { "assessment": "good",     "effect": "quiet move" },
+        "Nc6":  { "assessment": "good",     "effect": "quiet move" },
+        "Ne4":  { "assessment": "neutral",  "effect": "quiet move" },
+        "Ng4":  { "assessment": "neutral",  "effect": "quiet move" },
+        "Ng8":  { "assessment": "neutral",  "effect": "quiet move" },
+        "Nh5":  { "assessment": "neutral",  "effect": "quiet move" },
+        "Rg8":  { "assessment": "good",     "effect": "quiet move" },
+        "a5":   { "assessment": "good",     "effect": "quiet move" },
+        "a6":   { "assessment": "good",     "effect": "quiet move" },
+        "b5":   { "assessment": "neutral",  "effect": "attacks the pawn on c4; leaves the pawn on b5 exposed to capture" },
+        "b6":   { "assessment": "good",     "effect": "quiet move" },
+        "c5":   { "assessment": "neutral",  "effect": "leaves the pawn on c5 exposed to capture" },
+        "c6":   { "assessment": "neutral",  "effect": "quiet move" },
+        "d5":   { "assessment": "good",     "effect": "attacks the pawn on c4" },
+        "d6":   { "assessment": "good",     "effect": "quiet move" },
+        "e5":   { "assessment": "neutral",  "effect": "leaves the pawn on e5 exposed to capture" },
+        "e6":   { "assessment": "good",     "effect": "quiet move" },
+        "g5":   { "assessment": "neutral",  "effect": "leaves the pawn on g5 exposed to capture" },
+        "g6":   { "assessment": "good",     "effect": "quiet move" },
+        "h5":   { "assessment": "good",     "effect": "quiet move" },
+        "h6":   { "assessment": "good",     "effect": "quiet move" }
       }
     }
   },
   "state": {
     "in_check": "no",
-    "material": "Black is ahead by about 1 pawn of material",
-    "move_number": 6,
-    "our_pieces": "King e8, Queen d8, Rooks a8 and h8, Bishops e6 and f8, Knights c6 and f6, Pawns c4 a7 b7 c7 e7 f7 g7 h7",
+    "material": "material is equal",
+    "move_number": 2,
+    "our_pieces": "King e8, Queen d8, Rooks a8 and h8, Bishops c8 and f8, Knights f6 and b8, Pawns a7 b7 c7 d7 e7 f7 g7 h7",
     "phase": "opening",
-    "recent_moves": "3... dxc4 4. Nf3 Nc6 5. e3 Be6 6. Bd3",
+    "recent_moves": "1. d4 Nf6 2. c4",
     "side_to_move": "Black",
-    "their_pieces": "King e1, Queen d1, Rooks a1 and h1, Bishops c1 and d3, Knights c3 and f3, Pawns a2 b2 f2 g2 h2 e3 d4",
+    "their_pieces": "King e1, Queen d1, Rooks a1 and h1, Bishops c1 and f1, Knights b1 and g1, Pawns a2 b2 e2 f2 g2 h2 c4 d4",
     "threats_against_us": []
   }
 }
 ```
 
-Jev answered `cxd3` with probability 1.0 and confidence 0.99 in 358 ms, billing 1,348 input
-tokens (the response screenshot above). Keys arrive in alphabetical order because `serde_json`
-sorts object keys; the shortlist order is not a signal Jev can see.
+Jev answered `d5` (probability 0.42), with `Nc6` at 0.40 and `e6` at 0.07. Every other option
+got 0.03 or less, and `Rg8`, `a5` and `h5` got 0.0. Confidence 0.39, 336 ms, 1,176 input tokens
+(the response screenshot above). `d5`, the Queen's Gambit, is the classical reply, and it is
+within the veto margin, so it is played. The probabilities move a little between calls: the
+same request a few minutes earlier gave `d5` 0.44 and `Nc6` 0.38.
+
+Keys arrive in alphabetical order because `serde_json` sorts object keys, so the search's
+ranking is not a signal Jev can see; it sees only the words.
+
+### When Jev's choice matters, and when it does not
+
+Jev changes the game only when **several options are close to the best**, as above. That is
+common in openings and quiet middlegames, where the evaluation's small differences are noise.
+When one move clearly stands out, for example a capture that wins a piece while every other
+option is `bad` (more than 150 cp behind), the search has already decided: any other pick would
+be vetoed. Jev is still asked in that case today; it agrees with a probability near 1.0, which
+costs a few hundred milliseconds and about 1.5k tokens without changing the move. Forced moves
+and mate in one already skip the call, and the same shortcut for "no other option within the
+veto margin" would be a natural next step.
 
 ### What comes back, and what the app does with it
 
@@ -338,10 +387,11 @@ particular except taste. So each side does what it is good at.
 
 - **Code owns legality.** Jev only ever chooses among keys the app generated, and the answer is
   checked against that list. An illegal or invented move is impossible by construction.
-- **Code owns tactics and numbers.** Asking a language model "is the bishop on d3 defended?"
-  is multi-hop reasoning over a board it cannot see. Static exchange evaluation answers it
-  exactly, so the fact arrives already worked out: *captures the bishop on d3, wins material in
-  the exchange*.
+- **Code owns tactics and numbers.** Asking a language model whether a pawn push can be won
+  is multi-hop reasoning over a board it cannot see: which pieces attack the square, which
+  defend it, in what order they trade. Static exchange evaluation answers it exactly, so the
+  fact arrives already worked out: `b5` *attacks the pawn on c4; leaves the pawn on b5 exposed
+  to capture*.
 - **Words, not numbers.** Centipawn scores would invite Jev to do arithmetic, which is exactly
   where it is weakest. Five buckets carry the engine's opinion without numbers, and the effect
   text says *why* a move is good or bad. The guidance then tells Jev how to weigh them: prefer
