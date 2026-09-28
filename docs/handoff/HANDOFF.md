@@ -8,7 +8,7 @@ Sub-project: cleanup (spec section 10) | Plan: docs/superpowers/plans/2026-09-28
 Branch: chore/cleanup (spec section 10 and the plan committed; no code yet). main has feat/tui-polish merged locally at f18dd32, not pushed.
 Last completed task: cleanup plan written from a reviewed, restructured prototype and replayed twice on a fresh clone (every patch applies, tests patches fail as stated, counts 614/621/641/658/684/687/687, clippy -D warnings clean, pty smoke green)
 Next task: user reviews the plan and picks an execution method; then cleanup task 1
-State: green (except 3 pre-existing old-code test failures, removed by cleanup task 1)
+State: green (the three failing legacy tests were deleted in 20642e0)
 
 ## Verify before continuing
 env -u JEV_API_KEY -u TYPESAFE_API_KEY INSTA_UPDATE=no cargo test --lib tui:: && env -u JEV_API_KEY -u TYPESAFE_API_KEY cargo test --lib engine::
