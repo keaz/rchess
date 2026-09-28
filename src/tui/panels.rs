@@ -309,6 +309,9 @@ impl Note {
 
 /// The first of `notes` that fit in `rows` rows of `width` cells, and when some do not, a
 /// last note in their place saying how many warnings are not shown ("+2 more warnings").
+/// When no warning is among those that do not fit, there is no count ("+0 more
+/// warnings" would say nothing) and all of `notes` are returned, to be cut off where
+/// the rows end.
 fn fit_notes(mut notes: Vec<Note>, width: u16, rows: u16) -> (Vec<Note>, Option<Note>) {
     let needed = notes
         .iter()
@@ -327,10 +330,16 @@ fn fit_notes(mut notes: Vec<Note>, width: u16, rows: u16) -> (Vec<Note>, Option<
             used <= room
         })
         .count();
-    let hidden = notes
-        .drain(shown..)
+    let hidden = notes[shown..]
+        .iter()
         .filter(|note| note.marker == WARNING_MARKER)
         .count();
+    if hidden == 0 {
+        // Only notes that are not warnings would go; a count could name none of them,
+        // so they stay and are cut off at the bottom instead.
+        return (notes, None);
+    }
+    notes.truncate(shown);
     let text = match hidden {
         1 => "+1 more warning".to_string(),
         n => format!("+{n} more warnings"),
@@ -2322,6 +2331,26 @@ mod tests {
         assert!(screen.contains("! short"), "{screen}");
         assert!(!screen.contains("! long"), "{screen}");
         assert!(screen.contains("+1 more warning "), "{screen}");
+    }
+
+    #[test]
+    fn notes_that_hide_no_warning_get_no_count() {
+        let note = |marker: &'static str, text: &str| Note {
+            marker,
+            text: text.to_string(),
+            style: Style::new(),
+        };
+        // Only the engine status, two rows long in one row: nothing a count could name.
+        let status = "engine status ".repeat(4);
+        let (notes, more) = fit_notes(vec![note("", &status)], 20, 1);
+        assert!(more.is_none(), "{:?}", more.map(|more| more.text));
+        assert_eq!(notes.len(), 1);
+        // With a warning among the hidden notes the count is still there.
+        let (_, more) = fit_notes(vec![note("", &status), note(WARNING_MARKER, "w")], 20, 1);
+        assert_eq!(
+            more.map(|more| more.text).as_deref(),
+            Some("+1 more warning")
+        );
     }
 
     /// The characters [`Wrapper`] is fed on this thread while `fit` runs: the work of the
