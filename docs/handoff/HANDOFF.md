@@ -4,11 +4,11 @@ Read this first. Follow the protocol in section 8 of
 `docs/superpowers/specs/2026-09-26-rchess-redesign-design.md`.
 
 ## Current
-Sub-project: cleanup (spec section 10) | Plan: docs/superpowers/plans/2026-09-28-cleanup.md
-Branch: chore/cleanup (all 7 tasks done). main has feat/tui-polish merged locally at f18dd32, not pushed.
-Last completed task: 7 (CI and docs), then the final fix wave
-Next task: push `chore/cleanup` (and `main`) and open a PR from `chore/cleanup` to main, so the new workflow runs on the PR (Linux and macOS); merge only when it is green. Pushing `main` alone first would run the workflow on the legacy code of main, not on this branch.
-State: green (`cargo test` fully green, fmt and clippy `-D warnings` clean, pty smoke green)
+Sub-project: none in progress (core, engine, tui, tui-polish and cleanup are done)
+Branch: main (chore/cleanup merged locally at ab2383e; not pushed — main is ahead of origin/main; origin/chore/cleanup is an older copy at 7ddb5b2)
+Last completed task: cleanup sub-project merged (all 7 tasks, final review fixed and re-reviewed)
+Next task: push main to GitHub so the new CI (Ubuntu + macOS: fmt, clippy, build, test) runs; the follow-ups below are optional
+State: green (cargo test fully green, fmt and clippy -D warnings clean, pty smoke green locally)
 
 ## Verify before continuing
 env -u JEV_API_KEY -u TYPESAFE_API_KEY INSTA_UPDATE=no cargo test
@@ -148,6 +148,7 @@ Minor findings from the final review, deferred; none blocks the merge.
 - None.
 
 ## Log (newest first)
+- 2026-09-28 chore/cleanup merged into main locally (ab2383e); merged result verified: cargo test fully green (lib 689), fmt and clippy -D warnings clean, pty smoke green
 - 2026-09-28 cleanup final fix wave: CI matrix on Linux and macOS with an exact toolchain pin and a manual trigger (pty smoke local only), an error on a closed terminal ends by SIGHUP, no "+0 more warnings", HANDOFF follow-ups, CLAUDE.md fixes, stronger fallback and picture-cache tests
 - 2026-09-28 cleanup task 7 done: CI workflow (fmt, clippy -D warnings, test, build, pty smoke), CLAUDE.md rewritten for core/engine/tui, HANDOFF open issues cut to the spec 10.7 limits, pty smoke timing margins for CI; cleanup complete, awaiting the user's review and merge
 - 2026-09-28 cleanup task 6 done: Test quality and the pty hangup helper
