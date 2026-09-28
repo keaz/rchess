@@ -5,15 +5,28 @@ Read this first. Follow the protocol in section 8 of
 
 ## Current
 Sub-project: tui-polish | Plan: docs/superpowers/plans/2026-09-27-tui-polish.md
-Branch: feat/tui-polish
-Last completed task: tui-polish final whole-branch review fix wave
-Next task: the user runs the manual test in a real terminal (spec 9.6) and merges feat/tui-polish; then plan the cleanup sub-project (spec section 7 step 5)
+Branch: feat/tui-polish (all 8 tasks done; final whole-branch review fixed and re-reviewed; ready for the user's manual test and merge)
+Last completed task: tui-polish final whole-branch review fix wave (re-reviewed: all four findings addressed)
+Next task: the user runs the manual test below (spec 9.6) and merges feat/tui-polish; then plan the cleanup sub-project (spec section 7 step 5)
 State: green (except 3 pre-existing old-code test failures)
 
 ## Verify before continuing
-env -u JEV_API_KEY -u TYPESAFE_API_KEY INSTA_UPDATE=no cargo test --lib tui:: && cargo test --lib engine::
+env -u JEV_API_KEY -u TYPESAFE_API_KEY INSTA_UPDATE=no cargo test --lib tui:: && env -u JEV_API_KEY -u TYPESAFE_API_KEY cargo test --lib engine::
+cargo build && env -u JEV_API_KEY -u TYPESAFE_API_KEY python3 tests/pty_smoke.py --no-build
 
-## Manual smoke test (TUI, by the user)
+## Manual test (tui-polish, by the user; spec 9.6)
+Run `cargo run` in Ghostty and in one other terminal (Kitty, WezTerm or Alacritty) and check:
+- the TUI fills the terminal and the board grows with the window;
+- pieces are pictures and easy to tell apart (Alacritty: text pieces; pictures after `g` on a large window);
+- `g` cycles Image → Solid → Outline → Ascii;
+- a font zoom keeps the pictures sized to their squares;
+- `cargo run -- --debug`, then a game against Jev with `JEV_API_KEY` set: `d` shows the request and
+  response with the key shown as `<redacted>`;
+- `~/.local/state/rchess/jev-debug.jsonl` (or `$XDG_STATE_HOME/rchess/...`) gets one line per request
+  and has mode 0600;
+- quitting leaves the shell normal (mouse and paste modes off, cursor visible).
+
+## Manual smoke test (TUI from the tui sub-project, still valid)
 Run `cargo run` in a real terminal (Ghostty, Kitty, WezTerm or Alacritty) and check:
 - the menu appears;
 - Human vs Human plays by mouse click, by drag and through the command box (`/e4`);
@@ -173,10 +186,29 @@ Copied from the git-ignored SDD ledger (.superpowers/sdd/2026-09-27-tui-polish/p
 - tests/pty_smoke.py:939 `scenario_query_hangup` never checks the "at once" timing its docstring promises; any exit by SIGHUP within 5 s passes.
 - tests/pty_smoke.py:939 `scenario_query_hangup` duplicates the hangup-detection loop of `scenario_hangup` (line 620) instead of sharing a helper.
 
+### tui-polish (minors from the final whole-branch review, 2026-09-28; triaged as can wait)
+- src/tui/graphics.rs:192 A late start-up answer that reaches crossterm in more than one read freezes the UI until the next key. A split right after its ESC turns the answer into key presses that start a game.
+- src/tui/graphics.rs:233 Every start-up on a non-unix build shows the menu warning 'graphics query: unsupported; images use half-blocks', although no query was attempted and the user cannot fix it.
+- src/tui/debug.rs:144 Each exchange keeps a pre-rendered copy of every response body: pretty-printed JSON, one heap-allocated BodyLine per line. That makes the history's real limit 30-150x larger than the 1 MiB cap x 3 attempts x 50 it appears to have.
+- src/tui/debug.rs:630 The record channel to the debug-log thread is unbounded. While that thread is blocked, every exchange of the session stays in memory, not just the 50 in History, and no failure is ever reported.
+- src/tui/debug.rs:748 open_log follows a symlink (or hard link) at the log path. It appends JSON to the link's target and changes the target's mode to 0600, while the link itself is left in place.
+- src/tui/app.rs:1639 An answer held while Jev vs Jev is paused keeps its exchange out of the history, the view and the log until play resumes. If the person quits while paused, the exchange is never logged. When the exchange is recorded later, its log `time` is when it was released, not when the reply arrived.
+- src/tui/debug.rs:457 ←/→ (and `d`, through `ExchangeView::open`) reset `page` and `max_scroll` to 0 until the next draw. End, PgDn and ↓ that arrive in the same input batch after them do nothing.
+- src/tui/app.rs:1303 `d` on the game-over overlay does nothing and shows no message. To see the exchange behind Jev's game-ending move, the person must first press Esc (see the board), then `d`.
+- src/tui/app.rs:1970 On a terminal without a graphics protocol (half-blocks), `g` still offers `image`, but at ordinary window sizes it looks exactly like Solid while the status says "glyphs: image". Half-block pictures need 11×5 squares, which takes a window of about 123×46 cells or more with a 10×20 font.
+- src/tui/glyphs.rs:446 `RCHESS_IMAGES` treats only `off` as off. Values like `0`, `false` or `no` silently leave images on and still send the graphics query, unlike `RCHESS_DEBUG`, where `0` means off. No menu warning names the unrecognised value, as happens for `RCHESS_GLYPHS`.
+- docs/handoff/HANDOFF.md:14 Several HANDOFF sections are out of date or weaker than on main: the verify command, the manual smoke checklist, one test count, and the line references in older deferred minors.
+- src/tui/graphics.rs:462 Two deliberate departures from spec 9 are not written down in the spec or the HANDOFF deviation list.
+- src/tui/app.rs:5206 `a_log_failure_found_on_the_menu_is_shown_once_a_game_starts` waits a fixed 20 x 5 ms for the debug-log thread to fail, so it depends on timing.
+- src/tui/app.rs:5108 The Task 8 three-way merge left duplicated tests, one redundant field, and an inlined guard with no test. There is no dead code.
+- The Task 7 ledger minor (no Sixel-answering pty scenario) is resolved: tests/pty_smoke.py has scenario_query_sixel_zoom.
+- Kitty now also measures the font on each resize (spec 9.3), so the slow-terminal limits of the font measurement apply to Kitty too.
+
 ## Open questions for user
 - None.
 
 ## Log (newest first)
+- 2026-09-28 tui-polish complete: tasks 1-8 applied and reviewed, final five-lens review fixed (Kitty font zoom, dev-profile Sixel crates, handoff minors) and re-reviewed; awaiting the user's manual test and merge
 - 2026-09-28 tui-polish final fix wave: Kitty pictures follow a font zoom (spec 9.3 corrected); dev profile optimises `quantette`, `base64-simd` and `vsimd`; deferred review minors copied into this file
 - 2026-09-28 tui-polish task 8 fix round 1: Kitty pictures built with session ids and deleted by id (`a=d,d=I,i=<id>`) on every restore path; the task 8 note now discloses the `report_log_failure` conflict; `tui::` 450 passed, `engine::` 112 passed
 - 2026-09-28 tui-polish task 8 done: Whole-branch review fixes
