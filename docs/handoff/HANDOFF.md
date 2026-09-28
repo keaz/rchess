@@ -148,6 +148,7 @@ Minor findings from the final review, deferred; none blocks the merge.
 - None.
 
 ## Log (newest first)
+- 2026-09-28 README written on main (user request): architecture, when and how Jev is used, what is sent and why; screenshots (PNG) and low-res gameplay videos (MP4 plus animated WebP) recorded in Ghostty with the release build, stored in docs/media/
 - 2026-09-28 chore/cleanup merged into main locally (ab2383e); merged result verified: cargo test fully green (lib 689), fmt and clippy -D warnings clean, pty smoke green
 - 2026-09-28 cleanup final fix wave: CI matrix on Linux and macOS with an exact toolchain pin and a manual trigger (pty smoke local only), an error on a closed terminal ends by SIGHUP, no "+0 more warnings", HANDOFF follow-ups, CLAUDE.md fixes, stronger fallback and picture-cache tests
 - 2026-09-28 cleanup task 7 done: CI workflow (fmt, clippy -D warnings, test, build, pty smoke), CLAUDE.md rewritten for core/engine/tui, HANDOFF open issues cut to the spec 10.7 limits, pty smoke timing margins for CI; cleanup complete, awaiting the user's review and merge
