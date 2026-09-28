@@ -562,7 +562,7 @@ Sub-projects run sequentially; each is merge-ready before the next starts.
 3. `tui` — done when all three game modes are playable end to end, the headless tests and snapshots
    pass, and the user has smoke-tested `cargo run` in a real terminal.
 4. `tui-polish` — full-screen layout, piece images and Jev debug mode (section 9); done per 9.6.
-5. Cleanup — delete `src/pieces/`, `src/board.rs`, `src/ai.rs` and the old `Game`; remove
+5. Cleanup (section 10) — delete `src/pieces/`, `src/board.rs`, `src/ai.rs` and the old `Game`; remove
    `drawille`, `mockall` and the `[env]` key; update `CLAUDE.md`; extend CI with
    `cargo fmt --check` and `cargo clippy -- -D warnings`.
 
@@ -781,3 +781,125 @@ what is sent to Jev. Sections 6.x still hold except where this section changes t
 - The user confirms in a real terminal (Ghostty and one other) that the TUI fills the terminal, the
   board scales with it, pieces are images and easy to identify, `g` cycles styles, and `--debug`
   plus `d` shows the Jev request and response and writes the log file.
+
+## 10. Sub-project 5 — `cleanup` (legacy removal, open-issue fixes, CI)
+
+Added 2026-09-28. Replaces the one-line step 5 of section 7 with a full scope: remove the legacy
+code, fix every open issue in `docs/handoff/HANDOFF.md` that has a contained fix, and make CI check
+formatting, lints, tests and the pty smoke test. Branch `chore/cleanup`. Sections 4-9 still hold
+except where this section changes them.
+
+### 10.1 Legacy removal
+
+- Delete `src/pieces/`, `src/board.rs`, `src/ai.rs`, and the legacy `Game`, `Player`, `Position`
+  and `ChessError` in `src/lib.rs`; `src/lib.rs` only declares `pub mod core; pub mod engine; pub mod
+  tui;` (keeping the `::core::` note of the core caveats).
+- Remove the dependencies `drawille` and `mockall` (normal and dev), the dev dependency
+  `env_logger`, and the invalid `[env] RUST_LOG` key. `log` stays (the TUI panic hook and the engine
+  worker use it). No other dependency changes.
+- Afterwards `cargo test` has no failures; every mention of "3 pre-existing failures" in
+  `CLAUDE.md`, `HANDOFF.md`, CI notes and verify commands is updated.
+
+### 10.2 Engine fixes
+
+- `annotate`: the "undefended" qualifier ignores a king recapture that would be illegal (the king
+  would move into check).
+- `ComputerMove.model` and `Transport`/`Request` error text go through the same control-character
+  sanitiser as other Jev text.
+- Redaction: the response body is parsed as received; the key is redacted only in what is recorded
+  (the exchange, error text, notes), so the untraced path is unchanged. A non-JSON body whose
+  decoded form (JSON string escapes such as `\uXXXX` and `\/` resolved) contains the key is recorded
+  as `<redacted: the body contained the API key>`.
+- Tests: the failed-connection test connects to a port that is never listened on (`127.0.0.1:1`)
+  instead of a freed ephemeral port; the private `Attempt` is renamed `RawAttempt`.
+- Docs: the public path of the endpoint constant is `chess::engine::JEV_ENDPOINT` everywhere it is
+  named outside historical plans.
+
+### 10.3 Terminal and graphics fixes
+
+- Restore: `leave` runs once through a three-state guard (active → restoring → done); a second
+  caller waits (at most 1 s) until the first has finished. Every restore step runs even when an
+  earlier one fails. A unit test checks the exact bytes `leave` writes through an injected writer.
+  The panic-hook test serialises access to the process-global hook and always restores it.
+- A closed terminal without SIGHUP (stdin at EOF or failing with EIO) ends the program through the
+  hangup path within about 1 s instead of spinning.
+- Graphics query: answers still owed after a deadline, a split answer, or a quit signal during the
+  query are drained (read and discarded with `poll`, at most 200 ms) before input handling starts or
+  before exit, so they never become key presses or reach the shell. WezTerm and Konsole get the
+  device-attributes request so their answers end in an event crossterm reports. When the
+  environment names iTerm2 or WezTerm, the iTerm2 protocol wins over a Sixel answer. Without any
+  font size a detected Kitty or Sixel answer falls back to half-blocks (recorded here as intended:
+  pictures encoded at a guessed size spill into neighbouring squares). Non-unix builds skip the
+  query silently (no menu warning).
+- Kitty pictures dropped by a cache clear are deleted by id right away (written before the next
+  draw); exit deletes only the ones still alive.
+- A picture that fails to encode shows the Solid glyph and one status warning ("pictures
+  unavailable: <reason>"), not a silent fallback.
+
+### 10.4 Input, board and panels
+
+- `char_width` is 0 for control characters; `shorten` cuts by display width and never splits a
+  base character from its combining marks.
+- Paste: a tab becomes a space; a paste made only of line breaks submits the text already in the
+  box; `is_ignored` also drops U+061C, U+00AD, U+180E, U+034F and U+FFF9-U+FFFB.
+- An Alt+key chord outside a text field is Esc then the key, except that the key is dropped when the
+  Esc moved focus into a text field.
+- "Game in progress" (for the `q`, `n` and `m` confirmations) means at least one move played and
+  the game not over, for all three.
+- Events in one batch after an event that changes the screen or layout are handled after a redraw,
+  so mouse hits use the new layout.
+- Menu warnings that do not fit end with "+N more warnings".
+- `--version`/`-V` print `chess <version>` and exit; `--help` into a closed pipe exits 0 quietly.
+- `g` on a board whose squares are too small for pictures says "glyphs: image (squares too small
+  for pictures)"; `d` works from the game-over overlay.
+- Board label cells get their style reset like square cells; `fit_message` and `cut_to_fit` are
+  linear in the message length.
+
+### 10.5 Saving and the debug log
+
+- Saving without overwrite links the finished temp file into place (`hard_link`, which fails if the
+  name exists) and falls back to the existing check-then-rename only where hard links are not
+  supported; saving over a symlink writes to the link's target.
+- Debug log: a path that is a symbolic link or has more than one hard link is refused ("debug log
+  disabled: <path> is a link"); a log whose last byte is not a newline gets one before the next
+  record; the record channel holds at most 64 records (a full channel drops the record and shows one
+  warning); response bodies are pre-rendered only for the exchange on screen (cached per exchange
+  and width); a reply held while watch mode is paused is recorded in the history and the log when it
+  arrives (marked held), so quitting never loses it.
+- Exchange view: switching exchanges or opening the view keeps the last known page size, so End,
+  PgDn and ↓ in the same input batch work.
+- Environment: non-UTF-8 values of `RCHESS_GLYPHS`, `RCHESS_DEBUG_LOG`, `XDG_STATE_HOME` and `HOME`
+  give a menu warning; a relative `HOME` or `XDG_STATE_HOME` is ignored for the log path;
+  `RCHESS_IMAGES` treats `off`, `0`, `false` and `no` (any case) as off and warns on other values.
+
+### 10.6 Tests and documentation
+
+- Tests whose names promise more than they check are renamed or split; timing-dependent tests
+  synchronise instead of sleeping; duplicated tests and the redundant field left by the tui-polish
+  Task 8 merge are removed; missing tests are added (failed engine-thread spawn, `describe` error
+  branches that can be produced, the leave bytes, the same engine answering after a panic, a reply
+  to a closed channel); `FakeEngine::local()` reports local-search moves.
+- `tests/pty_smoke.py`: the hangup scenarios share one helper and check their timing.
+- `CLAUDE.md` is rewritten for the current layout (`core`, `engine`, `tui`, commands, the pty smoke
+  test, logging and CI); `HANDOFF.md` drops fixed items and keeps only the limits in 10.7.
+
+### 10.7 Documented limits (not fixed)
+
+- The PGN `Date` is the UTC date (a local date needs a timezone dependency).
+- Saving and picture encoding run on the UI thread (about 0.1-0.2 s for a large Sixel board).
+- Half-block pictures are written in 24-bit colour even on the 256-colour palette (ratatui-image).
+- Keys typed while waiting for a terminal that answers more than 1 s late are lost.
+- Historical plan documents are not rewritten.
+
+### 10.8 CI
+
+`.github/workflows/rust.yml` (push and pull request on `main`, Ubuntu): `cargo fmt --check`,
+`cargo clippy --all-targets -- -D warnings`, `cargo test`, then `cargo build` and
+`python3 tests/pty_smoke.py --no-build`, all with `JEV_API_KEY` and `TYPESAFE_API_KEY` unset. Timing
+checks in the smoke test get margins that hold on a shared runner.
+
+### 10.9 Done criteria
+
+All of the above with tests; `cargo test` fully green; fmt and clippy (`-D warnings`, all targets)
+clean; pty smoke green locally; the CI workflow file valid (checked with the same commands locally;
+a run on GitHub happens when the user pushes).

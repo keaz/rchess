@@ -4,10 +4,10 @@ Read this first. Follow the protocol in section 8 of
 `docs/superpowers/specs/2026-09-26-rchess-redesign-design.md`.
 
 ## Current
-Sub-project: cleanup (not started) | Plan: to be written from spec section 7 step 5
-Branch: main (feat/tui-polish merged locally at f18dd32; feat/tui at 575c3f6; not pushed — main is ahead of origin/main)
-Last completed task: tui-polish sub-project merged (all 8 tasks, final review fixed and re-reviewed)
-Next task: the user's manual test of tui-polish in a real terminal (below) if not yet done; then plan the cleanup sub-project (spec section 7 step 5)
+Sub-project: cleanup (spec section 10) | Plan: to be written
+Branch: chore/cleanup (spec section 10 committed; no code yet). main has feat/tui-polish merged locally at f18dd32, not pushed.
+Last completed task: cleanup design approved by the user and written as spec section 10
+Next task: user reviews spec section 10; then write the cleanup plan
 State: green (except 3 pre-existing old-code test failures)
 
 ## Verify before continuing
