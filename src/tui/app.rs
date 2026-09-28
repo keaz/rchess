@@ -669,10 +669,6 @@ pub struct App {
     command: LineEditor,
     command_focused: bool,
     message: Option<Message>,
-    /// A debug log failure found while the Menu is up (`message` is not drawn there and
-    /// [`App::start`] clears `message` for the new game): kept until a game screen
-    /// ([`Screen::Playing`] or [`Screen::GameOver`]) can show it ([`App::report_log_failure`]).
-    pending_log_failure: Option<Message>,
     move_scroll: usize,
 
     generation: u64,
@@ -753,7 +749,6 @@ impl App {
             command: LineEditor::new(),
             command_focused: false,
             message: None,
-            pending_log_failure: None,
             move_scroll: 0,
             generation: 0,
             pending: None,
@@ -1760,34 +1755,37 @@ impl App {
         }
     }
 
-    /// Shows the debug log's failure, the one time it is reported. Found while a game
-    /// screen is up, it is shown at once; found while the Menu is up (which never draws
-    /// `message`, and whose next game start clears it) it is kept in
-    /// `pending_log_failure` and shown as soon as a game screen can, rather than being
-    /// lost silently.
+    /// Shows the debug log's failure, or that it dropped exchanges ([`debug::LOG_BEHIND`]),
+    /// the one time the log reports it; a failure found at the same time wins. Only a
+    /// game screen ([`Screen::Playing`] or [`Screen::GameOver`]) asks: the Menu never draws
+    /// `message`, and the next game start clears it, so while the Menu is up the log keeps
+    /// what it has to report until a game screen can show it.
     fn report_log_failure(&mut self) {
-        if self.debug.as_mut().is_some_and(DebugSession::log_dropped) {
-            self.pending_log_failure = Some(Message::error(debug::LOG_BEHIND));
+        if !matches!(self.screen, Screen::Playing | Screen::GameOver) {
+            return;
         }
-        if let Some(failure) = self.debug.as_mut().and_then(DebugSession::log_failure) {
-            let text = "debug log disabled: ";
-            let message = match &failure.path {
-                // The path is the message's end, where it is shortened best when it
-                // does not fit, so the reason goes last with it.
-                Some(path) if failure.reason == debug::LINK => Message::error(text).with_path(
-                    format!("{} {}", tilde_path(path, self.home.as_deref()), debug::LINK),
-                ),
-                Some(path) => Message::error(format!("{text}{}: ", failure.reason))
-                    .with_path(tilde_path(path, self.home.as_deref())),
-                None => Message::error(format!("{text}{}", failure.reason)),
-            };
-            self.pending_log_failure = Some(message);
-        }
-        if matches!(self.screen, Screen::Playing | Screen::GameOver)
-            && let Some(message) = self.pending_log_failure.take()
-        {
-            self.show(message);
-        }
+        let Some(debug) = self.debug.as_mut() else {
+            return;
+        };
+        let dropped = debug.log_dropped();
+        let message = match debug.log_failure() {
+            Some(failure) => {
+                let text = "debug log disabled: ";
+                match &failure.path {
+                    // The path is the message's end, where it is shortened best when it
+                    // does not fit, so the reason goes last with it.
+                    Some(path) if failure.reason == debug::LINK => Message::error(text).with_path(
+                        format!("{} {}", tilde_path(path, self.home.as_deref()), debug::LINK),
+                    ),
+                    Some(path) => Message::error(format!("{text}{}: ", failure.reason))
+                        .with_path(tilde_path(path, self.home.as_deref())),
+                    None => Message::error(format!("{text}{}", failure.reason)),
+                }
+            }
+            None if dropped => Message::error(debug::LOG_BEHIND),
+            None => return,
+        };
+        self.show(message);
     }
 
     /// True when it is the engine's turn, nothing stops it, and in Jev vs Jev the step
@@ -4089,9 +4087,10 @@ mod tests {
         h.respond(&request);
         assert_eq!(h.uci().len(), 2);
         assert!(!h.app.is_thinking());
+        // The local search's move, as the engine without a Jev key reports it.
         assert_eq!(
             h.app.last_computer().map(|c| c.source.clone()),
-            Some(MoveSource::Jev)
+            Some(MoveSource::Fallback)
         );
     }
 
@@ -5040,18 +5039,20 @@ mod tests {
         h
     }
 
-    /// Ticks until the status line starts with `start`, for up to 10 s.
+    /// Waits (up to 10 s) for the debug-log thread to end at its first error, then ticks
+    /// once and checks that the status line starts with `start`.
     fn wait_for_status(h: &mut Harness, start: &str) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !h.app.status_line().starts_with(start) {
-            assert!(
-                Instant::now() < deadline,
-                "status never said {start:?}: {:?}",
-                h.app.status_line()
-            );
-            std::thread::sleep(Duration::from_millis(5));
-            h.tick();
-        }
+        let debug = h.app.debug.as_ref().expect("debug mode");
+        assert!(
+            debug.wait_for_log_thread(),
+            "the debug-log thread still runs"
+        );
+        h.tick();
+        assert!(
+            h.app.status_line().starts_with(start),
+            "status never said {start:?}: {:?}",
+            h.app.status_line()
+        );
     }
 
     /// The exchanges kept, as (move, stale).
@@ -5478,54 +5479,6 @@ mod tests {
     }
 
     #[test]
-    fn the_status_border_says_debug_in_debug_mode() {
-        let top_row = |h: &Harness| h.screen().lines().next().unwrap_or_default().to_string();
-        let mut h = Harness::sized(FakeEngine::jev(), 120, 40);
-        h.char('2');
-        assert!(!top_row(&h).contains("DEBUG"));
-        let mut h = debug_app(
-            FakeEngine::jev(),
-            (120, 40),
-            DebugLog::open(Err(NO_LOG_PATH.to_string())),
-        );
-        h.char('2');
-        let row = top_row(&h);
-        assert!(row.contains("┌ Status ─ DEBUG ─"), "{row}");
-        assert!(row.contains(" You (White) vs Jev ┐"), "{row}");
-    }
-
-    #[test]
-    fn the_mode_title_keeps_the_border_and_debug_moves_to_the_line_when_narrow() {
-        // 80x24: both DEBUG and the mode title would not fit on the border together,
-        // so the mode title (chosen from the full room) keeps the border and DEBUG
-        // starts the first status line instead.
-        let mut h = debug_app(
-            FakeEngine::jev(),
-            (80, 24),
-            DebugLog::open(Err(NO_LOG_PATH.to_string())),
-        );
-        h.char('2');
-        let top_row = h.screen().lines().next().unwrap_or_default().to_string();
-        assert!(!top_row.contains("DEBUG"), "{top_row}");
-        assert!(top_row.contains(" You (White) vs Jev ┐"), "{top_row}");
-        let second_row = h.screen().lines().nth(1).unwrap_or_default().to_string();
-        assert!(second_row.contains("DEBUG White to move"), "{second_row}");
-
-        // 60x20: same precedence, with the shorter mode label.
-        let mut h = debug_app(
-            FakeEngine::jev(),
-            (60, 20),
-            DebugLog::open(Err(NO_LOG_PATH.to_string())),
-        );
-        h.char('2');
-        let top_row = h.screen().lines().next().unwrap_or_default().to_string();
-        assert!(!top_row.contains("DEBUG"), "{top_row}");
-        assert!(top_row.contains(" You (W) vs Jev ┐"), "{top_row}");
-        let second_row = h.screen().lines().nth(1).unwrap_or_default().to_string();
-        assert!(second_row.contains("DEBUG White to move"), "{second_row}");
-    }
-
-    #[test]
     fn each_exchange_becomes_a_log_line() {
         let dir = TempDir::new("debug-app");
         let path = dir.join("jev.jsonl");
@@ -5571,11 +5524,9 @@ mod tests {
         );
         h.moves(&["Nf3"]);
         assert_eq!(h.app.status_line(), "", "a move clears it");
+        // The log thread ended at the failure, so this exchange is only kept.
         h.reply_traced("b8c6");
-        for _ in 0..10 {
-            std::thread::sleep(Duration::from_millis(5));
-            h.tick();
-        }
+        h.tick();
         assert_eq!(h.app.status_line(), "", "reported once");
         assert_eq!(h.app.exchanges().map(History::len), Some(2), "still kept");
     }
@@ -5647,64 +5598,48 @@ mod tests {
     }
 
     #[test]
-    fn a_log_failure_found_on_the_menu_is_shown_once_a_game_starts() {
-        let dir = TempDir::new("debug-app");
-        // A folder where the file should be: every write fails.
-        let mut h = debug_app(
-            FakeEngine::jev(),
-            (120, 40),
-            DebugLog::start(dir.path().to_path_buf()),
-        );
-        h.char('2');
-        let request = request(&h.command("e4"));
-        h.press(KeyCode::Esc);
-        h.char('m');
-        h.char('y');
-        assert_eq!(h.app.screen_name(), "menu");
-        // The stale reply arrives, and its exchange is queued for the (failing) log,
-        // while the Menu is up.
-        let computer = traced_jev_move(request.game.position(), "e7e5");
-        h.answer(&request, EngineOutcome::Move(computer));
-        // Give the debug-log thread time to fail and report it back, all while still on
-        // the Menu, which never draws a message.
-        for _ in 0..20 {
-            std::thread::sleep(Duration::from_millis(5));
-            h.tick();
-        }
-        assert_eq!(h.app.screen_name(), "menu", "still on the menu");
-        assert!(h.app.message().is_none(), "the menu never shows it");
-        assert_eq!(h.app.status_line(), "");
-        // Starting a new game must not lose the failure found while it was pending.
-        h.char('2');
-        assert_eq!(h.app.screen_name(), "playing");
-        assert!(h.app.message().is_some_and(|m| m.is_error));
-        assert!(
-            h.app
-                .status_line()
-                .starts_with("debug log disabled: it is a folder: "),
-            "{}",
-            h.app.status_line()
-        );
-    }
-
-    #[test]
     fn a_log_failure_found_on_the_menu_waits_for_the_next_game() {
-        let mut h = debug_game();
-        h.moves(&["e4"]);
-        h.char('m');
-        h.char('y');
-        assert_eq!(h.app.screen(), Screen::Menu);
-        // Jev's answer comes on the menu: stale, but kept and logged, and the log fails.
-        h.reply_traced("e7e5");
-        h.tick();
-        assert_eq!(h.app.exchanges().map(History::len), Some(1));
-        assert_eq!(h.app.status_line(), "", "the menu shows no status line");
-        h.char('2');
-        assert_eq!(h.app.screen(), Screen::Playing);
-        assert_eq!(
-            h.app.status_line(),
-            "debug log disabled: no log file (set RCHESS_DEBUG_LOG, XDG_STATE_HOME or HOME)"
-        );
+        let dir = TempDir::new("debug-app");
+        // A log without a file fails at once; a folder where the file should be fails on
+        // the debug-log thread, which reports it back later.
+        let logs = [
+            (
+                DebugLog::open(Err(NO_LOG_PATH.to_string())),
+                format!("debug log disabled: {NO_LOG_PATH}"),
+            ),
+            (
+                DebugLog::start(dir.path().to_path_buf()),
+                "debug log disabled: it is a folder: ".to_string(),
+            ),
+        ];
+        for (log, failure) in logs {
+            let mut h = debug_app(FakeEngine::jev(), (120, 40), log);
+            h.char('2');
+            h.moves(&["e4"]);
+            h.char('m');
+            h.char('y');
+            assert_eq!(h.app.screen(), Screen::Menu);
+            // Jev's answer comes on the menu: stale, but kept and logged, and the log fails.
+            h.reply_traced("e7e5");
+            let debug = h.app.debug.as_ref().expect("debug mode");
+            assert!(
+                debug.wait_for_log_thread(),
+                "the debug-log thread still runs"
+            );
+            h.tick();
+            assert_eq!(h.app.exchanges().map(History::len), Some(1));
+            assert!(h.app.message().is_none(), "the menu never shows it");
+            assert_eq!(h.app.status_line(), "", "the menu shows no status line");
+            // Starting a new game must not lose it.
+            h.char('2');
+            assert_eq!(h.app.screen(), Screen::Playing);
+            assert!(h.app.message().is_some_and(|m| m.is_error));
+            assert!(
+                h.app.status_line().starts_with(&failure),
+                "{}",
+                h.app.status_line()
+            );
+        }
     }
 
     #[test]

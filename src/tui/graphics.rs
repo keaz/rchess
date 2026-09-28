@@ -419,15 +419,35 @@ impl FontMeter {
     /// measurement reads (keys typed in those milliseconds) are fed to the answer
     /// parser and lost.
     pub fn measure(&mut self, is_tmux: bool, stop: impl Fn() -> bool) -> Option<CellSize> {
-        let answers = if ANSWERS_READABLE {
-            match write_stdout(font_query_text(is_tmux).as_bytes()) {
-                Ok(()) => self.read(read_stdin_byte, QUERY_TIMEOUT, stop),
-                Err(error) => Err(error.into()),
-            }
-        } else {
-            Err(QueryError::Unsupported)
-        };
+        let answers = self.ask_with(
+            ANSWERS_READABLE,
+            write_stdout,
+            read_stdin_byte,
+            is_tmux,
+            QUERY_TIMEOUT,
+            stop,
+        );
         measured_font(answers, window_cell_size())
+    }
+
+    /// Writes the font query with `write` and reads the answers with `read_byte`
+    /// ([`FontMeter::read`]), waiting up to `timeout`. Where the answers cannot be read
+    /// (`readable` is false, see [`ANSWERS_READABLE`]) nothing is written or read, as in
+    /// [`ask_with`], and nothing is owed.
+    fn ask_with(
+        &mut self,
+        readable: bool,
+        write: impl FnOnce(&[u8]) -> io::Result<()>,
+        read_byte: impl FnMut(Duration) -> io::Result<Option<u8>>,
+        is_tmux: bool,
+        timeout: Duration,
+        stop: impl Fn() -> bool,
+    ) -> Result<Vec<Response>, QueryError> {
+        if !readable {
+            return Err(QueryError::Unsupported);
+        }
+        write(font_query_text(is_tmux).as_bytes())?;
+        self.read(read_byte, timeout, stop)
     }
 
     /// Reads the answers to a measurement with [`read_answers_after`], skipping those
@@ -1638,6 +1658,56 @@ mod tests {
             [Response::CellSize(Some((8, 16)))]
         );
         assert_eq!(left, b"\x1b[?62;4c");
+    }
+
+    #[test]
+    fn a_measurement_writes_nothing_where_the_answers_cannot_be_read() {
+        let mut meter = FontMeter::default();
+        let mut written = Vec::new();
+        let answers = meter.ask_with(
+            false,
+            |bytes| {
+                written.extend_from_slice(bytes);
+                Ok(())
+            },
+            |_: Duration| -> io::Result<Option<u8>> { panic!("nothing is read") },
+            false,
+            QUERY_TIMEOUT,
+            || false,
+        );
+        assert!(
+            written.is_empty(),
+            "nothing must reach the terminal: {written:?}"
+        );
+        assert!(
+            matches!(answers, Err(QueryError::Unsupported)),
+            "{answers:?}"
+        );
+        assert_eq!(
+            meter.owed_at(Instant::now()),
+            0,
+            "no answers are owed by it"
+        );
+    }
+
+    #[test]
+    fn a_measurement_writes_its_query_then_reads_its_answer() {
+        let mut meter = FontMeter::default();
+        let mut written = Vec::new();
+        let mut source = VecDeque::from(font_answer(11, 22));
+        let answers = meter.ask_with(
+            true,
+            |bytes| {
+                written.extend_from_slice(bytes);
+                Ok(())
+            },
+            |_| Ok(source.pop_front()),
+            true,
+            QUERY_TIMEOUT,
+            || false,
+        );
+        assert_eq!(written, font_query_text(true).as_bytes());
+        assert_eq!(measured_font(answers, None), Some(CellSize::new(11, 22)));
     }
 
     #[test]

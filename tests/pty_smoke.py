@@ -35,7 +35,8 @@ nothing touches the network), drives it with keystrokes or signals, and checks:
   - answers partly before the deadline and the rest just after it: the rest is
     read and dropped, so its `3` does not start a game either;
   - gets SIGTERM or hangs up while the query waits: the process ends by that
-    signal at once, SIGTERM with the terminal restored, and answers that come
+    signal at once (within 0.8 s, not after the query's 1 s deadline), SIGTERM
+    with the terminal restored, and answers that come
     right after the signal are read and dropped, not left for the shell;
   - runs in WezTerm (from the environment): only the cell size, the status and
     then the device attributes are asked, and a late answer, which ends with the
@@ -71,10 +72,12 @@ nothing touches the network), drives it with keystrokes or signals, and checks:
   the process then dies by that signal; two SIGTERMs in a row do too;
 * a real hangup (the terminal closes its end of the pty, as a closed window or a
   dropped SSH session does) ends the process by SIGHUP, both with the UI idle
-  (crossterm keeps polling the dead tty, so the stuck-UI watchdog restores) and
-  with the UI blocked writing a frame (the write fails and the main thread
-  restores): restoring a dead tty must not panic, so there is no SIGABRT from a
-  panic inside the panic hook;
+  (crossterm keeps polling the dead tty, so the stuck-UI watchdog restores,
+  within about a second) and with the UI blocked writing a frame (a window
+  large enough that its frames overflow any pty buffer, which on Linux is
+  checked in /proc before the hangup; the write fails and the main thread
+  restores, within 1 s): restoring a dead tty must not panic, so there is no SIGABRT from a panic inside the panic hook; every
+  hangup scenario closes the pty and checks the exit the same way (`hang_up`);
 * a terminal that closes without sending SIGHUP (the program is not in the
   tty's session, as under a supervisor): stdin reports the hangup, and the
   process ends by SIGHUP within about a second instead of spinning;
@@ -95,6 +98,7 @@ import codecs
 import fcntl
 import json
 import os
+import platform
 import re
 import select
 import signal
@@ -695,6 +699,66 @@ def scenario_signal(binary, signum, repeat=1):
         app.close()
 
 
+def wait_status(app, seconds):
+    """Waits up to `seconds` for the process to end without reading the pty (it may be
+    closed); its exit status (negative: the signal that ended it), or None."""
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        pid, raw = os.waitpid(app.pid, os.WNOHANG)
+        if pid:
+            app.status = os.waitstatus_to_exitcode(raw)
+            return app.status
+        time.sleep(0.01)
+    return None
+
+
+def hang_up(app, within, why):
+    """Closes both ends of the pty, as a terminal emulator or sshd does when it goes away:
+    nobody holds the tty any more, so the kernel hangs it up (SIGHUP to the session when
+    the pty is the program's controlling tty) and every later read or write fails. Checks
+    that the process then ends by SIGHUP, never SIGABRT (restoring a dead terminal must
+    not panic), and within `within` seconds, which `why` explains."""
+    for name in ("slave", "master"):
+        os.close(getattr(app, name))
+        setattr(app, name, None)
+    sent = time.monotonic()
+    status = wait_status(app, max(5.0, 2 * within))
+    took = time.monotonic() - sent
+    check(status is not None, "process exits after the hangup", f"{took:.2f}s")
+    if status is None:
+        return
+    check(
+        status != -signal.SIGABRT,
+        "no SIGABRT: restoring a dead terminal never panics",
+        f"status {status}",
+    )
+    check(status == -signal.SIGHUP, "terminated by SIGHUP", f"status {status}")
+    check(took < within, why, f"{took:.2f}s")
+
+
+# The `write` and `writev` system call numbers, by machine, for `blocked_in_write`.
+WRITE_SYSCALLS = {"x86_64": (1, 20), "aarch64": (64, 66)}
+
+
+def blocked_in_write(pid):
+    """Whether the main thread of `pid` (the UI thread) is blocked in a write: True or
+    False where /proc tells the system call it waits in (Linux), None elsewhere."""
+    calls = WRITE_SYSCALLS.get(platform.machine())
+    try:
+        with open(f"/proc/{pid}/syscall") as f:
+            fields = f.read().split()
+    except OSError:
+        return None
+    if calls is None or not fields:
+        return None
+    if fields[0] == "running":
+        return False
+    try:
+        return int(fields[0]) in calls
+    except ValueError:
+        return None
+
+
 def scenario_hangup(binary, busy):
     state = "blocked writing a frame" if busy else "idle"
     print(f"scenario: the terminal hangs up mid-game with the UI {state}; it dies by SIGHUP")
@@ -703,38 +767,35 @@ def scenario_hangup(binary, busy):
         check_setup(app)
         check(app.wait_screen("1. Human vs Human"), "menu renders")
         if busy:
-            # Start a game and read nothing more: the first game frame is larger than
-            # the pty buffer, so the UI blocks in write(), which fails once the tty is
-            # gone and the main thread restores the terminal itself.
+            # Start a game and read nothing more: the UI blocks in write(), which fails
+            # once the tty is gone, and the main thread restores the terminal itself.
+            # The frames must overflow the pty's buffer, which is small on macOS but can
+            # hold hundreds of KiB on Linux: on a 250x800 window a game frame is about
+            # 180 KB, and each of the 20 resizes after it draws the whole screen again
+            # (about 3.6 MB in all), unless the UI is already stuck in a write.
+            set_window(app, 250, 800, 0, 0)
+            app.idle(0.5)  # read the menu drawn for the new size
             os.write(app.master, b"1")
-            time.sleep(0.5)
+            for rows, cols in ((240, 790), (250, 800)) * 10:
+                time.sleep(0.05)
+                set_window(app, rows, cols, 0, 0)
+            time.sleep(0.3)
+            blocked = blocked_in_write(app.pid)
+            if blocked is None:
+                # macOS: its pty buffer holds far less than one game frame.
+                print("  NOTE  the blocked write is not checked here (no /proc)")
+            else:
+                check(blocked, "the UI is blocked writing a frame before the hangup")
         else:
             app.send(b"1")
             check(app.wait_screen("White to move"), "game started")
-        # What a terminal emulator or sshd does when it goes away: its end of the pty is
-        # closed and nobody else holds the slave, so the kernel hangs the tty up (SIGHUP
-        # to the session) and every later write to it fails.
-        for name in ("slave", "master"):
-            os.close(getattr(app, name))
-            setattr(app, name, None)
-        sent = time.monotonic()
-        status = None
-        while status is None and time.monotonic() < sent + 5.0:
-            pid, raw = os.waitpid(app.pid, os.WNOHANG)
-            if pid:
-                status = os.waitstatus_to_exitcode(raw)
-            else:
-                time.sleep(0.01)
-        app.status = status
-        check(status is not None, "process exits after the hangup")
-        if status is not None:
-            took = time.monotonic() - sent
-            check(
-                status != -signal.SIGABRT,
-                "no SIGABRT: restoring a dead terminal never panics",
-                f"status {status}, {took:.3f}s",
-            )
-            check(status == -signal.SIGHUP, "terminated by SIGHUP", f"status {status}")
+        if busy:
+            # The failed write ends the UI, which waits up to 0.1 s for the SIGHUP.
+            hang_up(app, 1.0, "at once: the failed write meets the SIGHUP")
+        else:
+            # crossterm's reader keeps reading the dead tty and never hands the loop back,
+            # so the restore on the signal thread ends it after the stuck-UI grace (1 s).
+            hang_up(app, 3.0, "within about a second")
     finally:
         app.close()
 
@@ -1054,22 +1115,8 @@ def scenario_query_hangup(binary):
     try:
         check(wait_for_query(app) is not None, "the graphics query is written")
         app.idle(0.2)
-        for name in ("slave", "master"):
-            os.close(getattr(app, name))
-            setattr(app, name, None)
-        sent = time.monotonic()
-        status = None
-        while status is None and time.monotonic() < sent + 5.0:
-            pid, raw = os.waitpid(app.pid, os.WNOHANG)
-            if pid:
-                status = os.waitstatus_to_exitcode(raw)
-            else:
-                time.sleep(0.01)
-        app.status = status
-        check(status is not None, "process exits after the hangup")
-        if status is not None:
-            took = time.monotonic() - sent
-            check(status == -signal.SIGHUP, "terminated by SIGHUP", f"status {status}, {took:.3f}s")
+        # The query checks for a quit signal every 50 ms instead of waiting out its 1 s.
+        hang_up(app, 0.8, "at once, without waiting for the query's deadline")
     finally:
         app.close()
 
@@ -1381,19 +1428,6 @@ def scenario_query_iterm2(binary):
         app.close()
 
 
-def wait_status(app, seconds):
-    """Waits up to `seconds` for the process to end without reading the pty (it may be
-    closed); its exit status (negative: the signal that ended it), or None."""
-    end = time.monotonic() + seconds
-    while time.monotonic() < end:
-        pid, raw = os.waitpid(app.pid, os.WNOHANG)
-        if pid:
-            app.status = os.waitstatus_to_exitcode(raw)
-            return app.status
-        time.sleep(0.01)
-    return None
-
-
 def scenario_closed_without_sighup(binary):
     print("scenario: the terminal closes but no SIGHUP arrives; it still ends by SIGHUP")
     app = App(binary, ctty=False)
@@ -1403,19 +1437,10 @@ def scenario_closed_without_sighup(binary):
         app.send(b"1")
         check(app.wait_screen("White to move"), "game started")
         # The pty is not the program's controlling tty, so closing it sends no SIGHUP:
-        # stdin only reports the hangup (and reads end of file or fail with EIO).
-        for name in ("slave", "master"):
-            os.close(getattr(app, name))
-            setattr(app, name, None)
-        sent = time.monotonic()
-        status = wait_status(app, 5.0)
-        took = time.monotonic() - sent
-        check(status is not None, "process exits after the terminal closed", f"{took:.2f}s")
-        if status is not None:
-            check(status != -signal.SIGABRT, "no SIGABRT", f"status {status}")
-            check(status == -signal.SIGHUP, "terminated by SIGHUP, as by a hangup", f"status {status}")
-            # About 1 s: the hangup is seen within 0.3 s, then the stuck UI gets 1 s.
-            check(took < 3.0, "within about a second", f"{took:.2f}s")
+        # stdin only reports the hangup (and reads end of file or fail with EIO), and the
+        # program raises SIGHUP itself. About 1 s: the hangup is seen within 0.3 s, then
+        # the stuck UI gets 1 s.
+        hang_up(app, 3.0, "within about a second")
     finally:
         app.close()
 

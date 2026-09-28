@@ -1057,12 +1057,32 @@ impl DebugLog {
         };
         (log, queued, failed)
     }
+
+    /// Waits up to 10 s for the `debug-log` thread to end, as it does at its first error
+    /// (after handing the error over), so that [`DebugLog::failure`] can report it at once.
+    /// True when there is no thread running any more.
+    pub(crate) fn wait_for_thread(&self) -> bool {
+        match &self.state {
+            LogState::Running { finished, .. } => matches!(
+                finished.recv_timeout(Duration::from_secs(10)),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            ),
+            LogState::Unavailable(_) | LogState::Stopped(_) => true,
+        }
+    }
+}
+
+#[cfg(test)]
+impl DebugSession {
+    /// See [`DebugLog::wait_for_thread`].
+    pub(crate) fn wait_for_log_thread(&self) -> bool {
+        self.log.wait_for_thread()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::time::Instant;
 
     use serde_json::json;
 
@@ -1098,16 +1118,10 @@ mod tests {
             .collect()
     }
 
-    /// Asks `log` for its failure until one comes, for up to 10 s.
+    /// The failure `log` reports once its thread has ended (waiting up to 10 s for that).
     fn wait_for_failure(log: &mut DebugLog) -> LogFailure {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(failure) = log.failure() {
-                return failure;
-            }
-            assert!(Instant::now() < deadline, "no failure reported");
-            thread::sleep(Duration::from_millis(5));
-        }
+        assert!(log.wait_for_thread(), "the debug-log thread still runs");
+        log.failure().expect("the thread ended with a failure")
     }
 
     #[cfg(unix)]
@@ -1985,8 +1999,8 @@ mod tests {
                 path: Some(path),
             }
         );
+        // The thread has ended: nothing more is written, and nothing more reported.
         log.write(&record(false));
-        thread::sleep(Duration::from_millis(20));
         assert_eq!(log.failure(), None, "reported once");
         log.close(Duration::from_secs(10));
     }
@@ -2008,11 +2022,11 @@ mod tests {
         let dir = TempDir::new("debug-log");
         let mut session = DebugSession::new(DebugLog::start(dir.path().to_path_buf()));
         assert_eq!(session.record(exchange(), false, at_ms(1)), 1);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while session.log_failure().is_none() {
-            assert!(Instant::now() < deadline, "no failure reported");
-            thread::sleep(Duration::from_millis(5));
-        }
+        assert!(
+            session.wait_for_log_thread(),
+            "the debug-log thread still runs"
+        );
+        assert!(session.log_failure().is_some());
         assert_eq!(session.record(exchange(), true, at_ms(2)), 2);
         assert_eq!(session.log_failure(), None);
         assert_eq!(session.history().len(), 2);

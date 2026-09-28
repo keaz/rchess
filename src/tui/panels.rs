@@ -2058,7 +2058,10 @@ mod tests {
                 }
             }
         }
-        // And clicks land: a move by mouse on the largest board, flipped.
+    }
+
+    #[test]
+    fn a_click_and_a_drag_move_pieces_on_the_largest_board_flipped() {
         let mut h = with_font((300, 100), (10, 20), '1');
         h.char('f');
         h.click_square(sq("e2"));
@@ -2202,6 +2205,11 @@ mod tests {
                     });
                     h.char(key);
                     let case = format!("{width}x{height} jev={jev} {key}");
+                    // Without debug mode nothing says DEBUG.
+                    for row in 0..2 {
+                        let plain_row = status_row(&plain, row);
+                        assert!(!plain_row.contains("DEBUG"), "{case}: {plain_row}");
+                    }
                     let top = status_title(&h);
                     let first = status_row(&h, 1);
                     // The same mode title as without debug mode, which always has one.

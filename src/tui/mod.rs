@@ -559,8 +559,23 @@ fn changes_layout(event: &AppEvent) -> bool {
 
 /// Runs `request` on an engine thread, whose reply arrives on `replies`.
 fn request_engine(request: EngineRequest, engine: &Arc<dyn Engine>, replies: &Sender<EngineReply>) {
+    request_engine_with(request, engine, replies, worker::spawn_request);
+}
+
+/// [`request_engine`] with the thread started by `spawn` ([`worker::spawn_request`] in
+/// production). The thread is detached: its handle is dropped.
+fn request_engine_with(
+    request: EngineRequest,
+    engine: &Arc<dyn Engine>,
+    replies: &Sender<EngineReply>,
+    spawn: impl FnOnce(
+        Arc<dyn Engine>,
+        EngineRequest,
+        Sender<EngineReply>,
+    ) -> io::Result<thread::JoinHandle<()>>,
+) {
     let (generation, hash) = (request.generation, request.hash);
-    if let Err(error) = worker::spawn_request(Arc::clone(engine), request, replies.clone()) {
+    if let Err(error) = spawn(Arc::clone(engine), request, replies.clone()) {
         // No thread means no reply. Answer for it, so the app stops
         // waiting: it shows the failure and lets the person retry.
         let failed = EngineReply {
@@ -602,7 +617,8 @@ mod tests {
         list.iter().map(|arg| (*arg).to_string()).collect()
     }
 
-    fn play(glyphs: Option<&str>, warnings: &[&str]) -> Cli {
+    /// What `parse_args` returns for starting the UI with `glyphs` and `warnings`.
+    fn cli_play(glyphs: Option<&str>, warnings: &[&str]) -> Cli {
         Cli::Play(Options {
             glyphs: glyphs.map(str::to_string),
             warnings: warnings.iter().map(|w| (*w).to_string()).collect(),
@@ -614,7 +630,7 @@ mod tests {
 
     #[test]
     fn no_arguments_start_with_defaults() {
-        assert_eq!(parse_args(args(&[])), play(None, &[]));
+        assert_eq!(parse_args(args(&[])), cli_play(None, &[]));
     }
 
     #[test]
@@ -634,15 +650,15 @@ mod tests {
     fn glyphs_takes_a_separate_or_attached_value_and_the_last_wins() {
         assert_eq!(
             parse_args(args(&["--glyphs", "ascii"])),
-            play(Some("ascii"), &[])
+            cli_play(Some("ascii"), &[])
         );
         assert_eq!(
             parse_args(args(&["--glyphs=outline"])),
-            play(Some("outline"), &[])
+            cli_play(Some("outline"), &[])
         );
         assert_eq!(
             parse_args(args(&["--glyphs", "ascii", "--glyphs=solid"])),
-            play(Some("solid"), &[])
+            cli_play(Some("solid"), &[])
         );
     }
 
@@ -651,7 +667,7 @@ mod tests {
         // `glyphs::initial_glyphs` validates the value and words the warning.
         assert_eq!(
             parse_args(args(&["--glyphs", "fancy"])),
-            play(Some("fancy"), &[])
+            cli_play(Some("fancy"), &[])
         );
         let Cli::Play(options) = parse_args(args(&["--glyphs", "fancy"])) else {
             panic!("expected Play");
@@ -666,7 +682,7 @@ mod tests {
     fn the_image_style_can_be_asked_for() {
         assert_eq!(
             parse_args(args(&["--glyphs", "image"])),
-            play(Some("image"), &[])
+            cli_play(Some("image"), &[])
         );
     }
 
@@ -716,10 +732,10 @@ mod tests {
     #[test]
     fn a_missing_glyphs_value_is_a_warning() {
         let missing = "--glyphs needs a value: image, solid, outline or ascii";
-        assert_eq!(parse_args(args(&["--glyphs"])), play(None, &[missing]));
+        assert_eq!(parse_args(args(&["--glyphs"])), cli_play(None, &[missing]));
         assert_eq!(
             parse_args(args(&["--glyphs", "--glyphs=ascii"])),
-            play(Some("ascii"), &[missing])
+            cli_play(Some("ascii"), &[missing])
         );
     }
 
@@ -727,7 +743,7 @@ mod tests {
     fn unknown_arguments_are_warnings_in_order() {
         assert_eq!(
             parse_args(args(&["ascii", "--glyph", ""])),
-            play(
+            cli_play(
                 None,
                 &[
                     r#"ignored unknown argument "ascii" (see --help)"#,
@@ -848,8 +864,8 @@ mod tests {
     }
 
     fn options(glyphs: Option<&str>, warnings: &[&str]) -> Options {
-        let Cli::Play(options) = play(glyphs, warnings) else {
-            unreachable!("play() builds Cli::Play");
+        let Cli::Play(options) = cli_play(glyphs, warnings) else {
+            unreachable!("cli_play() builds Cli::Play");
         };
         options
     }
@@ -1622,6 +1638,39 @@ mod tests {
             panic!("expected the fallback move, got {:?}", reply.outcome);
         };
         assert_eq!(computer.note.as_deref(), Some(worker::ENGINE_ERROR_NOTE));
+    }
+
+    #[test]
+    fn an_engine_thread_that_cannot_start_is_answered_with_a_failure() {
+        // Human vs the computer as Black: the computer is asked to move at once.
+        let mut app = new_app();
+        let actions = app.handle(key(KeyCode::Char('3')), Instant::now());
+        let Some(Action::RequestEngine(request)) = actions.into_iter().next() else {
+            panic!("the computer is asked to move");
+        };
+        let (generation, hash) = (request.generation, request.hash);
+        let (tx, rx) = mpsc::channel();
+        request_engine_with(request, app.engine(), &tx, |_, _, _| {
+            Err(io::Error::other("out of threads"))
+        });
+        let reply = rx.try_recv().expect("answered at once, without a thread");
+        assert!(worker::is_current(&reply, generation, hash));
+        assert_eq!(
+            reply.outcome,
+            EngineOutcome::Failed("cannot start the engine thread: out of threads".to_string())
+        );
+        assert_eq!(reply.exchange, None);
+        // The app stops waiting, says so, and space asks again.
+        assert_eq!(app.in_flight(), 1);
+        let _ = app.handle(AppEvent::Engine(reply), Instant::now());
+        assert_eq!(app.in_flight(), 0);
+        assert!(!app.is_thinking());
+        assert_eq!(app.status_line(), app::ENGINE_FAILED);
+        let retry = app.handle(key(KeyCode::Char(' ')), Instant::now());
+        assert!(
+            matches!(retry.as_slice(), [Action::RequestEngine(_)]),
+            "{retry:?}"
+        );
     }
 
     #[test]
