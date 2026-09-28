@@ -24,6 +24,7 @@ pub mod terminal;
 mod test_support;
 pub mod worker;
 
+use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
@@ -80,7 +81,8 @@ const USAGE: &str = concat!(
     "  JEV_MAX_OPTIONS    moves offered to Jev per turn, 1-255 (default 40)\n",
     "  JEV_FILTER_LOSING  keep losing moves off Jev's shortlist (default true)\n",
     "  RCHESS_GLYPHS      glyph set when --glyphs is not given\n",
-    "  RCHESS_IMAGES      off: no piece pictures, and no graphics query at start\n",
+    "  RCHESS_IMAGES      off, 0, false or no: no piece pictures, and no graphics\n",
+    "                     query at start\n",
     "  RCHESS_DEBUG       debug mode as with --debug, unless empty or 0\n",
     "  RCHESS_DEBUG_LOG   the debug log file; the default is\n",
     "                     $XDG_STATE_HOME/rchess/jev-debug.jsonl, else\n",
@@ -134,7 +136,7 @@ fn print_quietly(out: &mut impl Write, text: &str) -> io::Result<()> {
 /// when the terminal cannot be set up, read or drawn. Writing the `--help` or
 /// `--version` text can fail too (not for a closed pipe).
 pub fn run(args: impl IntoIterator<Item = String>) -> io::Result<()> {
-    let options = match parse_args(args) {
+    let mut options = match parse_args(args) {
         Cli::Help => return print_quietly(&mut io::stdout().lock(), USAGE),
         Cli::Version => return print_quietly(&mut io::stdout().lock(), VERSION),
         Cli::Play(options) => options,
@@ -146,9 +148,13 @@ pub fn run(args: impl IntoIterator<Item = String>) -> io::Result<()> {
     }
 
     let env = |name: &str| std::env::var(name).ok();
+    let debug = debug::enabled(options.debug, env);
+    options
+        .warnings
+        .extend(env_warnings(debug, |name| std::env::var_os(name)));
     let images = glyphs::images_wanted(options.glyphs.as_deref(), env);
     let fault = injected_fault(env("RCHESS_FAULT").as_deref());
-    let config = engine_config(EngineConfig::from_env(), debug::enabled(options.debug, env));
+    let config = engine_config(EngineConfig::from_env(), debug);
     let mut engine: Arc<dyn Engine> = Arc::new(ComputerPlayer::from_config(config));
     if fault == Some(Fault::EnginePanic) {
         engine = Arc::new(PanickingEngine(engine));
@@ -170,6 +176,29 @@ pub fn run(args: impl IntoIterator<Item = String>) -> io::Result<()> {
         terminal::exit_by_signal(signal);
     }
     result
+}
+
+/// Menu warnings for the variables whose value is not valid UTF-8, which are read as
+/// unset: `RCHESS_GLYPHS`, `RCHESS_IMAGES` and `NO_COLOR` (crossterm reads it the same
+/// way, so colours stay on), and in debug mode the three that give the debug log's path
+/// (`RCHESS_DEBUG_LOG`, `XDG_STATE_HOME`, `HOME`; saving still takes `HOME` as it is).
+///
+/// `get_os` reads an environment variable; pass `|k| std::env::var_os(k)`.
+fn env_warnings(debug: bool, get_os: impl Fn(&str) -> Option<OsString>) -> Vec<String> {
+    let mut checked = [glyphs::GLYPHS_ENV, glyphs::IMAGES_ENV, "NO_COLOR"]
+        .map(|name| (name, "ignored"))
+        .to_vec();
+    if debug {
+        checked.extend(
+            [debug::DEBUG_LOG_ENV, "XDG_STATE_HOME", "HOME"]
+                .map(|name| (name, "the debug log does not use it")),
+        );
+    }
+    checked
+        .into_iter()
+        .filter(|(name, _)| get_os(name).is_some_and(|value| value.to_str().is_none()))
+        .map(|(name, effect)| format!("{name} is not valid UTF-8; {effect}"))
+        .collect()
 }
 
 /// `config` with the exchange recording debug mode needs (`trace`) on when `debug` is.
@@ -749,6 +778,10 @@ mod tests {
         ] {
             assert!(USAGE.contains(name), "{name}");
         }
+        assert!(
+            USAGE.contains("off, 0, false or no"),
+            "RCHESS_IMAGES values"
+        );
         assert!(USAGE.contains("Usage: chess "));
         assert!(USAGE.contains("[--glyphs image|solid|outline|ascii] [--debug]"));
         assert!(USAGE.lines().all(|line| line.chars().count() <= 80));
@@ -769,6 +802,50 @@ mod tests {
     }
 
     // ----- start-up -----
+
+    #[cfg(unix)]
+    #[test]
+    fn variables_that_are_not_utf_8_are_named_in_warnings() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let bad = || OsString::from_vec(b"/home/\xffana".to_vec());
+        let all_bad = |_: &str| Some(bad());
+        assert_eq!(
+            env_warnings(true, all_bad),
+            [
+                "RCHESS_GLYPHS is not valid UTF-8; ignored",
+                "RCHESS_IMAGES is not valid UTF-8; ignored",
+                "NO_COLOR is not valid UTF-8; ignored",
+                "RCHESS_DEBUG_LOG is not valid UTF-8; the debug log does not use it",
+                "XDG_STATE_HOME is not valid UTF-8; the debug log does not use it",
+                "HOME is not valid UTF-8; the debug log does not use it",
+            ]
+        );
+        assert_eq!(
+            env_warnings(false, all_bad),
+            [
+                "RCHESS_GLYPHS is not valid UTF-8; ignored",
+                "RCHESS_IMAGES is not valid UTF-8; ignored",
+                "NO_COLOR is not valid UTF-8; ignored",
+            ],
+            "the log's variables only matter in debug mode"
+        );
+        let fine = |name: &str| (name != "RCHESS_IMAGES").then(|| OsString::from("/home/ana"));
+        assert!(env_warnings(true, fine).is_empty());
+        assert!(env_warnings(true, |_| None).is_empty());
+        let only_home = |name: &str| (name == "HOME").then(bad);
+        assert_eq!(
+            env_warnings(true, only_home),
+            ["HOME is not valid UTF-8; the debug log does not use it"]
+        );
+        // NO_COLOR read as unset leaves the colours on, so it is named too.
+        let only_no_color = |name: &str| (name == "NO_COLOR").then(bad);
+        assert_eq!(
+            env_warnings(false, only_no_color),
+            ["NO_COLOR is not valid UTF-8; ignored"]
+        );
+    }
 
     fn options(glyphs: Option<&str>, warnings: &[&str]) -> Options {
         let Cli::Play(options) = play(glyphs, warnings) else {

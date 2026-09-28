@@ -3,25 +3,29 @@
 //!
 //! Debug mode is on with `--debug` or `RCHESS_DEBUG` ([`enabled`]). The engine then
 //! records each HTTP exchange with Jev (`EngineConfig::trace`), and the worker turns
-//! it into an [`Exchange`] on the engine thread, where its body text is also rendered,
-//! once. The app keeps the last [`HISTORY_LEN`] of them in a [`History`], replies it
-//! discarded as stale included, and `d` shows them full screen ([`ExchangeView`]).
+//! it into an [`Exchange`] on the engine thread. The app keeps the last
+//! [`HISTORY_LEN`] of them in a [`History`], replies it discarded as stale and replies
+//! held while Jev vs Jev is paused included, and `d` shows them full screen
+//! ([`ExchangeView`]). Only the exchange on screen has its body text rendered
+//! ([`BodyCache`]).
 //!
 //! Each exchange is also appended to the debug log ([`log_path`]) as one JSON object
 //! per line ([`log_line`]). A thread named `debug-log` does the writing, fed by a
-//! channel ([`DebugLog`]), so the UI never waits on the disk. The log file is created
-//! with the first exchange, in a folder made private to the user; the first error
-//! stops the log for the session and is reported once.
+//! channel of at most [`LOG_QUEUE`] records ([`DebugLog`]), so the UI never waits on
+//! the disk. The log file is created with the first exchange, in a folder made private
+//! to the user; a log path that is a link is refused; the first error stops the log for
+//! the session and is reported once.
 //!
 //! The API key never reaches any of this: the engine redacts it while recording, so
 //! the `Authorization` header reads `Bearer <redacted>`.
 
 use std::collections::VecDeque;
-use std::fs::{DirBuilder, File, OpenOptions};
-use std::io::{self, Write as _};
+use std::fs::{self, DirBuilder, File};
+use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -50,6 +54,13 @@ const LOG_DIR: &str = "rchess";
 const LOG_FILE: &str = "jev-debug.jsonl";
 /// Why there is no log when none of the variables that give its path is set.
 pub const NO_LOG_PATH: &str = "no log file (set RCHESS_DEBUG_LOG, XDG_STATE_HOME or HOME)";
+/// The [`LogFailure::reason`] for a log path that is a symbolic link or has more than one
+/// hard link: the message reads `debug log disabled: <path> is a link`.
+pub const LINK: &str = "is a link";
+/// Records waiting for the `debug-log` thread at most; more are dropped ([`LOG_BEHIND`]).
+pub const LOG_QUEUE: usize = 64;
+/// The warning shown the first time a record is dropped because the queue is full.
+pub const LOG_BEHIND: &str = "debug log cannot keep up; some exchanges were not logged";
 
 /// True when debug mode is on: `--debug` was given (`flag`), or `RCHESS_DEBUG` is set
 /// to anything but empty or `0` (surrounding whitespace ignored).
@@ -61,10 +72,11 @@ pub fn enabled(flag: bool, get: impl Fn(&str) -> Option<String>) -> bool {
 
 /// The debug log file: `RCHESS_DEBUG_LOG` when set, else
 /// `$XDG_STATE_HOME/rchess/jev-debug.jsonl`, else `~/.local/state/rchess/jev-debug.jsonl`
-/// (on macOS too). Empty variables count as unset, and so does a relative
-/// `XDG_STATE_HOME` (the XDG base directory rules say to ignore one). A leading `~/` in
-/// `RCHESS_DEBUG_LOG` is `HOME`, as in save paths ([`expand_tilde`]); a relative path
-/// stays relative to the working directory.
+/// (on macOS too). Empty variables count as unset, and so do a relative
+/// `XDG_STATE_HOME` (the XDG base directory rules say to ignore one) and a relative
+/// `HOME`. A leading `~/` in `RCHESS_DEBUG_LOG` is `HOME`, as in save paths
+/// ([`expand_tilde`]); a relative `RCHESS_DEBUG_LOG` stays relative to the working
+/// directory.
 ///
 /// # Errors
 ///
@@ -75,14 +87,14 @@ pub fn enabled(flag: bool, get: impl Fn(&str) -> Option<String>) -> bool {
 /// `get` reads an environment variable; pass `|k| std::env::var(k).ok()`.
 pub fn log_path(get: impl Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
     let set = |name: &str| get(name).filter(|value| !value.is_empty());
+    let absolute = |name: &str| set(name).map(PathBuf::from).filter(|dir| dir.is_absolute());
+    let home = absolute("HOME");
     if let Some(path) = set(DEBUG_LOG_ENV) {
-        return expand_tilde(&path, set("HOME").as_deref().map(Path::new))
+        return expand_tilde(&path, home.as_deref())
             .map_err(|error| format!("{DEBUG_LOG_ENV}: {error}"));
     }
-    let state = set("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .filter(|dir| dir.is_absolute())
-        .or_else(|| set("HOME").map(|home| Path::new(&home).join(".local").join("state")))
+    let state = absolute("XDG_STATE_HOME")
+        .or_else(|| home.map(|home| home.join(".local").join("state")))
         .ok_or_else(|| NO_LOG_PATH.to_string())?;
     Ok(state.join(LOG_DIR).join(LOG_FILE))
 }
@@ -127,13 +139,11 @@ pub struct Exchange {
     pub latency: Duration,
     /// The request and its attempts.
     pub http: JevExchange,
-    /// The view's text, rendered once.
-    body: Vec<BodyLine>,
 }
 
 impl Exchange {
     /// The exchange `http` that chose `computer` in `game` (the game the engine was
-    /// asked about). Renders the view's body text ([`Exchange::body`]).
+    /// asked about).
     pub fn new(game: &Game, computer: &ComputerMove, http: JevExchange) -> Exchange {
         Exchange {
             ply: game.moves().len(),
@@ -141,18 +151,18 @@ impl Exchange {
             san: computer.san.clone(),
             source: computer.source.to_string(),
             latency: computer.latency,
-            body: body_lines(&http),
             http,
         }
     }
 
-    /// The view's text: `REQUEST` (method and URL, the headers, then the JSON body
-    /// pretty-printed), then one `RESPONSE` block per attempt (its status or `no
-    /// response`, the time it took, the error, and the body: pretty-printed when it is
-    /// JSON, else the text as sent). Control characters are escaped (`\u{1b}`), so
+    /// The view's text, rendered anew on each call (the view keeps it for the exchange
+    /// on screen only, [`BodyCache`]): `REQUEST` (method and URL, the headers, then the
+    /// JSON body pretty-printed), then one `RESPONSE` block per attempt (its status or
+    /// `no response`, the time it took, the error, and the body: pretty-printed when it
+    /// is JSON, else the text as sent). Control characters are escaped (`\u{1b}`), so
     /// nothing a server sends can act on the terminal.
-    pub fn body(&self) -> &[BodyLine] {
-        &self.body
+    pub fn body(&self) -> Vec<BodyLine> {
+        body_lines(&self.http)
     }
 
     /// Attempts made, retries included.
@@ -196,55 +206,119 @@ pub struct BodyLine {
     pub text: String,
     /// How it is drawn.
     pub kind: LineKind,
-    /// Cells the text takes on one row.
-    pub width: usize,
-    /// Every character is one cell wide, so rows are simple to count.
-    narrow: bool,
 }
 
 impl BodyLine {
     /// `text` (which must hold no control characters) drawn as `kind`.
     fn new(text: String, kind: LineKind) -> BodyLine {
-        let (width, narrow) = text.chars().fold((0, true), |(width, narrow), c| {
-            let w = char_width(c);
-            (width + w, narrow && w == 1)
-        });
-        BodyLine {
-            text,
-            kind,
-            width,
-            narrow,
+        BodyLine { text, kind }
+    }
+
+    /// The line cut into rows of at most `width` cells (at least one), between any two
+    /// characters: a wide character that would straddle the edge starts the next row, and
+    /// a zero-width one stays with the character before it.
+    pub fn wrapped(&self, width: usize) -> Vec<&str> {
+        self.row_ranges(width)
+            .map(|range| &self.text[range])
+            .collect()
+    }
+
+    /// Where each row of [`BodyLine::wrapped`] is in `text`.
+    fn row_ranges(&self, width: usize) -> impl Iterator<Item = Range<usize>> + '_ {
+        let width = width.max(1);
+        let mut chars = self.text.char_indices().peekable();
+        let mut first = true;
+        std::iter::from_fn(move || {
+            let start = match chars.peek() {
+                Some(&(start, _)) => start,
+                // An empty line is one empty row.
+                None if first => 0,
+                None => return None,
+            };
+            first = false;
+            let mut used = 0;
+            let mut end = start;
+            while let Some(&(at, c)) = chars.peek() {
+                let w = char_width(c);
+                if used > 0 && used + w > width {
+                    break;
+                }
+                used += w;
+                end = at + c.len_utf8();
+                chars.next();
+            }
+            Some(start..end)
+        })
+    }
+}
+
+/// The exchange view's body for the exchange on screen: its text rendered
+/// ([`Exchange::body`]) when that exchange is first drawn, and cut into rows for one
+/// width, again only when the width changes. No other exchange keeps a rendered body.
+#[derive(Clone, Debug, Default)]
+pub struct BodyCache {
+    /// The [`Record::number`] of the exchange whose text `lines` holds.
+    number: Option<u64>,
+    lines: Vec<BodyLine>,
+    /// The width `rows` were cut for, and each row: its line and where it is in it.
+    width: usize,
+    rows: Vec<(usize, Range<usize>)>,
+}
+
+impl BodyCache {
+    /// The body of `record`'s exchange cut into rows of at most `width` cells,
+    /// rendering and cutting only what is not held already.
+    pub fn rows(&mut self, record: &Record, width: usize) -> BodyRows<'_> {
+        let width = width.max(1);
+        if self.number != Some(record.number) {
+            self.number = Some(record.number);
+            self.lines = record.exchange.body();
+            self.rows.clear();
+        }
+        if self.width != width || self.rows.is_empty() {
+            self.width = width;
+            self.rows = self
+                .lines
+                .iter()
+                .enumerate()
+                .flat_map(|(index, line)| line.row_ranges(width).map(move |range| (index, range)))
+                .collect();
+        }
+        BodyRows {
+            lines: &self.lines,
+            rows: &self.rows,
         }
     }
 
-    /// Rows the line takes when wrapped at `width` cells (at least one).
-    pub fn rows(&self, width: usize) -> usize {
-        let width = width.max(1);
-        if self.narrow {
-            self.width.div_ceil(width).max(1)
-        } else {
-            self.wrapped(width).len()
-        }
+    /// The record number and the width of the rows held, if any.
+    pub fn holds(&self) -> Option<(u64, usize)> {
+        self.number.map(|number| (number, self.width))
+    }
+}
+
+/// An exchange's body cut into rows ([`BodyCache::rows`]).
+#[derive(Clone, Copy, Debug)]
+pub struct BodyRows<'a> {
+    lines: &'a [BodyLine],
+    rows: &'a [(usize, Range<usize>)],
+}
+
+impl<'a> BodyRows<'a> {
+    /// Rows in the body.
+    pub fn len(&self) -> usize {
+        self.rows.len()
     }
 
-    /// The line cut into rows of at most `width` cells, between any two characters (a
-    /// wide character that would straddle the edge starts the next row).
-    pub fn wrapped(&self, width: usize) -> Vec<String> {
-        let width = width.max(1);
-        let mut rows = vec![String::new()];
-        let mut used = 0;
-        for c in self.text.chars() {
-            let w = char_width(c);
-            if used > 0 && used + w > width {
-                rows.push(String::new());
-                used = 0;
-            }
-            if let Some(row) = rows.last_mut() {
-                row.push(c);
-            }
-            used += w;
-        }
-        rows
+    /// True for a body without rows (never so for an exchange's body).
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Row `index`, from 0: how it is drawn and its text.
+    pub fn get(&self, index: usize) -> Option<(LineKind, &'a str)> {
+        let (line, range) = self.rows.get(index)?;
+        let line = &self.lines[*line];
+        Some((line.kind, &line.text[range.clone()]))
     }
 }
 
@@ -323,6 +397,9 @@ pub struct Record {
     pub time: SystemTime,
     /// The reply was discarded, not played (the game had moved on, or it was an illegal move).
     pub stale: bool,
+    /// The reply is held while Jev vs Jev is paused: neither played nor discarded yet.
+    /// Settled ([`History::settle`]) once it is; the log keeps the mark it had on arrival.
+    pub held: bool,
     /// The exchange, shared with the log thread.
     pub exchange: Arc<Exchange>,
 }
@@ -343,6 +420,17 @@ impl History {
 
     /// Adds `exchange` as the newest record, dropping the oldest beyond [`HISTORY_LEN`].
     pub fn push(&mut self, exchange: Exchange, stale: bool, time: SystemTime) -> &Record {
+        self.push_marked(exchange, stale, false, time)
+    }
+
+    /// [`History::push`], marked [`Record::held`] when `held` is true.
+    fn push_marked(
+        &mut self,
+        exchange: Exchange,
+        stale: bool,
+        held: bool,
+        time: SystemTime,
+    ) -> &Record {
         if self.records.len() == HISTORY_LEN {
             self.records.pop_front();
         }
@@ -351,9 +439,23 @@ impl History {
             number: self.recorded,
             time,
             stale,
+            held,
             exchange: Arc::new(exchange),
         });
         &self.records[self.records.len() - 1]
+    }
+
+    /// The held reply numbered `number` has been played (`stale` false) or discarded:
+    /// its record is no longer held. Nothing happens once it has been dropped.
+    pub fn settle(&mut self, number: u64, stale: bool) {
+        if let Some(record) = self
+            .records
+            .iter_mut()
+            .find(|record| record.number == number)
+        {
+            record.held = false;
+            record.stale = stale;
+        }
     }
 
     /// Records kept.
@@ -393,7 +495,9 @@ impl History {
 
 /// Where the exchange view is: which exchange it shows and how far its body is
 /// scrolled. The page size and the scroll limit come from the last draw, so the keys
-/// stop where the screen does.
+/// stop where the screen does. Opening the view or switching exchanges keeps the page
+/// size and leaves the limit unknown (`usize::MAX`) until the next draw, so keys in the
+/// same input batch still scroll; the draw then clamps the scroll to the body.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ExchangeView {
     /// The [`Record::number`] shown; `None` while there are no exchanges.
@@ -402,17 +506,21 @@ pub struct ExchangeView {
     pub scroll: usize,
     /// Body rows on screen at the last draw.
     pub page: usize,
-    /// The largest `scroll` at the last draw: the body's last row at the bottom.
+    /// The largest `scroll` at the last draw: the body's last row at the bottom;
+    /// `usize::MAX` before the exchange shown has been drawn.
     pub max_scroll: usize,
 }
 
 impl ExchangeView {
-    /// The view on the newest exchange in `history`, scrolled to the top.
+    /// The view on the newest exchange in `history`, scrolled to the top, with the
+    /// `page` size the view last had (0 before it was ever drawn).
     #[must_use]
-    pub fn open(history: &History) -> ExchangeView {
+    pub fn open(history: &History, page: usize) -> ExchangeView {
         ExchangeView {
             shown: history.last().map(|record| record.number),
-            ..ExchangeView::default()
+            scroll: 0,
+            page,
+            max_scroll: usize::MAX,
         }
     }
 
@@ -454,11 +562,14 @@ impl ExchangeView {
         }
     }
 
+    /// Shows exchange `number` from its top, keeping the page size.
     fn show(&mut self, number: Option<u64>) {
         if number != self.shown {
             *self = ExchangeView {
                 shown: number,
-                ..ExchangeView::default()
+                scroll: 0,
+                page: self.page,
+                max_scroll: usize::MAX,
             };
         }
     }
@@ -508,6 +619,7 @@ struct LogRecord<'a> {
     played: &'a str,
     source: &'a str,
     stale: bool,
+    held: bool,
     request: LogRequest<'a>,
     attempts: Vec<LogAttempt<'a>>,
 }
@@ -538,9 +650,12 @@ struct LogAttempt<'a> {
 }
 
 /// `record` as one line of JSON (without the line break): `time` (RFC 3339, UTC),
-/// `ply`, `played` (SAN), `source`, `stale`, `request` (`method`, `url`, `headers` as an
-/// object, `body`) and `attempts` (each `status` or null, `elapsed_ms`, `response` as
-/// JSON when it parses, else as a string, or null, and `error` or null).
+/// `ply`, `played` (SAN), `source`, `stale`, `held` (it arrived while Jev vs Jev was
+/// paused; a held record is logged on arrival, so its `stale` is its state then, and
+/// whether it was played or discarded later is only in the [`History`]), `request`
+/// (`method`, `url`, `headers` as an object, `body`) and `attempts`
+/// (each `status` or null, `elapsed_ms`, `response` as JSON when it parses, else as a
+/// string, or null, and `error` or null).
 ///
 /// # Errors
 ///
@@ -554,6 +669,7 @@ pub fn log_line(record: &Record) -> serde_json::Result<String> {
         played: &exchange.san,
         source: &exchange.source,
         stale: record.stale,
+        held: record.held,
         request: LogRequest {
             method: &http.method,
             url: &http.url,
@@ -578,7 +694,7 @@ pub fn log_line(record: &Record) -> serde_json::Result<String> {
 /// Why the debug log stopped.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogFailure {
-    /// A short reason, such as `permission denied`.
+    /// A short reason, such as `permission denied`, or [`LINK`].
     pub reason: String,
     /// The log file, when there is one.
     pub path: Option<PathBuf>,
@@ -588,17 +704,23 @@ pub struct LogFailure {
 /// each as a line ([`log_line`]) and flushes it. The file and any missing folders are
 /// created with the first record: folders with mode 0700, the file with mode 0600 (an
 /// existing file is appended to and made 0600 too; an existing folder keeps its mode).
+/// A log path that is a symbolic link or has more than one hard link is refused
+/// ([`LINK`]), and an existing log whose last record was cut short gets a line break
+/// first.
 ///
 /// The first error ends the thread; [`DebugLog::failure`] then reports it once and
-/// nothing more is written. Records never wait: [`DebugLog::write`] only sends.
+/// nothing more is written. Records never wait: [`DebugLog::write`] only sends, and
+/// drops the record when [`LOG_QUEUE`] are already waiting ([`DebugLog::dropped`]).
 pub struct DebugLog {
     state: LogState,
+    /// A record was dropped: `Some(true)` until [`DebugLog::dropped`] reports it.
+    dropped: Option<bool>,
 }
 
 enum LogState {
     /// The thread is writing.
     Running {
-        records: Sender<Record>,
+        records: SyncSender<Record>,
         failures: Receiver<LogFailure>,
         /// Disconnects when the thread ends.
         finished: Receiver<()>,
@@ -619,6 +741,7 @@ impl DebugLog {
             Ok(path) => DebugLog::start(path),
             Err(reason) => DebugLog {
                 state: LogState::Unavailable(LogFailure { reason, path: None }),
+                dropped: None,
             },
         }
     }
@@ -627,7 +750,7 @@ impl DebugLog {
     /// until the first record.
     #[must_use]
     pub fn start(path: PathBuf) -> DebugLog {
-        let (records, queued) = mpsc::channel();
+        let (records, queued) = mpsc::sync_channel(LOG_QUEUE);
         let (failed, failures) = mpsc::channel();
         let (done, finished) = mpsc::channel::<()>();
         let file = path.clone();
@@ -653,16 +776,24 @@ impl DebugLog {
                 path: Some(path),
             }),
         };
-        DebugLog { state }
+        DebugLog {
+            state,
+            dropped: None,
+        }
     }
 
-    /// Queues `record` for the log; never blocks.
+    /// Queues `record` for the log; never blocks. With [`LOG_QUEUE`] records already
+    /// waiting, `record` is dropped.
     pub fn write(&mut self, record: &Record) {
         match &mut self.state {
-            LogState::Running { records, .. } => {
-                // Fails only once the thread has stopped, and `failure` says why.
-                let _ = records.send(record.clone());
-            }
+            LogState::Running { records, .. } => match records.try_send(record.clone()) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    self.dropped.get_or_insert(true);
+                }
+                // The thread has stopped, and `failure` says why.
+                Err(TrySendError::Disconnected(_)) => {}
+            },
             LogState::Unavailable(failure) => {
                 let failure = failure.clone();
                 self.state = LogState::Stopped(Some(failure));
@@ -690,6 +821,15 @@ impl DebugLog {
             }
             LogState::Stopped(failure) => failure.take(),
             LogState::Unavailable(_) => None,
+        }
+    }
+
+    /// True the first time this is asked after a record was dropped because the queue
+    /// was full; false before and ever after, so the warning is shown once.
+    pub fn dropped(&mut self) -> bool {
+        match &mut self.dropped {
+            Some(unreported) => std::mem::replace(unreported, false),
+            None => false,
         }
     }
 
@@ -730,7 +870,18 @@ fn write_records(path: &Path, queued: &Receiver<Record>) -> Result<(), LogFailur
 /// folders that were already there keep theirs (one may be the user's
 /// `~/.local/state`). Only a regular file is changed: a device such as `/dev/null`
 /// is written as it is.
+///
+/// A symbolic link at `path`, or a file with another hard link, is refused with the
+/// reason [`LINK`]: checked before the file is opened, not followed by the open
+/// ([`open_appending`]), so a symbolic link planted in between is refused without
+/// touching its target, and checked again after (a hard link or another file planted in
+/// between is still refused, before anything is written or its mode changed). A regular
+/// file whose last byte is not a line break (a session that ended mid-record) gets one.
 fn open_log(path: &Path) -> io::Result<File> {
+    let refused = || io::Error::other(LINK);
+    if fs::symlink_metadata(path).is_ok_and(|meta| meta.is_symlink()) {
+        return Err(refused());
+    }
     if let Some(folder) = path
         .parent()
         .filter(|folder| !folder.as_os_str().is_empty())
@@ -741,20 +892,71 @@ fn open_log(path: &Path) -> io::Result<File> {
         std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
         builder.create(folder)?;
     }
-    let mut options = OpenOptions::new();
-    options.append(true).create(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let file = options.open(path)?;
+    let file = open_appending(path)?;
+    let metadata = file.metadata()?;
+    if is_link(path, &metadata)? {
+        return Err(refused());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let metadata = file.metadata()?;
         if metadata.is_file() && metadata.permissions().mode() & 0o777 != 0o600 {
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
     }
+    if metadata.is_file() && metadata.len() > 0 && !ends_with_newline(path)? {
+        (&file).write_all(b"\n")?;
+    }
     Ok(file)
+}
+
+/// Opens `path` for appending, creating it with mode 0600 when it is not there, and
+/// without following a symbolic link at `path` (`O_NOFOLLOW`): one is refused with the
+/// reason [`LINK`], and its target is neither opened nor created.
+#[cfg(unix)]
+fn open_appending(path: &Path) -> io::Result<File> {
+    use rustix::fs::{Mode, OFlags};
+    let flags =
+        OFlags::WRONLY | OFlags::APPEND | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    match rustix::fs::open(path, flags, Mode::RUSR | Mode::WUSR) {
+        Ok(fd) => Ok(File::from(fd)),
+        // What `O_NOFOLLOW` gives for a symbolic link.
+        Err(rustix::io::Errno::LOOP) => Err(io::Error::other(LINK)),
+        Err(errno) => Err(errno.into()),
+    }
+}
+
+/// Opens `path` for appending, creating it when it is not there.
+#[cfg(not(unix))]
+fn open_appending(path: &Path) -> io::Result<File> {
+    fs::OpenOptions::new().append(true).create(true).open(path)
+}
+
+/// True when the file opened at `path` (its `opened` metadata) is not simply the file
+/// named `path`: `path` is now a symbolic link, or names another file, or the file has
+/// more than one hard link.
+#[cfg(unix)]
+fn is_link(path: &Path, opened: &fs::Metadata) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let named = fs::symlink_metadata(path)?;
+    Ok(named.is_symlink()
+        || (named.dev(), named.ino()) != (opened.dev(), opened.ino())
+        || (opened.is_file() && opened.nlink() > 1))
+}
+
+/// True when `path` is now a symbolic link (other systems: hard links are not checked).
+#[cfg(not(unix))]
+fn is_link(path: &Path, _opened: &fs::Metadata) -> io::Result<bool> {
+    Ok(fs::symlink_metadata(path)?.is_symlink())
+}
+
+/// True when the last byte of the (non-empty) file at `path` is a line break.
+fn ends_with_newline(path: &Path) -> io::Result<bool> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0];
+    file.read_exact(&mut last)?;
+    Ok(last[0] == b'\n')
 }
 
 /// Writes `record` as one line and flushes it.
@@ -796,17 +998,64 @@ impl DebugSession {
         record.number
     }
 
+    /// Keeps `exchange`, received at `time` while Jev vs Jev is paused, marked held, and
+    /// queues it for the log at once, so quitting while paused never loses it. Returns its
+    /// [`Record::number`], for [`DebugSession::settle`].
+    pub fn hold(&mut self, exchange: Exchange, time: SystemTime) -> u64 {
+        let record = self.history.push_marked(exchange, false, true, time);
+        self.log.write(record);
+        record.number
+    }
+
+    /// The held reply numbered `number` was played (`stale` false) or discarded; the
+    /// log is not written again ([`History::settle`]).
+    pub fn settle(&mut self, number: u64, stale: bool) {
+        self.history.settle(number, stale);
+    }
+
     /// See [`DebugLog::failure`].
     pub fn log_failure(&mut self) -> Option<LogFailure> {
         self.log.failure()
+    }
+
+    /// See [`DebugLog::dropped`].
+    pub fn log_dropped(&mut self) -> bool {
+        self.log.dropped()
     }
 
     /// Closes the log ([`DebugLog::close`]); later exchanges are kept but not logged.
     pub fn close_log(&mut self, grace: Duration) {
         let stopped = DebugLog {
             state: LogState::Stopped(None),
+            dropped: None,
         };
         std::mem::replace(&mut self.log, stopped).close(grace);
+    }
+}
+
+// ----- test support -----
+
+#[cfg(test)]
+impl DebugLog {
+    /// A log whose `debug-log` thread never takes a record, as when it is stuck on a slow
+    /// disk: the test holds the queue's other end (`queued`), so the queue fills after
+    /// [`LOG_QUEUE`] records, with no thread to leave behind. While the test also keeps
+    /// `failures`, the log does not take its thread for stopped.
+    pub(crate) fn stalled(path: PathBuf) -> (DebugLog, Receiver<Record>, mpsc::Sender<LogFailure>) {
+        let (records, queued) = mpsc::sync_channel(LOG_QUEUE);
+        let (failed, failures) = mpsc::channel();
+        let (_done, finished) = mpsc::channel::<()>();
+        let state = LogState::Running {
+            records,
+            failures,
+            finished,
+            path,
+        };
+        let log = DebugLog {
+            state,
+            dropped: None,
+        };
+        (log, queued, failed)
     }
 }
 
@@ -841,11 +1090,11 @@ mod tests {
             .clone()
     }
 
-    fn texts(exchange: &Exchange) -> Vec<&str> {
+    fn texts(exchange: &Exchange) -> Vec<String> {
         exchange
             .body()
             .iter()
-            .map(|line| line.text.as_str())
+            .map(|line| line.text.clone())
             .collect()
     }
 
@@ -920,7 +1169,12 @@ mod tests {
                 "XDG_STATE_HOME {xdg:?} is ignored"
             );
         }
-        for pairs in [&[][..], &[("HOME", ""), ("XDG_STATE_HOME", "state")]] {
+        for pairs in [
+            &[][..],
+            &[("HOME", ""), ("XDG_STATE_HOME", "state")],
+            &[("HOME", "home/ana")],
+            &[("HOME", "home/ana"), ("XDG_STATE_HOME", "state")],
+        ] {
             assert_eq!(
                 log_path(env(pairs)),
                 Err(NO_LOG_PATH.to_string()),
@@ -996,7 +1250,7 @@ mod tests {
             "  \"answers\": {",
         ]);
         assert_eq!(&lines[..expected.len()], &expected[..]);
-        assert_eq!(lines.last(), Some(&"}"));
+        assert_eq!(lines.last().map(String::as_str), Some("}"));
         let kinds: Vec<LineKind> = exchange.body().iter().map(|line| line.kind).collect();
         assert_eq!(kinds[0], LineKind::Heading);
         let error = expected.len() - 7;
@@ -1073,19 +1327,69 @@ mod tests {
     #[test]
     fn body_lines_wrap_between_characters() {
         let line = BodyLine::new("abcdefghij".to_string(), LineKind::Text);
-        assert_eq!(line.width, 10);
-        assert_eq!(line.rows(4), 3);
         assert_eq!(line.wrapped(4), ["abcd", "efgh", "ij"]);
-        assert_eq!(line.rows(10), 1);
-        assert_eq!(line.rows(0), 10, "at least one cell per row");
+        assert_eq!(line.wrapped(10), ["abcdefghij"]);
+        assert_eq!(line.wrapped(0).len(), 10, "at least one cell per row");
         let empty = BodyLine::new(String::new(), LineKind::Text);
-        assert_eq!(empty.rows(8), 1);
         assert_eq!(empty.wrapped(8), [""]);
-        // A wide character never straddles the edge.
+        // A wide character never straddles the edge; a combining mark stays with its base.
         let wide = BodyLine::new("ab日本cd".to_string(), LineKind::Text);
-        assert_eq!(wide.width, 8);
         assert_eq!(wide.wrapped(3), ["ab", "日", "本c", "d"]);
-        assert_eq!(wide.rows(3), 4);
+        let marked = BodyLine::new("abe\u{301}f".to_string(), LineKind::Text);
+        assert_eq!(marked.wrapped(3), ["abe\u{301}", "f"]);
+    }
+
+    /// The rows `cache` holds for `record` at `width`, as text.
+    fn cached_rows(cache: &mut BodyCache, record: &Record, width: usize) -> Vec<String> {
+        let rows = cache.rows(record, width);
+        (0..rows.len())
+            .map(|index| rows.get(index).expect("a row").1.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn the_body_is_rendered_for_the_exchange_on_screen_only() {
+        let mut history = History::new();
+        history.push(exchange(), false, at_ms(1));
+        let mut other = jev_exchange();
+        other.attempts.truncate(1);
+        let game = Game::new();
+        let second = Exchange::new(&game, &jev_move(game.position(), "d2d4"), other);
+        history.push(second, false, at_ms(2));
+        let (first, second) = (history.get(0).unwrap(), history.get(1).unwrap());
+
+        let mut cache = BodyCache::default();
+        assert_eq!(cache.holds(), None);
+        let wide = cached_rows(&mut cache, first, 40);
+        assert_eq!(cache.holds(), Some((1, 40)));
+        let expected: Vec<String> = first
+            .exchange
+            .body()
+            .iter()
+            .flat_map(|line| {
+                line.wrapped(40)
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(wide, expected);
+        let rows = cache.rows(first, 40);
+        assert_eq!(rows.get(0), Some((LineKind::Heading, "REQUEST")));
+        assert_eq!(rows.get(rows.len()), None);
+
+        // Another width wraps the same text again.
+        let narrow = cached_rows(&mut cache, first, 12);
+        assert_eq!(cache.holds(), Some((1, 12)));
+        assert!(narrow.len() > wide.len());
+        assert!(narrow.iter().all(|row| row.chars().count() <= 12));
+        assert_eq!(narrow.concat(), wide.concat());
+
+        // Another exchange replaces the one held.
+        let rows = cached_rows(&mut cache, second, 12);
+        assert_eq!(cache.holds(), Some((2, 12)));
+        assert!(rows.len() < narrow.len(), "one response block, not two");
+        assert!(!rows.concat().contains("RESPONSE 2"));
     }
 
     // ----- history and view -----
@@ -1115,7 +1419,7 @@ mod tests {
     #[test]
     fn the_view_steps_between_exchanges_and_stays_on_its_own() {
         let mut history = History::new();
-        let mut view = ExchangeView::open(&history);
+        let mut view = ExchangeView::open(&history, 0);
         assert_eq!(view.shown, None);
         assert_eq!(view.index(&history), None);
         view.older(&history);
@@ -1137,7 +1441,7 @@ mod tests {
         view.older(&history);
         assert_eq!(view.shown, Some(2));
 
-        let view = ExchangeView::open(&history);
+        let view = ExchangeView::open(&history, 0);
         assert_eq!(view.shown, Some(3), "opens on the newest");
     }
 
@@ -1146,7 +1450,7 @@ mod tests {
         let mut history = History::new();
         history.push(exchange(), false, at_ms(1));
         history.push(exchange(), false, at_ms(2));
-        let mut view = ExchangeView::open(&history);
+        let mut view = ExchangeView::open(&history, 0);
         view.older(&history);
         (view.page, view.max_scroll) = (10, 40);
         view.down(7);
@@ -1186,7 +1490,7 @@ mod tests {
         for n in 1..=2 {
             history.push(exchange(), false, at_ms(n));
         }
-        let mut view = ExchangeView::open(&history);
+        let mut view = ExchangeView::open(&history, 0);
         view.page = 10;
         view.max_scroll = 25;
         view.down(1);
@@ -1217,14 +1521,49 @@ mod tests {
             view,
             ExchangeView {
                 shown: Some(1),
-                ..ExchangeView::default()
-            }
+                scroll: 0,
+                page: 1,
+                max_scroll: usize::MAX,
+            },
+            "at the top of the other exchange, with the page size kept"
         );
         view.older(&history);
         view.max_scroll = 25;
         view.end();
         view.older(&history);
         assert_eq!(view.scroll, 25, "already the oldest: nothing moves");
+    }
+
+    #[test]
+    fn the_page_size_is_kept_when_opening_or_switching() {
+        let mut history = History::new();
+        for n in 1..=2 {
+            history.push(exchange(), false, at_ms(n));
+        }
+        let mut view = ExchangeView::open(&history, 12);
+        assert_eq!(
+            view,
+            ExchangeView {
+                shown: Some(2),
+                scroll: 0,
+                page: 12,
+                max_scroll: usize::MAX,
+            }
+        );
+        // Until the next draw finds the body's end, the keys scroll freely and the draw
+        // clamps where they went.
+        view.page_down();
+        assert_eq!(view.scroll, 11);
+        view.down(1);
+        assert_eq!(view.scroll, 12);
+        view.older(&history);
+        assert_eq!((view.shown, view.scroll, view.page), (Some(1), 0, 12));
+        view.end();
+        assert_eq!(
+            view.scroll,
+            usize::MAX,
+            "the end, wherever the draw finds it"
+        );
     }
 
     // ----- log records -----
@@ -1239,6 +1578,7 @@ mod tests {
             "\"played\"",
             "\"source\"",
             "\"stale\"",
+            "\"held\"",
             "\"request\"",
             "\"attempts\"",
         ];
@@ -1256,6 +1596,7 @@ mod tests {
                 "played": "e4",
                 "source": "Jev",
                 "stale": false,
+                "held": false,
                 "request": {
                     "method": "POST",
                     "url": "https://api.typesafe.ai/v1/systemone",
@@ -1360,6 +1701,34 @@ mod tests {
     }
 
     #[test]
+    fn a_relative_home_is_not_used_for_the_log() {
+        // An absolute HOME gives the log a place; a relative one counts as unset.
+        assert_eq!(
+            log_path(env(&[("HOME", "/home/ana")])),
+            Ok(PathBuf::from(
+                "/home/ana/.local/state/rchess/jev-debug.jsonl"
+            ))
+        );
+        assert_eq!(
+            log_path(env(&[("HOME", "home/ana")])),
+            Err(NO_LOG_PATH.to_string())
+        );
+        assert_eq!(
+            log_path(env(&[("HOME", "home/ana"), ("XDG_STATE_HOME", "/xdg")])),
+            Ok(PathBuf::from("/xdg/rchess/jev-debug.jsonl"))
+        );
+        assert_eq!(
+            log_path(env(&[(DEBUG_LOG_ENV, "~/x.jsonl"), ("HOME", "home/ana")])),
+            Err("RCHESS_DEBUG_LOG: cannot expand ~ in ~/x.jsonl: HOME is not set".to_string())
+        );
+        assert_eq!(
+            log_path(env(&[(DEBUG_LOG_ENV, "x.jsonl"), ("HOME", "home/ana")])),
+            Ok(PathBuf::from("x.jsonl")),
+            "no ~, no home needed"
+        );
+    }
+
+    #[test]
     fn a_tilde_without_a_home_is_reported_as_such() {
         // Without a home there is nothing to expand `~` to, so there is no log, and the
         // reason says so rather than asking for RCHESS_DEBUG_LOG, which is set.
@@ -1449,6 +1818,156 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 2);
         assert_eq!(mode(&path), 0o600);
         assert_eq!(mode(&folder), 0o755);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_log_path_that_is_a_link_is_refused() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = TempDir::new("debug-log");
+        let target = dir.join("target.jsonl");
+        fs::write(&target, "mine\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        let soft = dir.join("soft.jsonl");
+        symlink(&target, &soft).unwrap();
+        let hard = dir.join("hard.jsonl");
+        fs::hard_link(&target, &hard).unwrap();
+        let dangling = dir.join("dangling.jsonl");
+        symlink(dir.join("nowhere.jsonl"), &dangling).unwrap();
+        for path in [soft, hard, dangling] {
+            let mut log = DebugLog::start(path.clone());
+            log.write(&record(false));
+            assert_eq!(
+                wait_for_failure(&mut log),
+                LogFailure {
+                    reason: LINK.to_string(),
+                    path: Some(path),
+                }
+            );
+            log.close(Duration::from_secs(10));
+        }
+        assert_eq!(fs::read_to_string(&target).unwrap(), "mine\n");
+        assert_eq!(mode(&target), 0o644, "the target's mode is left alone");
+        assert!(!dir.join("nowhere.jsonl").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_open_does_not_follow_a_link_planted_after_the_check() {
+        // `open_log` looks at the path before it opens it; a link planted after that look
+        // reaches the open itself, which must neither follow it nor create its target.
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new("debug-log");
+        let target = dir.join("target.jsonl");
+        fs::write(&target, "mine\n").unwrap();
+        let soft = dir.join("soft.jsonl");
+        symlink(&target, &soft).unwrap();
+        let dangling = dir.join("dangling.jsonl");
+        symlink(dir.join("nowhere.jsonl"), &dangling).unwrap();
+        for path in [soft, dangling] {
+            let error = open_appending(&path).expect_err("a link is not opened");
+            assert_eq!(describe(&error), LINK, "{path:?}");
+        }
+        assert_eq!(fs::read_to_string(&target).unwrap(), "mine\n");
+        assert!(!dir.join("nowhere.jsonl").exists(), "no target is created");
+
+        // A plain file is opened, and created with mode 0600.
+        let plain = dir.join("plain.jsonl");
+        open_appending(&plain).expect("a plain path opens");
+        assert_eq!(mode(&plain), 0o600);
+    }
+
+    #[test]
+    fn a_record_cut_short_is_ended_before_the_next_one() {
+        let dir = TempDir::new("debug-log");
+        // A session that ended in the middle of a record.
+        let path = dir.join("jev.jsonl");
+        let half = "{\"time\":\"2026-09-21T14:13:20.123Z\",\"pl";
+        fs::write(&path, half).unwrap();
+        let (first, second) = (record(false), record(true));
+        let mut log = DebugLog::start(path.clone());
+        log.write(&first);
+        log.write(&second);
+        log.close(Duration::from_secs(10));
+        let text = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                half.to_string(),
+                log_line(&first).unwrap(),
+                log_line(&second).unwrap()
+            ]
+        );
+        assert!(text.ends_with('\n'));
+
+        // An empty log and a whole one get no extra line.
+        for earlier in ["", "{\"earlier\":true}\n"] {
+            let path = dir.join("whole.jsonl");
+            fs::write(&path, earlier).unwrap();
+            let mut log = DebugLog::start(path.clone());
+            log.write(&first);
+            log.close(Duration::from_secs(10));
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                format!("{earlier}{}\n", log_line(&first).unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn a_full_queue_drops_records_and_warns_once() {
+        // Nothing takes the records, as when the thread is stuck writing.
+        let (mut log, queued, _failures) = DebugLog::stalled(PathBuf::from("jev.jsonl"));
+        assert!(!log.dropped());
+        for _ in 0..LOG_QUEUE + 10 {
+            log.write(&record(false));
+        }
+        assert!(log.dropped(), "the queue holds {LOG_QUEUE} records");
+        assert!(!log.dropped(), "one warning");
+        log.write(&record(false));
+        assert!(!log.dropped(), "still one warning");
+        assert_eq!(log.failure(), None, "dropping is not a failure");
+        assert_eq!(queued.try_iter().count(), LOG_QUEUE, "the first ones wait");
+        // Once the queue has room again, records are taken again.
+        log.write(&record(false));
+        assert_eq!(queued.try_iter().count(), 1);
+        assert!(!log.dropped());
+    }
+
+    #[test]
+    fn a_held_reply_is_logged_when_it_arrives() {
+        let dir = TempDir::new("debug-log");
+        let path = dir.join("jev.jsonl");
+        let mut session = DebugSession::new(DebugLog::start(path.clone()));
+        let first = session.hold(exchange(), at_ms(1));
+        assert_eq!(first, 1);
+        let record = session.history().last().unwrap();
+        assert!(record.held && !record.stale, "{record:?}");
+        session.settle(first, false);
+        let record = session.history().last().unwrap();
+        assert!(!record.held && !record.stale, "played: {record:?}");
+
+        let second = session.hold(exchange(), at_ms(2));
+        session.settle(second, true);
+        let record = session.history().last().unwrap();
+        assert!(!record.held && record.stale, "dropped: {record:?}");
+        // A record no longer kept is left alone.
+        session.settle(99, true);
+        assert_eq!(session.history().len(), 2);
+
+        session.close_log(Duration::from_secs(10));
+        let text = fs::read_to_string(&path).unwrap();
+        let lines: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        for (line, ms) in lines.iter().zip([1, 2]) {
+            assert_eq!(line["held"], json!(true), "{line}");
+            assert_eq!(line["stale"], json!(false), "{line}");
+            assert_eq!(line["time"], json!(rfc3339(at_ms(ms))), "when it arrived");
+        }
     }
 
     #[test]

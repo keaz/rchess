@@ -65,7 +65,7 @@ use ratatui_image::picker::{Picker, ProtocolType};
 use super::board::{
     BoardGeometry, CellSize, Highlights, PieceImages, min_picture_square, square_at,
 };
-use super::debug::{DebugLog, DebugSession, Exchange, ExchangeView, History};
+use super::debug::{self, BodyCache, DebugLog, DebugSession, Exchange, ExchangeView, History};
 use super::event::AppEvent;
 use super::files::{SaveError, pgn_export, resolve_path, tilde_path, today, write_file};
 use super::glyphs::{self, GlyphSet, Palette};
@@ -605,6 +605,14 @@ struct Pending {
     since: Instant,
 }
 
+/// The Jev exchange behind an engine reply, in debug mode.
+enum Trace {
+    /// Not kept yet (`None` without debug mode or without an exchange).
+    New(Option<Box<Exchange>>),
+    /// Kept when the reply arrived while paused: its record number.
+    Held(Option<u64>),
+}
+
 /// A piece picked up with the mouse button still held.
 #[derive(Clone, Copy, Debug)]
 struct Drag {
@@ -638,6 +646,11 @@ pub struct App {
     debug: Option<DebugSession>,
     /// The exchange view, while it is open (only in debug mode).
     exchange_view: Option<ExchangeView>,
+    /// The exchange view's body text for the exchange on screen; empty while the view
+    /// is closed.
+    exchange_body: BodyCache,
+    /// The exchange view's page size at its last draw, kept for when it opens again.
+    exchange_page: usize,
     pick_side: fn() -> Side,
     today: fn() -> String,
     home: Option<PathBuf>,
@@ -674,9 +687,9 @@ pub struct App {
     engine_failed: bool,
     /// Jev vs Jev is paused: no request is sent and no move is played.
     paused: bool,
-    /// An answer that arrived while paused, applied when play resumes, with its Jev
-    /// exchange.
-    held: Option<(EngineOutcome, Option<Box<Exchange>>)>,
+    /// An answer that arrived while paused, applied when play resumes, with the number of
+    /// its Jev exchange, kept (marked held) and logged when it arrived.
+    held: Option<(EngineOutcome, Option<u64>)>,
     step_delay: Duration,
     /// When the last Jev vs Jev move was applied; the next request is due one step
     /// delay later. `None` means due now.
@@ -722,6 +735,8 @@ impl App {
             piece_images: PieceImages::new(),
             debug: None,
             exchange_view: None,
+            exchange_body: BodyCache::default(),
+            exchange_page: 0,
             pick_side: random_side,
             today,
             home: std::env::var_os("HOME").map(PathBuf::from),
@@ -1399,7 +1414,9 @@ impl App {
     /// Opens the exchange view on the newest exchange, or says debug mode is off.
     fn open_exchanges(&mut self) {
         match &self.debug {
-            Some(debug) => self.exchange_view = Some(ExchangeView::open(debug.history())),
+            Some(debug) => {
+                self.exchange_view = Some(ExchangeView::open(debug.history(), self.exchange_page));
+            }
             None => self.show(Message::info(DEBUG_OFF)),
         }
     }
@@ -1648,32 +1665,29 @@ impl App {
         }
         self.pending = None;
         if self.paused {
-            // Paused while the engine was thinking: nothing is played until space resumes.
-            self.held = Some((reply.outcome, reply.exchange));
+            // Paused while the engine was thinking: nothing is played until space resumes,
+            // but the exchange is kept and logged now, so quitting first never loses it.
+            let held = self.hold_exchange(reply.exchange);
+            self.held = Some((reply.outcome, held));
             return;
         }
-        self.apply_outcome(reply.outcome, reply.exchange, now);
+        self.apply_outcome(reply.outcome, Trace::New(reply.exchange), now);
     }
 
-    /// Plays a move the worker produced, or records why there is none. `exchange` is the
+    /// Plays a move the worker produced, or records why there is none. `trace` is the
     /// Jev exchange behind the move, kept as played or, for an illegal move, as not.
-    fn apply_outcome(
-        &mut self,
-        outcome: EngineOutcome,
-        exchange: Option<Box<Exchange>>,
-        now: Instant,
-    ) {
+    fn apply_outcome(&mut self, outcome: EngineOutcome, trace: Trace, now: Instant) {
         match outcome {
             EngineOutcome::Move(computer) => {
                 if let Err(error) = self.game.play(computer.mv) {
-                    self.record_exchange(exchange, true);
+                    self.keep_trace(trace, true);
                     self.engine_failure(&format!(
                         "engine returned an illegal move {}: {error}",
                         computer.mv
                     ));
                     return;
                 }
-                self.record_exchange(exchange, false);
+                self.keep_trace(trace, false);
                 let recovered = computer.note.as_deref() == Some(ENGINE_ERROR_NOTE);
                 self.last_computer = Some((self.game.moves().len(), computer));
                 // Notes about the turn just played (a move typed too early, an undo) are
@@ -1702,10 +1716,36 @@ impl App {
     /// Plays the answer held while paused, once play has resumed.
     fn release_held(&mut self, now: Instant) {
         if !self.paused
-            && let Some((outcome, exchange)) = self.held.take()
+            && let Some((outcome, held)) = self.held.take()
         {
-            self.apply_outcome(outcome, exchange, now);
+            self.apply_outcome(outcome, Trace::Held(held), now);
         }
+    }
+
+    /// Keeps the Jev exchange behind a reply as played or, when `stale`, as not: a new
+    /// one is recorded ([`App::record_exchange`]), a held one settled.
+    fn keep_trace(&mut self, trace: Trace, stale: bool) {
+        match trace {
+            Trace::New(exchange) => self.record_exchange(exchange, stale),
+            Trace::Held(number) => {
+                if let (Some(debug), Some(number)) = (&mut self.debug, number) {
+                    debug.settle(number, stale);
+                }
+            }
+        }
+    }
+
+    /// Keeps `exchange`, whose reply is held while paused, marked held (and logs it), and
+    /// returns its number. Without debug mode it is dropped.
+    fn hold_exchange(&mut self, exchange: Option<Box<Exchange>>) -> Option<u64> {
+        let (Some(debug), Some(exchange)) = (&mut self.debug, exchange) else {
+            return None;
+        };
+        let number = debug.hold(*exchange, SystemTime::now());
+        if let Some(view) = &mut self.exchange_view {
+            view.follow(debug.history());
+        }
+        Some(number)
     }
 
     /// Keeps `exchange` in debug mode (`stale` when its move was not played) and shows it
@@ -1726,12 +1766,20 @@ impl App {
     /// `pending_log_failure` and shown as soon as a game screen can, rather than being
     /// lost silently.
     fn report_log_failure(&mut self) {
+        if self.debug.as_mut().is_some_and(DebugSession::log_dropped) {
+            self.pending_log_failure = Some(Message::error(debug::LOG_BEHIND));
+        }
         if let Some(failure) = self.debug.as_mut().and_then(DebugSession::log_failure) {
-            let text = format!("debug log disabled: {}", failure.reason);
+            let text = "debug log disabled: ";
             let message = match &failure.path {
-                Some(path) => Message::error(format!("{text}: "))
+                // The path is the message's end, where it is shortened best when it
+                // does not fit, so the reason goes last with it.
+                Some(path) if failure.reason == debug::LINK => Message::error(text).with_path(
+                    format!("{} {}", tilde_path(path, self.home.as_deref()), debug::LINK),
+                ),
+                Some(path) => Message::error(format!("{text}{}: ", failure.reason))
                     .with_path(tilde_path(path, self.home.as_deref())),
-                None => Message::error(text),
+                None => Message::error(format!("{text}{}", failure.reason)),
             };
             self.pending_log_failure = Some(message);
         }
@@ -1847,8 +1895,8 @@ impl App {
     fn invalidate(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.pending = None;
-        if let Some((_, exchange)) = self.held.take() {
-            self.record_exchange(exchange, true);
+        if let Some((_, held)) = self.held.take() {
+            self.keep_trace(Trace::Held(held), true);
         }
         self.engine_failed = false;
         self.selected = None;
@@ -2439,8 +2487,13 @@ impl App {
         self.too_small = is_too_small(frame.area());
         // Lent to the draw, which reads the rest of the app and keeps new pictures in it.
         let mut images = std::mem::take(&mut self.piece_images);
-        let drawn = panels::draw(self, &mut images, frame, now);
+        let mut bodies = std::mem::take(&mut self.exchange_body);
+        let drawn = panels::draw(self, &mut images, &mut bodies, frame, now);
         self.piece_images = images;
+        // Only the exchange on screen keeps its body rendered.
+        if self.exchange_view.is_some() {
+            self.exchange_body = bodies;
+        }
         // Shown from the next frame on; only the first failure is reported.
         if let Some(reason) = self.piece_images.take_failure() {
             self.show(Message::error(format!("pictures unavailable: {reason}")));
@@ -2449,6 +2502,9 @@ impl App {
         self.move_scroll = drawn.move_scroll;
         if self.exchange_view.is_some() {
             self.exchange_view = drawn.exchange_view;
+            if let Some(view) = self.exchange_view {
+                self.exchange_page = view.page;
+            }
         }
     }
 }
@@ -2587,7 +2643,7 @@ mod tests {
     use crate::engine::EngineConfig;
     use crate::engine::{MoveSource, analyse, recorded_exchange};
     use crate::tui::board::square_rect;
-    use crate::tui::debug::NO_LOG_PATH;
+    use crate::tui::debug::{LOG_BEHIND, LOG_QUEUE, NO_LOG_PATH};
     use crate::tui::graphics;
     use crate::tui::panels::HELP_LINES;
     use crate::tui::test_support::engine::{
@@ -5008,6 +5064,16 @@ mod tests {
             .collect()
     }
 
+    /// Which kept exchanges are marked held, oldest first.
+    fn held(h: &Harness) -> Vec<bool> {
+        h.app
+            .exchanges()
+            .expect("debug mode")
+            .iter()
+            .map(|record| record.held)
+            .collect()
+    }
+
     #[test]
     fn d_says_when_debug_mode_is_off() {
         let mut h = hvh();
@@ -5151,10 +5217,23 @@ mod tests {
         h.char(' ');
         h.reply_traced("e7e5");
         assert!(h.app.has_held_move());
-        assert!(kept(&h).is_empty(), "not decided yet");
+        assert_eq!(
+            kept(&h),
+            [("e5".to_string(), false)],
+            "kept when it arrives"
+        );
+        assert_eq!(held(&h), [true]);
+        h.char('d');
+        assert!(
+            h.screen().contains("held — not played yet"),
+            "{}",
+            h.screen()
+        );
+        h.press(KeyCode::Esc);
         h.char('u');
         assert_eq!(h.uci(), Vec::<String>::new());
         assert_eq!(kept(&h), [("e5".to_string(), true)], "undo dropped it");
+        assert_eq!(held(&h), [false]);
 
         let mut h = debug_app(
             FakeEngine::jev(),
@@ -5170,6 +5249,32 @@ mod tests {
         h.char(' ');
         assert_eq!(h.uci(), ["e2e4", "e7e5"]);
         assert_eq!(kept(&h), [("e5".to_string(), false)]);
+        assert_eq!(held(&h), [false], "played");
+    }
+
+    #[test]
+    fn quitting_while_an_answer_is_held_still_logs_it() {
+        let dir = TempDir::new("debug-app");
+        let path = dir.join("jev.jsonl");
+        let mut h = debug_app(FakeEngine::jev(), (80, 24), DebugLog::start(path.clone()));
+        h.char('5');
+        h.reply("e2e4");
+        h.at_ms(5_000);
+        h.tick();
+        h.char(' ');
+        h.reply_traced("e7e5");
+        assert!(h.app.has_held_move());
+        // What quitting does once the loop has ended.
+        h.app.close_debug_log(Duration::from_secs(10));
+        let text = fs::read_to_string(&path).expect("logged");
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 1, "{text}");
+        assert_eq!(lines[0]["played"], "e5");
+        assert_eq!(lines[0]["held"], true);
+        assert_eq!(lines[0]["stale"], false);
     }
 
     #[test]
@@ -5257,6 +5362,67 @@ mod tests {
             scroll(&h),
             Some(page - 2),
             "no older exchange: nothing moves"
+        );
+    }
+
+    #[test]
+    fn keys_after_switching_exchanges_scroll_in_the_same_batch() {
+        let mut h = debug_game();
+        h.moves(&["e4"]);
+        h.reply_traced("e7e5");
+        h.moves(&["d4"]);
+        h.reply_traced("d7d5");
+        h.char('d');
+        let page = h.app.exchange_view().expect("open").page;
+        assert!(page > 2, "{page}");
+        // Each batch is handled before the next draw, as the run loop does.
+        let batch = |h: &mut Harness, keys: &[KeyCode]| {
+            for &code in keys {
+                let _ = h.app.handle(key(code), h.now);
+            }
+            h.draw();
+            h.app.exchange_view().expect("open")
+        };
+        let view = batch(&mut h, &[KeyCode::Left, KeyCode::End]);
+        assert_eq!(view.shown, Some(1));
+        assert!(view.max_scroll > 0, "{view:?}");
+        assert_eq!(view.scroll, view.max_scroll, "End after ←");
+        let view = batch(&mut h, &[KeyCode::Right, KeyCode::PageDown, KeyCode::Down]);
+        assert_eq!(
+            (view.shown, view.scroll),
+            (Some(2), page),
+            "PgDn and ↓ after →"
+        );
+        // Opening the view keeps the page size too.
+        let view = batch(
+            &mut h,
+            &[KeyCode::Esc, KeyCode::Char('d'), KeyCode::PageDown],
+        );
+        assert_eq!(
+            (view.shown, view.scroll),
+            (Some(2), page - 1),
+            "PgDn after d"
+        );
+    }
+
+    #[test]
+    fn the_view_keeps_only_the_exchange_on_screen_rendered() {
+        let mut h = debug_game();
+        h.moves(&["e4"]);
+        h.reply_traced("e7e5");
+        assert_eq!(
+            h.app.exchange_body.holds(),
+            None,
+            "nothing shown, nothing rendered"
+        );
+        h.char('d');
+        let width = h.app.exchange_body.holds().expect("rendered").1;
+        assert_eq!(h.app.exchange_body.holds(), Some((1, width)));
+        h.press(KeyCode::Esc);
+        assert_eq!(
+            h.app.exchange_body.holds(),
+            None,
+            "dropped once the view closes"
         );
     }
 
@@ -5412,6 +5578,60 @@ mod tests {
         }
         assert_eq!(h.app.status_line(), "", "reported once");
         assert_eq!(h.app.exchanges().map(History::len), Some(2), "still kept");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_log_that_is_a_link_is_named_in_the_status() {
+        let dir = TempDir::new("debug-app");
+        let target = dir.join("target.jsonl");
+        fs::write(&target, "").unwrap();
+        let link = dir.join("jev.jsonl");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut h = debug_app(FakeEngine::jev(), (200, 40), DebugLog::start(link.clone()));
+        h.char('2');
+        h.moves(&["e4"]);
+        h.reply_traced("e7e5");
+        wait_for_status(&mut h, "debug log disabled: ");
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        assert_eq!(
+            h.app.status_line(),
+            format!(
+                "debug log disabled: {} is a link",
+                tilde_path(&link, home.as_deref())
+            )
+        );
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "",
+            "nothing written through it"
+        );
+    }
+
+    #[test]
+    fn a_log_that_cannot_keep_up_warns_once() {
+        // Nothing takes the records, as when the debug-log thread is stuck writing.
+        let (log, queued, _failures) = DebugLog::stalled(PathBuf::from("jev.jsonl"));
+        let mut h = debug_app(FakeEngine::jev(), (200, 40), log);
+        h.char('2');
+        let request = request(&h.command("e4"));
+        h.press(KeyCode::Esc);
+        // Late answers to the same request are stale, and each is logged.
+        for _ in 0..=LOG_QUEUE + 1 {
+            let computer = traced_jev_move(request.game.position(), "e7e5");
+            h.answer(&request, EngineOutcome::Move(computer));
+        }
+        assert_eq!(h.app.status_line(), LOG_BEHIND);
+        assert!(h.app.message().is_some_and(|m| m.is_error));
+        h.moves(&["Nf3"]);
+        let computer = traced_jev_move(request.game.position(), "e7e5");
+        h.answer(&request, EngineOutcome::Move(computer));
+        assert_eq!(h.app.status_line(), "", "one warning");
+        assert_eq!(
+            queued.try_iter().count(),
+            LOG_QUEUE,
+            "the rest were dropped"
+        );
     }
 
     #[test]

@@ -12,10 +12,7 @@ use std::io::{self, ErrorKind, Write as _};
 use std::path::{Path, PathBuf, is_separator};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::core::{Game, Outcome};
-
-/// The Seven Tag Roster, in the order the PGN standard (section 8.1.1) requires.
-const SEVEN_TAG_ROSTER: [&str; 7] = ["Event", "Site", "Date", "Round", "White", "Black", "Result"];
+use crate::core::Game;
 
 /// Longest movetext line: export format needs fewer than 80 characters (PGN standard 8.2.1).
 const PGN_MAX_LINE: usize = 79;
@@ -118,46 +115,147 @@ impl std::error::Error for SaveError {}
 /// Writes `contents` to `path` atomically.
 ///
 /// The data goes to a sibling temp file `.<name>.tmp-<pid>`, which is flushed to disk and then
-/// renamed over `path`, so readers see either the old file or the complete new one and a failed
-/// save never leaves a truncated file or a stray temp file behind. The temp file is created
+/// put in place, so readers see either the old file or the complete new one and a failed save
+/// never leaves a truncated file or a stray temp file behind. The temp file is created
 /// exclusively, so a symlink planted at its name is never followed. Parent folders are not
-/// created. Replacing a regular file keeps its permission bits; replacing a symlink replaces the
-/// link itself, not its target.
+/// created.
+///
+/// Without `overwrite`, the temp file is hard-linked into place, which fails if the name
+/// exists by then, so a file another program creates while the save runs is never replaced.
+/// Only where the file system has no hard links does the save fall back to checking the name
+/// once more and renaming. With `overwrite`, the temp file is renamed over the old file, which
+/// keeps its permission bits. A symlink at `path` stays: the save writes to the file it
+/// points to (following a chain of links, and creating the file a dangling link names).
 ///
 /// # Errors
 ///
 /// [`SaveError::Exists`] when `path` exists and `overwrite` is false (nothing is written), and
-/// [`SaveError::Io`] when `path` is a folder or any file operation fails.
+/// [`SaveError::Io`] when `path` is a folder (or a link to one) or any file operation fails.
 pub fn write_file(path: &Path, contents: &str, overwrite: bool) -> Result<(), SaveError> {
+    write_file_with(path, contents, overwrite, |tmp, path| {
+        fs::hard_link(tmp, path)
+    })
+}
+
+/// [`write_file`], with `link` doing what [`fs::hard_link`] does, so a test can stand in for
+/// another program or for a file system without hard links.
+fn write_file_with(
+    path: &Path,
+    contents: &str,
+    overwrite: bool,
+    link: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> Result<(), SaveError> {
     let fail = |reason: String| SaveError::Io {
         path: path.to_path_buf(),
         reason,
     };
-    let Some(name) = path.file_name() else {
+    let folder = || fail(describe(&ErrorKind::IsADirectory.into()));
+    if path.file_name().is_none() {
         return Err(fail("not a file name".to_string()));
-    };
-    let replacing = match fs::symlink_metadata(path) {
-        Ok(meta) if meta.is_dir() => return Err(fail(describe(&ErrorKind::IsADirectory.into()))),
+    }
+    // Where the data goes (the file a symlink points to), and what is there now.
+    let (target, replacing) = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => return Err(folder()),
         Ok(_) if !overwrite => return Err(SaveError::Exists),
-        Ok(meta) => Some(meta),
-        Err(err) if err.kind() == ErrorKind::NotFound => None,
+        Ok(meta) if meta.is_symlink() => {
+            let target = link_target(path).map_err(|err| fail(describe(&err)))?;
+            match fs::symlink_metadata(&target) {
+                Ok(meta) if meta.is_dir() => return Err(folder()),
+                Ok(meta) => (target, Some(meta)),
+                Err(err) if err.kind() == ErrorKind::NotFound => (target, None),
+                Err(err) => return Err(fail(describe(&err))),
+            }
+        }
+        Ok(meta) => (path.to_path_buf(), Some(meta)),
+        Err(err) if err.kind() == ErrorKind::NotFound => (path.to_path_buf(), None),
         Err(err) => return Err(fail(describe(&err))),
+    };
+    let Some(name) = target.file_name() else {
+        return Err(fail("not a file name".to_string()));
     };
 
     let mut tmp_name = OsString::from(".");
     tmp_name.push(name);
     tmp_name.push(format!(".tmp-{}", std::process::id()));
-    let tmp = path.with_file_name(tmp_name);
+    let tmp = target.with_file_name(tmp_name);
 
-    if let Err(err) =
-        write_temp(&tmp, contents, replacing.as_ref()).and_then(|()| fs::rename(&tmp, path))
-    {
+    let placed = write_temp(&tmp, contents, replacing.as_ref()).and_then(|()| {
+        if overwrite {
+            fs::rename(&tmp, &target)
+        } else {
+            place_new(&tmp, &target, link)
+        }
+    });
+    if let Err(err) = placed {
         // Best effort: the temp file may never have been created.
         let _ = fs::remove_file(&tmp);
-        return Err(fail(describe(&err)));
+        return Err(if err.kind() == ErrorKind::AlreadyExists {
+            SaveError::Exists
+        } else {
+            fail(describe(&err))
+        });
     }
-    sync_parent(path);
+    sync_parent(&target);
     Ok(())
+}
+
+/// Puts the finished `tmp` at `path`, which must not exist: `link` makes it a second name
+/// for `tmp` (failing with [`ErrorKind::AlreadyExists`] when the name is taken), then `tmp`
+/// goes. Where the file system has no hard links, `path` is checked once more and `tmp`
+/// renamed to it; a file created between the two is then replaced.
+fn place_new(
+    tmp: &Path,
+    path: &Path,
+    link: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    match link(tmp, path) {
+        Ok(()) => {
+            // Best effort: the file is saved; a temp file left behind is overwritten by the
+            // next save with this process id.
+            let _ = fs::remove_file(tmp);
+            Ok(())
+        }
+        // Linux reports a file system without hard links (FAT, some network file systems)
+        // as EPERM, which is PermissionDenied.
+        Err(err)
+            if matches!(
+                err.kind(),
+                ErrorKind::Unsupported | ErrorKind::PermissionDenied
+            ) =>
+        {
+            match fs::symlink_metadata(path) {
+                Ok(_) => Err(ErrorKind::AlreadyExists.into()),
+                Err(err) if err.kind() == ErrorKind::NotFound => fs::rename(tmp, path),
+                Err(err) => Err(err),
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Symlinks followed before [`link_target`] gives up (Linux's own limit).
+const MAX_LINKS: usize = 40;
+
+/// The file the symlink at `path` points to, following a chain of links: the first name
+/// that is not a symlink, which may not exist yet. A relative link is taken from the
+/// folder the link is in.
+fn link_target(path: &Path) -> io::Result<PathBuf> {
+    let mut path = path.to_path_buf();
+    for _ in 0..MAX_LINKS {
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_symlink() => {
+                let next = fs::read_link(&path)?;
+                path = match path.parent() {
+                    Some(folder) => folder.join(next),
+                    None => next,
+                };
+            }
+            Ok(_) => return Ok(path),
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(path),
+            Err(err) => return Err(err),
+        }
+    }
+    Err(io::Error::other("too many levels of symbolic links"))
 }
 
 /// Creates `tmp` exclusively and writes `contents` to it, flushed to disk.
@@ -273,57 +371,32 @@ fn pgn_date(unix_days: i64) -> String {
 
 /// The game as an export-format PGN file.
 ///
-/// Starts from [`Game::to_pgn`] and replaces its placeholder `Date`, `White` and `Black` tag
-/// values (blank values become the PGN unknowns `?` and `????.??.??`; `"` and `\` are escaped;
-/// control characters become spaces). The Seven Tag Roster comes first in its standard order,
-/// followed by any other tags `to_pgn` wrote (`SetUp`, `FEN`) in their original order. The
+/// Starts from [`Game::to_pgn`], which writes the Seven Tag Roster in its standard order and
+/// then any other tags (`SetUp`, `FEN`), and replaces its placeholder `Date`, `White` and
+/// `Black` values (blank values become the PGN unknowns `?` and `????.??.??`; `"` and `\`
+/// are escaped; control characters become spaces); every other tag is kept as written. The
 /// movetext is re-wrapped so no line reaches 80 characters, breaking only between tokens.
 #[must_use]
 pub fn pgn_export(game: &Game, white: &str, black: &str, date: &str) -> String {
     let pgn = game.to_pgn();
     let (headers, movetext) = pgn.split_once("\n\n").unwrap_or(("", pgn.as_str()));
-    let header_lines: Vec<&str> = headers
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .collect();
-    let roster_line = |name: &str| {
-        header_lines
-            .iter()
-            .copied()
-            .find(|line| tag_name(line) == Some(name))
-    };
-
     let mut out = String::with_capacity(pgn.len() + 64);
-    for name in SEVEN_TAG_ROSTER {
-        let value = match name {
-            "Date" => Some(tag_value(date, UNKNOWN_DATE)),
-            "White" => Some(tag_value(white, "?")),
-            "Black" => Some(tag_value(black, "?")),
+    for line in headers.lines().filter(|line| !line.trim().is_empty()) {
+        let filled = match tag_name(line) {
+            Some(name @ "Date") => Some((name, tag_value(date, UNKNOWN_DATE))),
+            Some(name @ "White") => Some((name, tag_value(white, "?"))),
+            Some(name @ "Black") => Some((name, tag_value(black, "?"))),
             _ => None,
         };
-        match (value, roster_line(name)) {
-            (Some(value), _) => {
+        match filled {
+            Some((name, value)) => {
                 let _ = writeln!(out, "[{name} \"{value}\"]");
             }
-            (None, Some(line)) => {
+            None => {
                 out.push_str(line);
                 out.push('\n');
             }
-            (None, None) => {
-                let value = match name {
-                    "Result" => game.outcome().map_or("*", Outcome::result),
-                    _ => "?",
-                };
-                let _ = writeln!(out, "[{name} \"{value}\"]");
-            }
         }
-    }
-    for line in header_lines
-        .iter()
-        .filter(|line| tag_name(line).is_none_or(|name| !SEVEN_TAG_ROSTER.contains(&name)))
-    {
-        out.push_str(line);
-        out.push('\n');
     }
     out.push('\n');
     out.push_str(&wrap_tokens(movetext, PGN_MAX_LINE));
@@ -545,6 +618,191 @@ mod tests {
     }
 
     #[test]
+    fn a_file_created_while_saving_is_never_replaced() {
+        let dir = TempDir::new("race");
+        let target = dir.join("game.pgn");
+        // Another program creates the file after the check, just before the save links
+        // its temp file into place.
+        let result = write_file_with(&target, "ours\n", false, |tmp, path| {
+            fs::write(path, "theirs\n")?;
+            fs::hard_link(tmp, path)
+        });
+        assert_eq!(result, Err(SaveError::Exists));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "theirs\n");
+        assert_eq!(dir.entries(), ["game.pgn"], "no temp file is left behind");
+    }
+
+    #[test]
+    fn without_hard_links_a_new_file_is_renamed_into_place() {
+        let dir = TempDir::new("no-links");
+        let target = dir.join("game.pgn");
+        let unsupported = |_: &Path, _: &Path| Err(io::Error::from(ErrorKind::Unsupported));
+        assert_eq!(
+            write_file_with(&target, "one\n", false, unsupported),
+            Ok(())
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "one\n");
+        assert_eq!(dir.entries(), ["game.pgn"]);
+        // The check before the rename still refuses an existing file.
+        assert_eq!(
+            write_file_with(&target, "two\n", false, unsupported),
+            Err(SaveError::Exists)
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "one\n");
+        assert_eq!(dir.entries(), ["game.pgn"]);
+    }
+
+    #[test]
+    fn a_failed_link_is_reported_and_cleaned_up() {
+        let dir = TempDir::new("link-fails");
+        let target = dir.join("game.pgn");
+        let full = |_: &Path, _: &Path| Err(io::Error::from(ErrorKind::StorageFull));
+        assert_eq!(
+            write_file_with(&target, "x", false, full),
+            Err(SaveError::Io {
+                path: target.clone(),
+                reason: "disk is full".to_string(),
+            })
+        );
+        assert!(dir.entries().is_empty(), "{:?}", dir.entries());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_over_a_symlink_writes_to_its_target() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = TempDir::new("symlink");
+        let games = dir.join("games");
+        fs::create_dir(&games).unwrap();
+        let target = games.join("real.pgn");
+        fs::write(&target, "old\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+        // A relative link, and a link to that link.
+        let link = dir.join("game.pgn");
+        symlink("games/real.pgn", &link).unwrap();
+        let outer = dir.join("latest.pgn");
+        symlink("game.pgn", &outer).unwrap();
+
+        assert_eq!(write_file(&link, "new\n", false), Err(SaveError::Exists));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "old\n");
+
+        assert_eq!(write_file(&link, "new\n", true), Ok(()));
+        assert!(
+            fs::symlink_metadata(&link).unwrap().is_symlink(),
+            "still a link"
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new\n");
+        let mode = fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o640, "the target keeps its mode");
+
+        assert_eq!(write_file(&outer, "newer\n", true), Ok(()));
+        assert!(fs::symlink_metadata(&outer).unwrap().is_symlink());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "newer\n");
+        assert_eq!(dir.entries(), ["game.pgn", "games", "latest.pgn"]);
+        let in_games: Vec<_> = fs::read_dir(&games).unwrap().collect();
+        assert_eq!(in_games.len(), 1, "no temp file is left beside the target");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_over_a_dangling_symlink_creates_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new("dangling");
+        let link = dir.join("game.pgn");
+        symlink(dir.join("made.pgn"), &link).unwrap();
+        assert_eq!(write_file(&link, "x\n", false), Err(SaveError::Exists));
+        assert_eq!(write_file(&link, "x\n", true), Ok(()));
+        assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(fs::read_to_string(dir.join("made.pgn")).unwrap(), "x\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_over_a_symlink_to_a_folder_is_an_io_error() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new("link-to-folder");
+        fs::create_dir(dir.join("sub")).unwrap();
+        let link = dir.join("game.pgn");
+        symlink("sub", &link).unwrap();
+        assert_eq!(
+            write_file(&link, "x", true),
+            Err(SaveError::Io {
+                path: link.clone(),
+                reason: "it is a folder".to_string(),
+            })
+        );
+        assert!(fs::read_dir(dir.join("sub")).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn describe_names_each_common_failure() {
+        let described = |kind: ErrorKind| describe(&io::Error::from(kind));
+        assert_eq!(described(ErrorKind::NotFound), "folder does not exist");
+        assert_eq!(described(ErrorKind::PermissionDenied), "permission denied");
+        assert_eq!(described(ErrorKind::IsADirectory), "it is a folder");
+        assert_eq!(
+            described(ErrorKind::NotADirectory),
+            "part of the path is not a folder"
+        );
+        assert_eq!(
+            described(ErrorKind::ReadOnlyFilesystem),
+            "read-only file system"
+        );
+        assert_eq!(described(ErrorKind::StorageFull), "disk is full");
+        // Anything else keeps the system's own words.
+        let other = io::Error::other("quota exceeded on /home");
+        assert_eq!(describe(&other), "quota exceeded on /home");
+    }
+
+    #[test]
+    fn a_file_in_the_way_of_a_folder_is_reported() {
+        let dir = TempDir::new("not-a-folder");
+        fs::write(dir.join("notes"), "a file").unwrap();
+        let target = dir.join("notes").join("game.pgn");
+        assert_eq!(
+            write_file(&target, "x", false),
+            Err(SaveError::Io {
+                path: target.clone(),
+                reason: "part of the path is not a folder".to_string(),
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_without_write_permission_is_reported() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new("read-only");
+        let folder = dir.join("locked");
+        fs::create_dir(&folder).unwrap();
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o500)).unwrap();
+        // Root may write anyway: then no save can be refused here, and the test says it
+        // was skipped rather than passing without checking anything.
+        if fs::write(folder.join("probe"), "").is_ok() {
+            fs::set_permissions(&folder, fs::Permissions::from_mode(0o700)).unwrap();
+            eprintln!(
+                "skipped a_folder_without_write_permission_is_reported: a folder without \
+                 write permission is still writable here (running as root?)"
+            );
+            return;
+        }
+        let target = folder.join("game.pgn");
+        let result = write_file(&target, "x", false);
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            result,
+            Err(SaveError::Io {
+                path: target,
+                reason: "permission denied".to_string(),
+            })
+        );
+    }
+
+    #[test]
     fn save_error_display() {
         assert_eq!(SaveError::Exists.to_string(), "file already exists");
         let denied = SaveError::Io {
@@ -711,6 +969,27 @@ mod tests {
         );
         assert!(headers.contains(&format!("[FEN \"{fen}\"]")), "{headers}");
         assert_eq!(movetext, "12... Kd7 13. e4 *\n");
+    }
+
+    #[test]
+    fn pgn_export_keeps_the_tags_to_pgn_writes_and_only_fills_in_three() {
+        let game = game_from(START_FEN, &["e2e4"]);
+        let exported = pgn_export(&game, "You", "Jev", "2026.09.27");
+        let original = game.to_pgn();
+        let lines = |pgn: &str| -> Vec<String> {
+            let (headers, _) = pgn.split_once("\n\n").unwrap();
+            headers.lines().map(str::to_string).collect()
+        };
+        let (exported, original) = (lines(&exported), lines(&original));
+        assert_eq!(exported.len(), original.len());
+        for (new, old) in exported.iter().zip(&original) {
+            match tag_name(old) {
+                Some("Date") => assert_eq!(new, "[Date \"2026.09.27\"]"),
+                Some("White") => assert_eq!(new, "[White \"You\"]"),
+                Some("Black") => assert_eq!(new, "[Black \"Jev\"]"),
+                _ => assert_eq!(new, old),
+            }
+        }
     }
 
     /// A deterministic pseudo-random game of `plies` legal moves that is still in progress.

@@ -14,8 +14,8 @@
 //! position, and a panic in it must not reach the UI.
 //!
 //! In debug mode the engine records its exchange with Jev in the move; the thread
-//! moves it into the reply as a [`debug::Exchange`](super::debug::Exchange), whose
-//! text for the exchange view is rendered there too, off the UI thread.
+//! moves it into the reply as a [`debug::Exchange`](super::debug::Exchange). Its text
+//! is rendered on the UI thread, and only while the exchange view shows it.
 
 use std::any::Any;
 use std::io;
@@ -344,7 +344,10 @@ mod tests {
         assert_eq!((exchange.ply, exchange.fullmove), (1, 1));
         assert_eq!(exchange.san, "e5");
         assert_eq!(exchange.source, "Jev");
-        assert!(!exchange.body().is_empty(), "rendered on the engine thread");
+        assert!(
+            !exchange.body().is_empty(),
+            "its body renders when it is shown"
+        );
     }
 
     #[test]

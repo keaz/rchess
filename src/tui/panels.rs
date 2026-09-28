@@ -26,8 +26,9 @@
 //!
 //! The exchange view takes the whole screen instead of the playing screen (nothing of the
 //! board is drawn under it, so no piece picture is lost under it), with dialogs still on
-//! top. Its body text comes ready-made with the exchange ([`Exchange::body`]); a frame only
-//! wraps the rows it shows.
+//! top. Its body text is rendered and cut into rows for the exchange on screen only, and
+//! kept for the next frame until the exchange or the width changes ([`BodyCache`]); a
+//! frame only builds the rows it shows.
 //!
 //! The snapshot tests at the bottom of this file render every screen; their files in
 //! `src/tui/snapshots/` (`chess__tui__panels__tests__*.snap`) show the exact output at
@@ -54,7 +55,7 @@ use super::app::{
     is_too_small, move_rows, outcome_text,
 };
 use super::board::{BoardGeometry, BoardView, CellSize, PieceImages, layout_board};
-use super::debug::{Exchange, ExchangeView, LineKind, NO_EXCHANGES, Record};
+use super::debug::{BodyCache, BodyRows, ExchangeView, LineKind, NO_EXCHANGES, Record};
 use super::glyphs::{self, ELLIPSIS, GlyphSet, Palette, char_width};
 use super::input::LineEditor;
 use crate::core::{Color as Side, Game, Piece, PieceKind, Position as ChessPosition};
@@ -131,9 +132,16 @@ pub struct Drawn {
 }
 
 /// Draws `app` into `frame` and returns the click targets and the clamped move-list
-/// scroll. `images` keeps the board's piece pictures between frames (the Image style).
-/// `now` is used for the thinking spinner only.
-pub fn draw(app: &App, images: &mut PieceImages, frame: &mut Frame, now: Instant) -> Drawn {
+/// scroll. `images` keeps the board's piece pictures between frames (the Image style),
+/// and `bodies` the exchange view's body text for the exchange on screen. `now` is used
+/// for the thinking spinner only.
+pub fn draw(
+    app: &App,
+    images: &mut PieceImages,
+    bodies: &mut BodyCache,
+    frame: &mut Frame,
+    now: Instant,
+) -> Drawn {
     let mut drawn = Drawn {
         hits: HitMap::default(),
         move_scroll: app.move_scroll(),
@@ -146,7 +154,9 @@ pub fn draw(app: &App, images: &mut PieceImages, frame: &mut Frame, now: Instant
     }
     let overlays = overlays(app, area);
     match (app.exchange_view(), app.screen()) {
-        (Some(view), _) => drawn.exchange_view = Some(exchange_screen(frame, area, app, view)),
+        (Some(view), _) => {
+            drawn.exchange_view = Some(exchange_screen(frame, area, app, view, bodies));
+        }
         (None, Screen::Menu) => menu(frame, area, app, &mut drawn.hits),
         (None, Screen::Playing) => {
             playing(frame, area, app, images, &overlays, now, &mut drawn);
@@ -1113,8 +1123,15 @@ fn piece_span(piece: Piece, glyph_set: GlyphSet, palette: &Palette) -> Span<'sta
 /// The Jev exchange view on the whole of `area` (spec 9.4): the exchange `view` shows,
 /// with a header saying which one it is and how it went, then its body, wrapped and
 /// scrolled; or [`NO_EXCHANGES`]. Returns `view` with its scroll clamped and its page size
-/// and scroll limit for this size.
-fn exchange_screen(frame: &mut Frame, area: Rect, app: &App, view: ExchangeView) -> ExchangeView {
+/// and scroll limit for this size. `bodies` keeps the body text rendered and cut into rows
+/// for the next frame.
+fn exchange_screen(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    view: ExchangeView,
+    bodies: &mut BodyCache,
+) -> ExchangeView {
     let block = Block::bordered()
         .title(Line::from(" Jev exchange ").bold())
         .title_bottom(Line::from(EXCHANGE_KEYS).dim())
@@ -1148,10 +1165,10 @@ fn exchange_screen(frame: &mut Frame, area: Rect, app: &App, view: ExchangeView)
         height: inner.height - body_top,
         ..inner
     };
-    let exchange = &record.exchange;
     let width = usize::from(body_area.width.max(1));
     let page = usize::from(body_area.height);
-    let total: usize = exchange.body().iter().map(|line| line.rows(width)).sum();
+    let body = bodies.rows(record, width);
+    let total = body.len();
     let max_scroll = total.saturating_sub(page);
     let scroll = view.scroll.min(max_scroll);
     let block = if total > page {
@@ -1168,10 +1185,7 @@ fn exchange_screen(frame: &mut Frame, area: Rect, app: &App, view: ExchangeView)
             ..inner
         },
     );
-    frame.render_widget(
-        Paragraph::new(body_rows(exchange, width, scroll, page)),
-        body_area,
-    );
+    frame.render_widget(Paragraph::new(body_rows(&body, scroll, page)), body_area);
     ExchangeView {
         scroll,
         page,
@@ -1182,7 +1196,8 @@ fn exchange_screen(frame: &mut Frame, area: Rect, app: &App, view: ExchangeView)
 
 /// The exchange view's header for `record`, the `index`th of `count` (from 0), as items
 /// for [`pack`]: `exchange N of M`, `move <fullmove>`, the move, how it was chosen, the
-/// last status, the attempts and the latency, and `stale — not played` when it was not.
+/// last status, the attempts and the latency, and `stale — not played` when it was not
+/// (`held — not played yet` while Jev vs Jev is paused with it).
 fn exchange_header(record: &Record, index: usize, count: usize) -> Vec<Vec<Span<'static>>> {
     let exchange = &record.exchange;
     let attempts = match exchange.attempts() {
@@ -1200,41 +1215,26 @@ fn exchange_header(record: &Record, index: usize, count: usize) -> Vec<Vec<Span<
     ];
     if record.stale {
         items.push(vec![Span::raw("stale — not played").yellow()]);
+    } else if record.held {
+        items.push(vec![Span::raw("held — not played yet").yellow()]);
     }
     items
 }
 
-/// The rows of `exchange`'s body wrapped at `width` cells, from row `scroll`, at most
-/// `page` of them. Only the lines on screen are wrapped.
-fn body_rows(exchange: &Exchange, width: usize, scroll: usize, page: usize) -> Vec<Line<'static>> {
-    let mut rows = Vec::new();
-    let mut top = 0;
-    for line in exchange.body() {
-        if rows.len() == page {
-            break;
-        }
-        let height = line.rows(width);
-        if top + height <= scroll {
-            top += height;
-            continue;
-        }
-        let style = match line.kind {
-            LineKind::Heading => Style::new().bold(),
-            LineKind::Error => Style::new().red(),
-            LineKind::Text => Style::new(),
-        };
-        let skip = scroll.saturating_sub(top);
-        let room = page - rows.len();
-        rows.extend(
-            line.wrapped(width)
-                .into_iter()
-                .skip(skip)
-                .take(room)
-                .map(|row| Line::styled(row, style)),
-        );
-        top += height;
-    }
-    rows
+/// The rows of an exchange's `body` from row `scroll`, at most `page` of them.
+fn body_rows(body: &BodyRows, scroll: usize, page: usize) -> Vec<Line<'static>> {
+    let end = scroll.saturating_add(page).min(body.len());
+    (scroll.min(end)..end)
+        .filter_map(|index| body.get(index))
+        .map(|(kind, text)| {
+            let style = match kind {
+                LineKind::Heading => Style::new().bold(),
+                LineKind::Error => Style::new().red(),
+                LineKind::Text => Style::new(),
+            };
+            Line::styled(text.to_string(), style)
+        })
+        .collect()
 }
 
 // ----- overlays -----
@@ -1741,7 +1741,7 @@ mod tests {
     use super::*;
     use crate::core::{START_FEN, Square};
     use crate::tui::board::{image_area, square_at, square_rect};
-    use crate::tui::debug::{DebugLog, NO_LOG_PATH};
+    use crate::tui::debug::{BodyCache, DebugLog, NO_LOG_PATH};
     use crate::tui::event::AppEvent;
     use crate::tui::glyphs::{ImageSupport, initial_glyphs};
     use crate::tui::graphics::picker_for;
@@ -3071,13 +3071,20 @@ mod tests {
             .exchanges()
             .and_then(|history| history.last())
             .unwrap();
-        let exchange = &record.exchange;
-        let all = body_rows(exchange, 20, 0, usize::MAX);
-        let total: usize = exchange.body().iter().map(|line| line.rows(20)).sum();
+        let mut cache = BodyCache::default();
+        let body = cache.rows(record, 20);
+        let all = body_rows(&body, 0, usize::MAX);
+        let total: usize = record
+            .exchange
+            .body()
+            .iter()
+            .map(|line| line.wrapped(20).len())
+            .sum();
         assert_eq!(all.len(), total);
+        assert_eq!(body.len(), total);
         assert!(all.iter().all(|row| row.width() <= 20));
         for (scroll, page) in [(0, 5), (7, 10), (total - 3, 10), (total, 4)] {
-            let rows = body_rows(exchange, 20, scroll, page);
+            let rows = body_rows(&body, scroll, page);
             let expected: Vec<Line> = all.iter().skip(scroll).take(page).cloned().collect();
             assert_eq!(rows, expected, "scroll {scroll}, page {page}");
         }
