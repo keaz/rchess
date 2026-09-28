@@ -6,8 +6,8 @@ Read this first. Follow the protocol in section 8 of
 ## Current
 Sub-project: cleanup | Plan: docs/superpowers/plans/2026-09-28-cleanup.md
 Branch: chore/cleanup
-Last completed task: cleanup task 2 (Engine fixes: king recaptures, record-only redaction, sanitised text)
-Next task: cleanup task 3 (terminal and graphics fixes)
+Last completed task: cleanup task 3 (Terminal and graphics fixes)
+Next task: cleanup task 4 (input, board and panels)
 State: green
 
 ## Verify before continuing
@@ -208,6 +208,7 @@ Copied from the git-ignored SDD ledger (.superpowers/sdd/2026-09-27-tui-polish/p
 - None.
 
 ## Log (newest first)
+- 2026-09-28 cleanup task 3 done: Terminal and graphics fixes
 - 2026-09-28 cleanup task 2 done: Engine fixes: king recaptures, record-only redaction, sanitised text
 - 2026-09-28 cleanup task 1 done: Remove the legacy code and dependencies
 - 2026-09-28 cleanup plan written: 7 tasks as git patches from a prototype reviewed for correctness and plan readiness, history rebuilt so each task's tests fail first; spec section 10 amended with the review rulings

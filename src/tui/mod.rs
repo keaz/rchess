@@ -223,6 +223,8 @@ fn play(
     // long.
     let mut screen = ManuallyDrop::new(screen);
     let _guard = terminal::Guard;
+    // A terminal that closes without sending SIGHUP still ends the program by it.
+    terminal::watch_hangup()?;
     // A terminal that does not know a probe may have printed it, and the first draw
     // writes only the cells that are not blank. (`Terminal::clear` would also ask
     // for the cursor position, another answer to wait for.)
@@ -235,9 +237,13 @@ fn play(
         quit,
         |app| {
             // Kitty keeps pictures after the program ends unless they are deleted: the
-            // board builds each with an id from `terminal::next_kitty_id`, which
-            // `terminal::leave` deletes.
+            // board builds each with an id from `terminal::next_kitty_id`. Those dropped
+            // by a font change (between frames) are deleted before the next frame, those
+            // dropped by a new square size (found while drawing) right after it;
+            // `terminal::leave` deletes the rest.
+            terminal::delete_dropped_kitty_pictures(&mut io::stdout())?;
             screen.draw(|frame| app.render(frame, Instant::now()))?;
+            terminal::delete_dropped_kitty_pictures(&mut io::stdout())?;
             Ok(())
         },
         |replies| {

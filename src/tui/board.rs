@@ -232,17 +232,41 @@ const MAX_PICTURE_PX: u32 = 4096;
 /// [`composite`](super::pieces::composite), one per [`ImageKey`], so a picture is
 /// scaled and encoded once and a piece that moves to a square of the same colour
 /// reuses it. A picture the picker could not encode is kept as `None`, and its
-/// square shows the glyph.
+/// square shows the glyph; the first such failure is kept for the App to report
+/// ([`PieceImages::take_failure`]).
 ///
 /// Every picture on a board has the same image area size. When a frame needs
 /// another size, or the picker another font or protocol, the pictures are dropped
 /// first (the squares or the font changed), so the cache holds at most one entry
-/// per piece and square colour in use.
-#[derive(Default)]
+/// per piece and square colour in use. Dropped Kitty pictures are handed to
+/// [`terminal::drop_kitty_pictures`], so the terminal deletes them before the next
+/// draw.
 pub struct PieceImages {
     cache: ImageCache<Option<Protocol>>,
     /// What the pictures in `cache` were made for.
     made_for: Option<PictureFormat>,
+    /// Makes a picture: [`encode`] outside tests.
+    encode: Encoder,
+    /// Why a picture could not be made, until [`PieceImages::take_failure`] takes it.
+    failure: Option<String>,
+    /// A failure was kept once already: later ones are not reported again.
+    failed: bool,
+}
+
+/// Makes the picture of a composite that is exactly the pixel size of the cells it
+/// fills, with a picker; the error says why it could not.
+type Encoder = fn(&Picker, DynamicImage, Size) -> Result<Protocol, String>;
+
+impl Default for PieceImages {
+    fn default() -> PieceImages {
+        PieceImages {
+            cache: ImageCache::default(),
+            made_for: None,
+            encode,
+            failure: None,
+            failed: false,
+        }
+    }
 }
 
 /// Everything a board's pictures share, besides the piece and the colour.
@@ -271,10 +295,32 @@ impl PieceImages {
         self.cache.is_empty()
     }
 
+    /// Pictures made with `encode` instead of the picker's own encoder, so tests can
+    /// make encoding fail.
+    #[cfg(test)]
+    pub(crate) fn with_encoder(encode: Encoder) -> PieceImages {
+        PieceImages {
+            encode,
+            ..PieceImages::default()
+        }
+    }
+
     /// Drops every picture, as when the font changed.
     pub fn clear(&mut self) {
+        if self
+            .made_for
+            .is_some_and(|format| format.protocol == ProtocolType::Kitty)
+        {
+            terminal::drop_kitty_pictures();
+        }
         self.cache.clear();
         self.made_for = None;
+    }
+
+    /// Why a picture could not be made, the first time one could not (later failures
+    /// are not reported again); `None` otherwise, or once taken.
+    pub fn take_failure(&mut self) -> Option<String> {
+        self.failure.take()
     }
 
     /// The picture of `piece` on `background` (RGB) for an image area of `cells`,
@@ -294,7 +340,7 @@ impl PieceImages {
             protocol: picker.protocol_type(),
         };
         if self.made_for != Some(format) {
-            self.cache.clear();
+            self.clear();
             self.made_for = Some(format);
         }
         // The composite is exactly the area's size in pixels, so the picker encodes it
@@ -308,16 +354,34 @@ impl PieceImages {
         if key.width_px > MAX_PICTURE_PX || key.height_px > MAX_PICTURE_PX {
             return None;
         }
+        let (encode, failure, failed) = (self.encode, &mut self.failure, &mut self.failed);
         self.cache
             .get_or_insert_with(key, |key| {
                 let image = DynamicImage::ImageRgba8(key.composite());
-                if picker.protocol_type() == ProtocolType::Kitty {
-                    kitty_picture(image, cells, picker.tmux_detected())
-                } else {
-                    picker.new_protocol(image, cells, Resize::Fit(None)).ok()
+                match encode(picker, image, cells) {
+                    Ok(picture) => Some(picture),
+                    Err(reason) => {
+                        if !*failed {
+                            *failed = true;
+                            *failure = Some(reason);
+                        }
+                        None
+                    }
                 }
             })
             .as_ref()
+    }
+}
+
+/// The picture of `image` for `cells`, as `picker` draws it: a Kitty picture with an id
+/// of ours ([`kitty_picture`]), else the picker's own.
+fn encode(picker: &Picker, image: DynamicImage, cells: Size) -> Result<Protocol, String> {
+    if picker.protocol_type() == ProtocolType::Kitty {
+        kitty_picture(image, cells, picker.tmux_detected())
+    } else {
+        picker
+            .new_protocol(image, cells, Resize::Fit(None))
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -327,11 +391,11 @@ impl PieceImages {
 /// Kitty pictures are virtual placements, which the terminal deletes only by id, so
 /// the restore must know every id sent. The transmission is not compressed, as the
 /// graphics query never asks whether the terminal can inflate it.
-fn kitty_picture(image: DynamicImage, cells: Size, tmux: bool) -> Option<Protocol> {
+fn kitty_picture(image: DynamicImage, cells: Size, tmux: bool) -> Result<Protocol, String> {
     let id = terminal::next_kitty_id(tmux);
     Kitty::new(image, cells, id, tmux, false)
-        .ok()
         .map(Protocol::Kitty)
+        .map_err(|error| error.to_string())
 }
 
 impl fmt::Debug for PieceImages {

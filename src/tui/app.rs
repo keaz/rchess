@@ -2415,6 +2415,10 @@ impl App {
         let mut images = std::mem::take(&mut self.piece_images);
         let drawn = panels::draw(self, &mut images, frame, now);
         self.piece_images = images;
+        // Shown from the next frame on; only the first failure is reported.
+        if let Some(reason) = self.piece_images.take_failure() {
+            self.show(Message::error(format!("pictures unavailable: {reason}")));
+        }
         self.hits = drawn.hits;
         self.move_scroll = drawn.move_scroll;
         if self.exchange_view.is_some() {
@@ -3607,6 +3611,36 @@ mod tests {
         h.draw();
         assert_eq!(h.app.piece_images().len(), 21);
         assert!(!e1(&h).contains(king));
+    }
+
+    #[test]
+    fn a_picture_that_cannot_be_encoded_shows_the_glyph_and_one_warning() {
+        let mut h = picture_app(ProtocolType::Sixel, CellSize::DEFAULT);
+        h.app.piece_images = PieceImages::with_encoder(|_, _, _| Err("no encoder".to_string()));
+        while h.app.glyphs() != GlyphSet::Image {
+            h.char('g');
+        }
+        h.draw();
+        let king = glyphs::glyph(GlyphSet::Solid, Piece::new(Side::White, PieceKind::King));
+        let screen = h.screen();
+        assert!(
+            screen.contains("pictures unavailable: no encoder"),
+            "the status says why: {screen}"
+        );
+        assert!(screen.contains(king), "the pieces show the Solid glyph");
+
+        // One warning: once another message replaced it, it does not come back.
+        h.char('g');
+        while h.app.glyphs() != GlyphSet::Image {
+            h.char('g');
+        }
+        h.draw();
+        h.draw();
+        assert_eq!(
+            h.app.message().map(|message| message.text.as_str()),
+            Some("glyphs: image")
+        );
+        assert!(h.screen().contains(king));
     }
 
     #[test]
