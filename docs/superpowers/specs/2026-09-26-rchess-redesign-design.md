@@ -846,8 +846,8 @@ except where this section changes them.
   Esc moved focus into a text field.
 - "Game in progress" (for the `q`, `n` and `m` confirmations) means at least one move played and
   the game not over, for all three.
-- Events in one batch after an event that changes the screen or layout are handled after a redraw,
-  so mouse hits use the new layout.
+- Mouse and key events in one batch after an event that changes the screen or layout are handled
+  after a redraw, so they see the new layout and screen state.
 - Menu warnings that do not fit end with "+N more warnings".
 - `--version`/`-V` print `chess <version>` and exit; `--help` into a closed pipe exits 0 quietly.
 - `g` on a board whose squares are too small for pictures says "glyphs: image (squares too small
@@ -870,7 +870,8 @@ except where this section changes them.
   PgDn and ↓ in the same input batch work.
 - Environment: non-UTF-8 values of `RCHESS_GLYPHS`, `RCHESS_DEBUG_LOG`, `XDG_STATE_HOME` and `HOME`
   give a menu warning; a relative `HOME` or `XDG_STATE_HOME` is ignored for the log path;
-  `RCHESS_IMAGES` treats `off`, `0`, `false` and `no` (any case) as off and warns on other values.
+  `RCHESS_IMAGES` treats `off`, `0`, `false` and `no` (any case) as off, `on`, `1`, `true` and `yes`
+  as on, and warns on other values.
 
 ### 10.6 Tests and documentation
 
