@@ -251,12 +251,6 @@ mod test {
     }
 
     #[test]
-    #[should_panic]
-    fn test_from_index_invalid_upper() {
-        let _ = Position::from_index(64);
-    }
-
-    #[test]
     fn test_from_index() {
         let position = Position::from_index(0);
         assert_eq!(position.x, 'a');

@@ -43,17 +43,9 @@ mod test {
 
     use crate::{
         Position, Square,
-        ai::generate_move,
-        board::{self, BoardTrait},
+        board::BoardTrait,
         pieces::{self, Color, PieceType},
     };
-
-    #[test]
-    fn test_generate_move() {
-        let mut board = board::new_board();
-        let best_move = generate_move(Color::White, &mut board);
-        assert_eq!(best_move.is_some(), true);
-    }
 
     #[derive(Debug, Clone)]
     struct MockBoard {

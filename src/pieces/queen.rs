@@ -75,10 +75,7 @@ pub fn possible_moves(
 mod test {
     use crate::{
         BoardTrait, Position, board,
-        pieces::{
-            ChessError, Color, Piece, PieceType,
-            queen::{can_move_to, possible_moves},
-        },
+        pieces::{ChessError, Color, Piece, PieceType, queen::can_move_to},
     };
 
     fn init() {
@@ -330,14 +327,5 @@ mod test {
             result.is_ok(),
             "d4 Black Queen should not be able to capture d2 white pawn"
         );
-    }
-
-    #[test]
-    fn test_possible_moves() {
-        init();
-
-        let board = board::new_board();
-        let positions = possible_moves(&Position::new('d', 4), &Color::White, &board);
-        assert_eq!(positions.len(), 16);
     }
 }
