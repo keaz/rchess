@@ -54,6 +54,14 @@ const TICK: Duration = Duration::from_millis(50);
 /// arrives, and the process should then end by that signal rather than by the error.
 const SIGNAL_GRACE: Duration = Duration::from_millis(100);
 
+/// The number of SIGHUP, with which a UI that failed on a closed terminal ends.
+#[cfg(unix)]
+const HANGUP: i32 = signal_hook::consts::SIGHUP;
+/// SIGHUP's number on POSIX systems; unused in practice here, as stdin never looks
+/// closed ([`terminal::stdin_looks_closed`]).
+#[cfg(not(unix))]
+const HANGUP: i32 = 1;
+
 /// How long quitting waits for the debug log to write the exchanges still queued.
 const LOG_GRACE: Duration = Duration::from_millis(500);
 
@@ -128,7 +136,9 @@ fn print_quietly(out: &mut impl Write, text: &str) -> io::Result<()> {
 /// a panic on the thread named "main"). The terminal is restored on every exit:
 /// normal return, error return, panic, or signal. After a signal it does not
 /// return: once the terminal is restored, the process ends by that signal
-/// ([`terminal::exit_by_signal`]), so the shell sees it was interrupted.
+/// ([`terminal::exit_by_signal`]), so the shell sees it was interrupted. An error on a
+/// terminal that closed without sending SIGHUP (stdin looks closed) ends the same way,
+/// by SIGHUP.
 ///
 /// # Errors
 ///
@@ -167,7 +177,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> io::Result<()> {
         build_app(options, engine, graphics, env)
     });
     let signal = if result.is_err() {
-        signal_after(&quit, SIGNAL_GRACE)
+        signal_after_error(&quit, SIGNAL_GRACE, terminal::stdin_looks_closed)
     } else {
         quit.load(Ordering::SeqCst)
     };
@@ -328,6 +338,23 @@ fn signal_after(quit: &AtomicI32, grace: Duration) -> i32 {
             return signal;
         }
         thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// The signal a UI that failed should end by: the quit signal that arrives within
+/// `grace` ([`signal_after`]), else SIGHUP when stdin is closed (`stdin_closed`, asked
+/// only then), else 0 (return the error). A terminal can close without its SIGHUP
+/// reaching the program; the "hangup" thread would raise one within its next look at
+/// stdin, which can come just after `grace`, so a failure on a closed terminal is taken
+/// as that hangup here rather than ending with status 1.
+fn signal_after_error(
+    quit: &AtomicI32,
+    grace: Duration,
+    stdin_closed: impl FnOnce() -> bool,
+) -> i32 {
+    match signal_after(quit, grace) {
+        0 if stdin_closed() => HANGUP,
+        signal => signal,
     }
 }
 
@@ -591,6 +618,7 @@ fn request_engine_with(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::VecDeque;
     use std::convert::Infallible;
 
@@ -1601,6 +1629,34 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "no wait once set"
+        );
+    }
+
+    #[test]
+    fn an_error_exit_with_stdin_closed_ends_as_a_hangup() {
+        // A terminal closed without SIGHUP: the write fails, no signal comes, and
+        // stdin is closed, so the program ends by SIGHUP rather than with status 1.
+        let looked = Cell::new(0);
+        let closed = || {
+            looked.set(looked.get() + 1);
+            true
+        };
+        let quit = AtomicI32::new(0);
+        assert_eq!(
+            signal_after_error(&quit, Duration::from_millis(10), closed),
+            HANGUP
+        );
+        assert_eq!(looked.get(), 1);
+        // With stdin open the error is returned as it is.
+        assert_eq!(
+            signal_after_error(&quit, Duration::from_millis(10), || false),
+            0
+        );
+        // A signal that arrived is kept, and stdin is not looked at.
+        let quit = AtomicI32::new(SIGNAL);
+        assert_eq!(
+            signal_after_error(&quit, Duration::from_secs(10), || panic!("not asked")),
+            SIGNAL
         );
     }
 

@@ -58,6 +58,7 @@ const DONE: u8 = 0;
 const LEAVE_WAIT: Duration = Duration::from_secs(1);
 
 /// How often the "hangup" thread looks at stdin ([`watch_hangup`]).
+#[cfg(unix)]
 const HANGUP_LOOK: Duration = Duration::from_millis(100);
 
 /// How many looks in a row must find stdin at end of file before it counts as closed:
@@ -615,6 +616,21 @@ pub fn watch_hangup() -> io::Result<()> {
         })
         .map(drop)?;
     Ok(())
+}
+
+/// Whether stdin, looked at once, is closed: hung up, failing or at end of file. Ask it
+/// only once nothing reads stdin any more (the UI loop has ended): then end of file
+/// cannot be bytes read between the two halves of the look, as it can for
+/// [`watch_hangup`]. Always false on non-Unix platforms.
+pub fn stdin_looks_closed() -> bool {
+    #[cfg(unix)]
+    {
+        look(io::stdin()) != Tty::Open
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 /// What a look at the terminal's input found.
