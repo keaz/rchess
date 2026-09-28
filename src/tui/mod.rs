@@ -3,17 +3,22 @@
 //! `crate::core` and `crate::engine`.
 //!
 //! [`run`] is the whole program: it reads the command line and the environment,
-//! builds the computer player, sets up the terminal and runs the main loop
-//! until the user quits or a signal asks it to stop.
+//! builds the computer player, sets up the terminal, asks it about graphics
+//! ([`graphics::detect`]) and runs the main loop until the user quits or a signal
+//! asks it to stop. In debug mode ([`debug::enabled`]) the computer player records
+//! its exchanges with Jev, and the app keeps them and writes the debug log.
 
 pub mod app;
 pub mod board;
+pub mod debug;
 pub mod event;
 pub mod files;
 pub mod glyphs;
+pub mod graphics;
 pub mod input;
 pub mod movetext;
 pub mod panels;
+pub mod pieces;
 pub mod terminal;
 #[cfg(test)]
 mod test_support;
@@ -27,14 +32,18 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use ratatui::backend::Backend;
 use ratatui::crossterm::event::Event;
 
 use crate::core::Game;
 use crate::engine::{ComputerMove, ComputerPlayer, EngineConfig};
 
 use self::app::{Action, App};
+use self::board::CellSize;
+use self::debug::DebugLog;
 use self::event::AppEvent;
-use self::worker::{Engine, EngineOutcome, EngineReply};
+use self::graphics::{FontMeter, Graphics, LateAnswers};
+use self::worker::{Engine, EngineOutcome, EngineReply, EngineRequest};
 
 /// How long one batch waits for terminal input before its `Tick` (spec 6.5).
 const TICK: Duration = Duration::from_millis(50);
@@ -44,17 +53,23 @@ const TICK: Duration = Duration::from_millis(50);
 /// arrives, and the process should then end by that signal rather than by the error.
 const SIGNAL_GRACE: Duration = Duration::from_millis(100);
 
+/// How long quitting waits for the debug log to write the exchanges still queued.
+const LOG_GRACE: Duration = Duration::from_millis(500);
+
 /// The `--help` text.
 const USAGE: &str = concat!(
     "rchess: chess in the terminal, against a person or the Jev computer player\n",
     "\n",
     "Usage: ",
     env!("CARGO_PKG_NAME"),
-    " [--glyphs solid|outline|ascii]\n",
+    " [--glyphs image|solid|outline|ascii] [--debug]\n",
     "\n",
     "Options:\n",
-    "  --glyphs <set>     piece glyphs: solid (default), outline or ascii;\n",
-    "                     `g` cycles them during a game\n",
+    "  --glyphs <set>     how pieces look: image (pictures; the default when the\n",
+    "                     terminal can show them), solid (otherwise the default),\n",
+    "                     outline or ascii; `g` cycles them during a game\n",
+    "  --debug            debug mode: keep every Jev request and answer, show them\n",
+    "                     with `d` during a game and append them to the debug log\n",
     "  -h, --help         show this help and exit\n",
     "\n",
     "Environment:\n",
@@ -64,8 +79,13 @@ const USAGE: &str = concat!(
     "  JEV_MAX_OPTIONS    moves offered to Jev per turn, 1-255 (default 40)\n",
     "  JEV_FILTER_LOSING  keep losing moves off Jev's shortlist (default true)\n",
     "  RCHESS_GLYPHS      glyph set when --glyphs is not given\n",
+    "  RCHESS_IMAGES      off: no piece pictures, and no graphics query at start\n",
+    "  RCHESS_DEBUG       debug mode as with --debug, unless empty or 0\n",
+    "  RCHESS_DEBUG_LOG   the debug log file; the default is\n",
+    "                     $XDG_STATE_HOME/rchess/jev-debug.jsonl, else\n",
+    "                     ~/.local/state/rchess/jev-debug.jsonl\n",
     "  NO_COLOR           no colours: start with outline glyphs unless a set is\n",
-    "                     chosen, and mark board highlights with text\n",
+    "                     chosen, mark board highlights with text, no pictures\n",
     "  COLORTERM          truecolor or 24bit selects 24-bit colours\n",
     "\n",
     "In the game press ? for help. Moves can be typed after / (e4, Nf3, e2e4).\n",
@@ -77,8 +97,14 @@ const USAGE: &str = concat!(
 /// `--help` prints the usage and returns without touching the terminal.
 /// Unknown arguments and a missing or invalid `--glyphs` value do not stop the
 /// program: they are listed as warnings on the menu, like invalid engine
-/// settings. The computer player comes from `EngineConfig::from_env()`; with
-/// no `JEV_API_KEY` it plays by local search and never uses the network.
+/// settings, and so is a graphics query that failed. The computer player comes
+/// from `EngineConfig::from_env()`; with no `JEV_API_KEY` it plays by local
+/// search and never uses the network. In debug mode (`--debug` or `RCHESS_DEBUG`)
+/// it records its exchanges with Jev (`EngineConfig::trace`).
+///
+/// Unless images are off ([`glyphs::images_wanted`]), the terminal is asked about
+/// graphics right after it is set up, which takes up to [`graphics::QUERY_TIMEOUT`]
+/// when it does not answer.
 ///
 /// Call it from the main thread (the panic hook restores the terminal only for
 /// a panic on the thread named "main"). The terminal is restored on every exit:
@@ -103,22 +129,20 @@ pub fn run(args: impl IntoIterator<Item = String>) -> io::Result<()> {
     }
 
     let env = |name: &str| std::env::var(name).ok();
-    let (glyph_set, glyph_warnings) = glyphs::initial_glyphs(options.glyphs.as_deref(), env);
-    let mut warnings = options.warnings;
-    warnings.extend(glyph_warnings);
+    let images = glyphs::images_wanted(options.glyphs.as_deref(), env);
     let fault = injected_fault(env("RCHESS_FAULT").as_deref());
-    let mut engine: Arc<dyn Engine> =
-        Arc::new(ComputerPlayer::from_config(EngineConfig::from_env()));
+    let config = engine_config(EngineConfig::from_env(), debug::enabled(options.debug, env));
+    let mut engine: Arc<dyn Engine> = Arc::new(ComputerPlayer::from_config(config));
     if fault == Some(Fault::EnginePanic) {
         engine = Arc::new(PanickingEngine(engine));
     }
-    let mut app = App::new(engine, glyph_set, glyphs::detect_truecolor(env), warnings)
-        .with_no_color(glyphs::no_color(env));
 
     // Before `enter`, so a signal that arrives during setup still ends in a
     // clean restore instead of killing the process with the terminal in raw mode.
     let quit = terminal::register_signals()?;
-    let result = play(&mut app, &quit, fault);
+    let result = play(&quit, images, fault, |graphics| {
+        build_app(options, engine, graphics, env)
+    });
     let signal = if result.is_err() {
         signal_after(&quit, SIGNAL_GRACE)
     } else {
@@ -129,6 +153,14 @@ pub fn run(args: impl IntoIterator<Item = String>) -> io::Result<()> {
         terminal::exit_by_signal(signal);
     }
     result
+}
+
+/// `config` with the exchange recording debug mode needs (`trace`) on when `debug` is.
+fn engine_config(config: EngineConfig, debug: bool) -> EngineConfig {
+    EngineConfig {
+        trace: debug,
+        ..config
+    }
 }
 
 /// Why the UI cannot run, given whether stdin and stdout are terminals: it reads keys
@@ -143,31 +175,95 @@ fn terminal_problem(stdin_is_terminal: bool, stdout_is_terminal: bool) -> Option
     }
 }
 
-/// Sets up the terminal, runs the main loop and restores the terminal (also on
-/// an error) before returning.
-fn play(app: &mut App, quit: &AtomicI32, fault: Option<Fault>) -> io::Result<()> {
+/// The app for the options and environment (`get`), once the terminal has been
+/// asked about graphics: the starting glyph set follows [`Graphics::support`], and
+/// the menu lists the command-line warnings, then the glyph warnings, then the
+/// graphics query's (after the engine's own, which `App::new` adds). In debug mode
+/// it starts the debug log at [`debug::log_path`].
+fn build_app(
+    options: Options,
+    engine: Arc<dyn Engine>,
+    graphics: Graphics,
+    get: impl Fn(&str) -> Option<String>,
+) -> App {
+    let (glyph_set, glyph_warnings) =
+        glyphs::initial_glyphs(options.glyphs.as_deref(), &get, graphics.support());
+    let mut warnings = options.warnings;
+    warnings.extend(glyph_warnings);
+    warnings.extend(graphics.warning);
+    let mut app = App::new(engine, glyph_set, glyphs::detect_truecolor(&get), warnings)
+        .with_no_color(glyphs::no_color(&get))
+        .with_picker(graphics.picker);
+    if debug::enabled(options.debug, &get) {
+        app = app.with_debug(DebugLog::open(debug::log_path(&get)));
+    }
+    app.set_cell_size(graphics.cell_size);
+    app
+}
+
+/// Sets up the terminal, asks it about graphics when `images` is true, builds the
+/// app from the result, runs the main loop, gives the debug log a moment to finish,
+/// and restores the terminal (also on an error) before returning.
+fn play(
+    quit: &AtomicI32,
+    images: bool,
+    fault: Option<Fault>,
+    build: impl FnOnce(Graphics) -> App,
+) -> io::Result<()> {
+    let (screen, graphics) = terminal::enter(|| {
+        if images {
+            graphics::detect(|| quit.load(Ordering::SeqCst) != 0)
+        } else {
+            graphics::without_images()
+        }
+    })?;
     // Never dropped: `Terminal`'s `Drop` shows the cursor and prints when that
     // fails, which panics on a hung-up tty. `terminal::leave` shows the cursor
     // instead, ignoring errors. The process ends soon after, so nothing leaks for
     // long.
-    let mut screen = ManuallyDrop::new(terminal::enter()?);
+    let mut screen = ManuallyDrop::new(screen);
     let _guard = terminal::Guard;
-    run_loop(
-        app,
+    // A terminal that does not know a probe may have printed it, and the first draw
+    // writes only the cells that are not blank. (`Terminal::clear` would also ask
+    // for the cursor position, another answer to wait for.)
+    screen.backend_mut().clear()?;
+    let mut late = LateAnswers::after(&graphics, Instant::now());
+    let mut meter = FontMeter::default();
+    let mut app = build(graphics);
+    let result = run_loop(
+        &mut app,
         quit,
         |app| {
-            screen
-                .draw(|frame| app.render(frame, Instant::now()))
-                .map(drop)
+            // Kitty keeps pictures after the program ends unless they are deleted: the
+            // board builds each with an id from `terminal::next_kitty_id`, which
+            // `terminal::leave` deletes.
+            screen.draw(|frame| app.render(frame, Instant::now()))?;
+            Ok(())
         },
         |replies| {
-            let batch = event::collect(replies, TICK)?;
+            let mut batch = event::collect(replies, TICK)?;
+            drop_late_answers(&mut batch, &mut late, Instant::now());
             if let Some(fault) = fault {
                 inject_ui_fault(fault, &batch);
             }
             Ok(batch)
         },
-    )
+        |app| {
+            let is_tmux = app.picker().is_some_and(|picker| picker.tmux_detected());
+            meter.measure(is_tmux, || quit.load(Ordering::SeqCst) != 0)
+        },
+    );
+    app.close_debug_log(LOG_GRACE);
+    result
+}
+
+/// Removes from `batch` the key presses of a graphics answer that came after the
+/// query stopped waiting ([`LateAnswers`]), so they do not act as keys.
+fn drop_late_answers(batch: &mut Vec<AppEvent>, late: &mut LateAnswers, now: Instant) {
+    batch.retain(|event| match event {
+        AppEvent::Term(term) => late.keep(term, now),
+        _ => true,
+    });
 }
 
 /// The quit signal recorded in `quit`, waiting up to `grace` for one to arrive; 0 if
@@ -265,11 +361,13 @@ struct Options {
     /// The last `--glyphs` value, still unchecked: `glyphs::initial_glyphs`
     /// validates it and warns about a bad one.
     glyphs: Option<String>,
+    /// `--debug` was given ([`debug::enabled`] also reads `RCHESS_DEBUG`).
+    debug: bool,
     /// Notes about ignored arguments, shown on the menu.
     warnings: Vec<String>,
 }
 
-/// Reads `--glyphs <set>`, `--glyphs=<set>`, `-h` and `--help`. The last
+/// Reads `--glyphs <set>`, `--glyphs=<set>`, `--debug`, `-h` and `--help`. The last
 /// `--glyphs` wins. A `--glyphs` followed by nothing or by another option has no
 /// value; that and any other argument become warnings rather than errors.
 fn parse_args(args: impl IntoIterator<Item = String>) -> Cli {
@@ -278,11 +376,12 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Cli {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => return Cli::Help,
+            "--debug" => options.debug = true,
             "--glyphs" => match args.next_if(|value| !value.starts_with('-')) {
                 Some(value) => options.glyphs = Some(value),
                 None => options
                     .warnings
-                    .push("--glyphs needs a value: solid, outline or ascii".to_string()),
+                    .push("--glyphs needs a value: image, solid, outline or ascii".to_string()),
             },
             _ => match arg.strip_prefix("--glyphs=") {
                 Some(value) => options.glyphs = Some(value.to_string()),
@@ -301,15 +400,23 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Cli {
 /// (the number of a quit signal, 0 until one arrives) is set. Both are checked
 /// before every draw, so a signal is seen within one batch timeout.
 ///
+/// Engine requests start at once. A font measurement ([`Action::MeasureFont`]) waits
+/// for the end of the batch, so that it sees the terminal after every resize in it,
+/// and runs once however many resizes asked: `measure_font` asks the terminal
+/// ([`FontMeter::measure`] in production, up to [`graphics::QUERY_TIMEOUT`] when it
+/// does not answer) and its result goes to
+/// [`App::font_measured`] before the next draw.
+///
 /// Drawing comes before each batch so that mouse events are hit-tested against
 /// what is on screen. Every batch ends with a `Tick`, so the screen is redrawn at
 /// least once per batch (the spinner and the Jev vs Jev delay depend on it);
 /// ratatui writes only the cells that changed. Once the app quits, the rest of
 /// the batch is dropped.
 ///
-/// `draw` and `next_batch` are the terminal in production and a `TestBackend`
-/// with scripted batches in tests. Engine replies travel over a channel created
-/// here: `next_batch` receives its end, the worker threads send on the other.
+/// `draw`, `next_batch` and `measure_font` are the terminal in production and a
+/// `TestBackend` with scripted batches and font sizes in tests. Engine replies
+/// travel over a channel created here: `next_batch` receives its end, the worker
+/// threads send on the other.
 ///
 /// # Errors
 ///
@@ -319,44 +426,49 @@ fn run_loop(
     quit: &AtomicI32,
     mut draw: impl FnMut(&mut App) -> io::Result<()>,
     mut next_batch: impl FnMut(&Receiver<EngineReply>) -> io::Result<Vec<AppEvent>>,
+    mut measure_font: impl FnMut(&App) -> Option<CellSize>,
 ) -> io::Result<()> {
     let (replies_tx, replies) = mpsc::channel();
     while quit.load(Ordering::SeqCst) == 0 && !app.should_quit() {
         draw(app)?;
         let batch = next_batch(&replies)?;
         let now = Instant::now();
+        let mut measure = false;
         for event in batch {
             for action in app.handle(event, now) {
-                perform(action, app.engine(), &replies_tx);
+                match action {
+                    Action::RequestEngine(request) => {
+                        request_engine(request, app.engine(), &replies_tx);
+                    }
+                    Action::MeasureFont => measure = true,
+                }
             }
             if app.should_quit() {
                 break;
             }
         }
+        if measure && !app.should_quit() {
+            let measured = measure_font(app);
+            app.font_measured(measured);
+        }
     }
     Ok(())
 }
 
-/// Carries out one [`Action`] for the app.
-fn perform(action: Action, engine: &Arc<dyn Engine>, replies: &Sender<EngineReply>) {
-    match action {
-        Action::RequestEngine(request) => {
-            let (generation, hash) = (request.generation, request.hash);
-            if let Err(error) = worker::spawn_request(Arc::clone(engine), request, replies.clone())
-            {
-                // No thread means no reply. Answer for it, so the app stops
-                // waiting: it shows the failure and lets the person retry.
-                let failed = EngineReply {
-                    generation,
-                    hash,
-                    outcome: EngineOutcome::Failed(format!(
-                        "cannot start the engine thread: {error}"
-                    )),
-                };
-                // The receiver lives in `run_loop`, which is still running.
-                let _ = replies.send(failed);
-            }
-        }
+/// Runs `request` on an engine thread, whose reply arrives on `replies`.
+fn request_engine(request: EngineRequest, engine: &Arc<dyn Engine>, replies: &Sender<EngineReply>) {
+    let (generation, hash) = (request.generation, request.hash);
+    if let Err(error) = worker::spawn_request(Arc::clone(engine), request, replies.clone()) {
+        // No thread means no reply. Answer for it, so the app stops
+        // waiting: it shows the failure and lets the person retry.
+        let failed = EngineReply {
+            generation,
+            hash,
+            outcome: EngineOutcome::Failed(format!("cannot start the engine thread: {error}")),
+            exchange: None,
+        };
+        // The receiver lives in `run_loop`, which is still running.
+        let _ = replies.send(failed);
     }
 }
 
@@ -369,10 +481,15 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, MouseButton, MouseEventKind};
 
+    use ratatui_image::picker::ProtocolType;
+
     use super::app::{Hit, Mode, Screen};
-    use super::glyphs::GlyphSet;
-    use super::test_support::engine::{REPLY_TIMEOUT, chars, key, mouse};
-    use super::test_support::uci_moves;
+    use super::board::CellSize;
+    use super::glyphs::{GlyphSet, ImageSupport};
+    use super::graphics::{Graphics, LateAnswers, picker_for};
+    use super::test_support::TempDir;
+    use super::test_support::engine::{FakeEngine, REPLY_TIMEOUT, Turn, chars, key, mouse};
+    use super::test_support::{late_kitty_answer, uci_moves};
     use super::*;
     use crate::core::Color as Side;
     use crate::engine::{JevClient, MoveSource};
@@ -387,6 +504,7 @@ mod tests {
         Cli::Play(Options {
             glyphs: glyphs.map(str::to_string),
             warnings: warnings.iter().map(|w| (*w).to_string()).collect(),
+            ..Options::default()
         })
     }
 
@@ -436,14 +554,66 @@ mod tests {
         let Cli::Play(options) = parse_args(args(&["--glyphs", "fancy"])) else {
             panic!("expected Play");
         };
-        let (set, warnings) = glyphs::initial_glyphs(options.glyphs.as_deref(), |_| None);
+        let (set, warnings) =
+            glyphs::initial_glyphs(options.glyphs.as_deref(), |_| None, ImageSupport::Off);
         assert_eq!(set, GlyphSet::Solid);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
     }
 
     #[test]
+    fn the_image_style_can_be_asked_for() {
+        assert_eq!(
+            parse_args(args(&["--glyphs", "image"])),
+            play(Some("image"), &[])
+        );
+    }
+
+    #[test]
+    fn debug_mode_can_be_asked_for() {
+        let debug = |list: &[&str]| match parse_args(args(list)) {
+            Cli::Play(options) => options,
+            Cli::Help => panic!("expected Play"),
+        };
+        assert!(!debug(&[]).debug);
+        assert_eq!(
+            debug(&["--debug", "--glyphs", "ascii"]),
+            Options {
+                glyphs: Some("ascii".to_string()),
+                debug: true,
+                warnings: Vec::new(),
+            }
+        );
+        assert_eq!(
+            debug(&["--glyphs", "--debug"]),
+            Options {
+                glyphs: None,
+                debug: true,
+                warnings: vec!["--glyphs needs a value: image, solid, outline or ascii".into()],
+            },
+            "--debug is not a glyph set"
+        );
+        assert_eq!(
+            debug(&["--debug=1"]).warnings,
+            [r#"ignored unknown argument "--debug=1" (see --help)"#]
+        );
+    }
+
+    #[test]
+    fn debug_mode_turns_the_engine_trace_on() {
+        assert!(engine_config(EngineConfig::default(), true).trace);
+        let config = EngineConfig {
+            model: "jev-x".to_string(),
+            trace: true,
+            ..EngineConfig::default()
+        };
+        let config = engine_config(config, false);
+        assert!(!config.trace);
+        assert_eq!(config.model, "jev-x", "nothing else changes");
+    }
+
+    #[test]
     fn a_missing_glyphs_value_is_a_warning() {
-        let missing = "--glyphs needs a value: solid, outline or ascii";
+        let missing = "--glyphs needs a value: image, solid, outline or ascii";
         assert_eq!(parse_args(args(&["--glyphs"])), play(None, &[missing]));
         assert_eq!(
             parse_args(args(&["--glyphs", "--glyphs=ascii"])),
@@ -488,6 +658,7 @@ mod tests {
     fn usage_names_every_option_and_variable() {
         for name in [
             "--glyphs",
+            "--debug",
             "--help",
             "JEV_API_KEY",
             "TYPESAFE_API_KEY",
@@ -495,12 +666,16 @@ mod tests {
             "JEV_MAX_OPTIONS",
             "JEV_FILTER_LOSING",
             "RCHESS_GLYPHS",
+            "RCHESS_IMAGES",
+            "RCHESS_DEBUG",
+            "RCHESS_DEBUG_LOG",
             "NO_COLOR",
             "COLORTERM",
         ] {
             assert!(USAGE.contains(name), "{name}");
         }
         assert!(USAGE.contains("Usage: chess "));
+        assert!(USAGE.contains("[--glyphs image|solid|outline|ascii] [--debug]"));
         assert!(USAGE.lines().all(|line| line.chars().count() <= 80));
     }
 
@@ -516,6 +691,109 @@ mod tests {
             Some("stdin is not a terminal; run it in a terminal (see --help)")
         );
         assert!(terminal_problem(false, false).is_some());
+    }
+
+    // ----- start-up -----
+
+    fn options(glyphs: Option<&str>, warnings: &[&str]) -> Options {
+        let Cli::Play(options) = play(glyphs, warnings) else {
+            unreachable!("play() builds Cli::Play");
+        };
+        options
+    }
+
+    #[test]
+    fn a_graphics_protocol_starts_the_app_with_piece_images() {
+        let cell = CellSize::new(9, 18);
+        let graphics = Graphics {
+            picker: Some(picker_for(ProtocolType::Kitty, cell)),
+            cell_size: cell,
+            warning: None,
+            answers_pending: false,
+        };
+        let app = build_app(options(None, &[]), local_engine(), graphics, |_| None);
+        assert_eq!(app.glyphs(), GlyphSet::Image);
+        assert!(app.images_available());
+        assert_eq!(
+            app.picker().map(|picker| picker.protocol_type()),
+            Some(ProtocolType::Kitty)
+        );
+        assert_eq!(app.cell_size(), cell);
+        assert!(app.warnings().is_empty(), "{:?}", app.warnings());
+    }
+
+    #[test]
+    fn a_failed_query_starts_solid_and_warns_after_the_other_notes() {
+        let warning = "graphics query: no answer within 1 s; images use half-blocks";
+        let graphics = Graphics {
+            picker: Some(picker_for(ProtocolType::Halfblocks, CellSize::DEFAULT)),
+            cell_size: CellSize::DEFAULT,
+            warning: Some(warning.to_string()),
+            answers_pending: true,
+        };
+        let unknown = r#"ignored unknown argument "--frob" (see --help)"#;
+        let app = build_app(
+            options(Some("fancy"), &[unknown]),
+            local_engine(),
+            graphics,
+            |_| None,
+        );
+        assert_eq!(app.glyphs(), GlyphSet::Solid);
+        assert!(app.images_available(), "Image stays in the cycle");
+        assert_eq!(
+            app.warnings(),
+            [
+                unknown,
+                "--glyphs: unknown glyph set \"fancy\" (expected image, solid, outline or \
+                 ascii); using solid",
+                warning,
+            ]
+        );
+    }
+
+    #[test]
+    fn without_images_the_app_has_no_picker() {
+        let get = |name: &str| (name == "NO_COLOR").then(|| "1".to_string());
+        let cell = CellSize::new(8, 16);
+        let app = build_app(options(None, &[]), local_engine(), Graphics::off(cell), get);
+        assert_eq!(app.glyphs(), GlyphSet::Outline);
+        assert!(!app.images_available());
+        assert!(app.picker().is_none());
+        assert!(app.no_color());
+        assert_eq!(
+            app.cell_size(),
+            cell,
+            "the font size still shapes the squares"
+        );
+    }
+
+    #[test]
+    fn debug_mode_starts_the_log_where_the_environment_says() {
+        let dir = TempDir::new("debug-start");
+        let path = dir.join("log").join("jev.jsonl");
+        let log = path.display().to_string();
+        let vars = |debug: &str| {
+            let (debug, log) = (debug.to_string(), log.clone());
+            move |name: &str| match name {
+                "RCHESS_DEBUG" => Some(debug.clone()),
+                "RCHESS_DEBUG_LOG" => Some(log.clone()),
+                _ => None,
+            }
+        };
+        let off = Graphics::off(CellSize::DEFAULT);
+        let app = build_app(options(None, &[]), local_engine(), off.clone(), vars("0"));
+        assert!(!app.debug_mode());
+        let mut app = build_app(options(None, &[]), local_engine(), off.clone(), vars("1"));
+        assert!(app.debug_mode());
+        assert!(app.exchanges().is_some_and(debug::History::is_empty));
+        app.close_debug_log(Duration::from_secs(10));
+        assert!(!path.exists(), "no exchange, no file");
+        let flagged = Options {
+            debug: true,
+            ..Options::default()
+        };
+        let app = build_app(flagged, local_engine(), off, vars(""));
+        assert!(app.debug_mode(), "--debug alone");
     }
 
     // ----- main loop -----
@@ -549,21 +827,34 @@ mod tests {
         unused_steps: usize,
         /// [`App::in_flight`] at every draw, so before every batch.
         in_flight: Vec<usize>,
+        /// The draw each font measurement came after (1 for the first draw).
+        measured_after: Vec<usize>,
     }
 
     /// Runs [`run_loop`] on an 80×24 `TestBackend`, serving `steps` as batches. Running
     /// out of steps before the loop ends is an error, so a loop that fails to quit fails
-    /// the test instead of hanging it.
+    /// the test instead of hanging it. Font measurements find nothing.
     fn drive(app: &mut App, quit: &AtomicI32, steps: Vec<Step>) -> Run {
+        drive_with_font(app, quit, steps, None)
+    }
+
+    /// [`drive`], with every font measurement giving `font`.
+    fn drive_with_font(
+        app: &mut App,
+        quit: &AtomicI32,
+        steps: Vec<Step>,
+        font: Option<CellSize>,
+    ) -> Run {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
         let mut steps = VecDeque::from(steps);
-        let mut draws = 0;
+        let draws = std::cell::Cell::new(0);
         let mut in_flight = Vec::new();
+        let mut measured_after = Vec::new();
         let result = run_loop(
             app,
             quit,
             |app| {
-                draws += 1;
+                draws.set(draws.get() + 1);
                 in_flight.push(app.in_flight());
                 terminal
                     .draw(|frame| app.render(frame, Instant::now()))
@@ -586,13 +877,240 @@ mod tests {
                 batch.push(AppEvent::Tick);
                 Ok(batch)
             },
+            |_| {
+                measured_after.push(draws.get());
+                font
+            },
         );
         Run {
             result,
-            draws,
+            draws: draws.get(),
             unused_steps: steps.len(),
             in_flight,
+            measured_after,
         }
+    }
+
+    /// A game on an app whose picker draws with `protocol` at 10×20.
+    fn picture_game(protocol: ProtocolType) -> App {
+        let mut app = new_app().with_picker(Some(picker_for(protocol, CellSize::DEFAULT)));
+        app.set_cell_size(CellSize::DEFAULT);
+        let _ = app.handle(key(KeyCode::Char('1')), Instant::now());
+        app
+    }
+
+    fn resizes(sizes: &[(u16, u16)]) -> Step {
+        Step::Events(
+            sizes
+                .iter()
+                .map(|&(columns, rows)| AppEvent::Term(Event::Resize(columns, rows)))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn a_batch_of_resizes_measures_the_font_once_after_the_batch() {
+        let mut app = picture_game(ProtocolType::Sixel);
+        let run = drive_with_font(
+            &mut app,
+            &AtomicI32::new(0),
+            vec![
+                resizes(&[(100, 30), (90, 26), (100, 30)]),
+                Step::Events(Vec::new()),
+                resizes(&[(80, 24)]),
+                Step::Signal,
+            ],
+            Some(CellSize::new(8, 16)),
+        );
+        run.result.expect("loop ends cleanly");
+        assert_eq!(run.measured_after, [1, 3], "once per batch of resizes");
+        assert_eq!(app.cell_size(), CellSize::new(8, 16));
+        let font = app.picker().map(|picker| picker.font_size());
+        assert_eq!(font.map(|font| (font.width, font.height)), Some((8, 16)));
+
+        // Nothing measured keeps the font.
+        let mut app = picture_game(ProtocolType::Iterm2);
+        let run = drive(
+            &mut app,
+            &AtomicI32::new(0),
+            vec![resizes(&[(100, 30)]), Step::Signal],
+        );
+        run.result.expect("loop ends cleanly");
+        assert_eq!(run.measured_after, [1]);
+        assert_eq!(app.cell_size(), CellSize::DEFAULT);
+    }
+
+    #[test]
+    fn kitty_pictures_follow_a_font_zoom() {
+        // Kitty and Ghostty size a placeholder picture from its pixel size and the
+        // current cell size, so a picture made for the old font would be cropped or
+        // shrunk after a zoom.
+        let mut app = picture_game(ProtocolType::Kitty);
+        let run = drive_with_font(
+            &mut app,
+            &AtomicI32::new(0),
+            vec![resizes(&[(100, 30), (80, 24)]), Step::Signal],
+            Some(CellSize::new(8, 16)),
+        );
+        run.result.expect("loop ends cleanly");
+        assert_eq!(run.measured_after, [1]);
+        assert_eq!(app.cell_size(), CellSize::new(8, 16));
+        let picker = app.picker().expect("images stay on");
+        assert_eq!(picker.protocol_type(), ProtocolType::Kitty);
+        let font = picker.font_size();
+        assert_eq!((font.width, font.height), (8, 16));
+    }
+
+    #[test]
+    fn half_block_pictures_are_never_measured() {
+        let mut app = picture_game(ProtocolType::Halfblocks);
+        let run = drive_with_font(
+            &mut app,
+            &AtomicI32::new(0),
+            vec![resizes(&[(100, 30), (80, 24)]), Step::Signal],
+            Some(CellSize::new(8, 16)),
+        );
+        run.result.expect("loop ends cleanly");
+        assert!(run.measured_after.is_empty());
+        assert_eq!(app.cell_size(), CellSize::DEFAULT);
+    }
+
+    #[test]
+    fn a_late_graphics_answer_does_not_start_a_game_from_the_menu() {
+        let answer: Vec<AppEvent> = late_kitty_answer()
+            .into_iter()
+            .map(AppEvent::Term)
+            .collect();
+
+        // Typed as keys, the `3` in the answer starts Human vs Jev as Black.
+        let mut app = new_app();
+        let run = drive(
+            &mut app,
+            &AtomicI32::new(0),
+            vec![Step::Events(answer.clone()), Step::Signal],
+        );
+        run.result.expect("loop ends cleanly");
+        assert_eq!(app.mode(), Mode::HumanVsJev { human: Side::Black });
+
+        let graphics = Graphics {
+            answers_pending: true,
+            ..Graphics::off(CellSize::DEFAULT)
+        };
+        let now = Instant::now();
+        let mut late = LateAnswers::after(&graphics, now);
+        let mut batch = answer;
+        drop_late_answers(&mut batch, &mut late, now);
+        let mut app = new_app();
+        let run = drive(
+            &mut app,
+            &AtomicI32::new(0),
+            vec![Step::Events(batch), Step::Events(chars("q"))],
+        );
+        run.result.expect("q on the menu quits at once");
+        assert_eq!(run.unused_steps, 0);
+        assert!(app.should_quit());
+        assert_eq!(app.screen_name(), "menu");
+        assert!(uci_moves(app.game()).is_empty());
+    }
+
+    #[test]
+    fn a_traced_move_reaches_the_exchange_view_and_the_log() {
+        // The worker thread moves the fake engine's exchange into its reply; the app keeps
+        // it for `d` and the log thread appends it.
+        let dir = TempDir::new("debug-loop");
+        let path = dir.join("jev.jsonl");
+        let engine = Arc::new(FakeEngine::jev().scripted([Turn::Traced("e2e4")]));
+        let mut app = App::new(engine, GlyphSet::Solid, true, Vec::new())
+            .with_home(None)
+            .with_debug(DebugLog::start(path.clone()));
+        let quit = AtomicI32::new(0);
+        let run = drive(
+            &mut app,
+            &quit,
+            vec![
+                Step::Events(chars("3")),
+                Step::AwaitEngine,
+                Step::Events(chars("d")),
+                Step::Events(vec![key(KeyCode::End)]),
+                Step::Signal,
+            ],
+        );
+        run.result.expect("loop ends cleanly");
+        assert_eq!(uci_moves(app.game()), ["e2e4"]);
+        let view = app.exchange_view().expect("the view is open");
+        assert_eq!(view.shown, Some(1));
+        assert_eq!(view.scroll, view.max_scroll);
+        assert!(view.max_scroll > 0);
+        app.close_debug_log(Duration::from_secs(10));
+        let log = std::fs::read_to_string(&path).expect("log written");
+        let line: serde_json::Value = serde_json::from_str(log.trim_end()).expect("one line");
+        assert_eq!(line["played"], "e4");
+        assert_eq!(line["ply"], 0);
+        assert_eq!(line["stale"], false);
+    }
+
+    #[test]
+    fn debug_mode_from_the_environment_logs_an_exchange_privately() {
+        // What `run` does with `RCHESS_DEBUG=1`: `build_app` finds the log path in the
+        // environment, and the first traced move creates the folders and the file. The
+        // binary cannot make a Jev request offline, so a fake engine records one.
+        let dir = TempDir::new("debug-env");
+        let (state, home) = (dir.join("state"), dir.join("home"));
+        let explicit = state.join("explicit").join("jev.jsonl");
+        let default = state.join("rchess").join("jev-debug.jsonl");
+        for (log_var, expected) in [(Some(&explicit), &explicit), (None, &default)] {
+            let mut vars = vec![
+                ("RCHESS_DEBUG", "1".to_string()),
+                ("XDG_STATE_HOME", state.display().to_string()),
+                ("HOME", home.display().to_string()),
+            ];
+            if let Some(path) = log_var {
+                vars.push(("RCHESS_DEBUG_LOG", path.display().to_string()));
+            }
+            let get = |name: &str| {
+                vars.iter()
+                    .find(|(var, _)| *var == name)
+                    .map(|(_, value)| value.clone())
+            };
+            let engine = Arc::new(FakeEngine::jev().scripted([Turn::Traced("e2e4")]));
+            let mut app = build_app(
+                Options::default(),
+                engine,
+                Graphics::off(CellSize::DEFAULT),
+                get,
+            );
+            assert!(app.debug_mode(), "RCHESS_DEBUG=1 without --debug");
+            let run = drive(
+                &mut app,
+                &AtomicI32::new(0),
+                vec![Step::Events(chars("3")), Step::AwaitEngine, Step::Signal],
+            );
+            run.result.expect("loop ends cleanly");
+            assert_eq!(uci_moves(app.game()), ["e2e4"]);
+            app.close_debug_log(Duration::from_secs(10));
+
+            let log = std::fs::read_to_string(expected).expect("log written");
+            let lines: Vec<&str> = log.lines().collect();
+            assert_eq!(lines.len(), 1, "{log}");
+            let line: serde_json::Value = serde_json::from_str(lines[0]).expect("JSON line");
+            assert_eq!(line["played"], "e4");
+            assert_eq!(line["stale"], false);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = |path: &std::path::Path| {
+                    std::fs::metadata(path)
+                        .expect("exists")
+                        .permissions()
+                        .mode()
+                        & 0o777
+                };
+                assert_eq!(mode(expected), 0o600, "{}", expected.display());
+                assert_eq!(mode(expected.parent().expect("folder")), 0o700);
+                assert_eq!(mode(&state), 0o700, "missing folders are made private");
+            }
+        }
+        assert!(!home.exists(), "HOME is the last resort");
     }
 
     #[test]
@@ -749,6 +1267,7 @@ mod tests {
             &quit,
             |_| Err(io::Error::other("tty gone")),
             |_| panic!("no batch after a failed draw"),
+            |_| panic!("no font measurement"),
         );
         assert_eq!(result.expect_err("draw failed").to_string(), "tty gone");
     }
@@ -766,6 +1285,7 @@ mod tests {
                 Ok(())
             },
             |_| Err(io::Error::other("read failed")),
+            |_| panic!("no font measurement"),
         );
         assert_eq!(result.expect_err("read failed").to_string(), "read failed");
         assert_eq!(draws, 1);
@@ -828,11 +1348,7 @@ mod tests {
         let engine: Arc<dyn Engine> = Arc::new(PanickingEngine(local_engine()));
         assert_eq!(engine.status(), "No JEV_API_KEY — local search");
         let (tx, rx) = mpsc::channel();
-        perform(
-            Action::RequestEngine(worker::EngineRequest::new(1, Game::new())),
-            &engine,
-            &tx,
-        );
+        request_engine(worker::EngineRequest::new(1, Game::new()), &engine, &tx);
         let reply = rx.recv_timeout(REPLY_TIMEOUT).expect("a reply arrives");
         let EngineOutcome::Move(computer) = reply.outcome else {
             panic!("expected the fallback move, got {:?}", reply.outcome);
@@ -847,7 +1363,7 @@ mod tests {
         let request = worker::EngineRequest::new(7, crate::core::Game::new());
         let hash = request.hash;
 
-        perform(Action::RequestEngine(request), &engine, &tx);
+        request_engine(request, &engine, &tx);
 
         let reply = rx.recv_timeout(REPLY_TIMEOUT).expect("a reply arrives");
         assert!(worker::is_current(&reply, 7, hash));

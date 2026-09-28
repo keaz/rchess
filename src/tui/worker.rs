@@ -12,6 +12,10 @@
 //! replies with its best move, noted [`ENGINE_ERROR_NOTE`]. The UI thread only
 //! ever applies ready-made moves: a search can take tens of seconds on a crowded
 //! position, and a panic in it must not reach the UI.
+//!
+//! In debug mode the engine records its exchange with Jev in the move; the thread
+//! moves it into the reply as a [`debug::Exchange`](super::debug::Exchange), whose
+//! text for the exchange view is rendered there too, off the UI thread.
 
 use std::any::Any;
 use std::io;
@@ -21,6 +25,7 @@ use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::Instant;
 
+use super::debug::Exchange;
 use crate::core::Game;
 use crate::engine::{ComputerMove, ComputerPlayer, EngineConfig, MoveChooser, MoveSource, analyse};
 
@@ -131,6 +136,31 @@ pub struct EngineReply {
     pub hash: u64,
     /// What the engine produced.
     pub outcome: EngineOutcome,
+    /// The exchange with Jev behind a move, when the engine recorded one (debug mode).
+    /// Taken out of the move, so [`EngineOutcome::Move`] never holds it.
+    pub exchange: Option<Box<Exchange>>,
+}
+
+impl EngineReply {
+    /// The reply to `request` with `outcome`. The exchange a traced move carries
+    /// (`ComputerMove::exchange`) moves into [`EngineReply::exchange`], with the move
+    /// and the position it was for.
+    #[must_use]
+    pub fn new(request: &EngineRequest, mut outcome: EngineOutcome) -> EngineReply {
+        let exchange = match &mut outcome {
+            EngineOutcome::Move(computer) => computer
+                .exchange
+                .take()
+                .map(|http| Box::new(Exchange::new(&request.game, computer, *http))),
+            EngineOutcome::GameOver | EngineOutcome::Failed(_) => None,
+        };
+        EngineReply {
+            generation: request.generation,
+            hash: request.hash,
+            outcome,
+            exchange,
+        }
+    }
 }
 
 /// Runs `request` on a new detached thread named "engine" and sends the reply on
@@ -150,18 +180,9 @@ pub fn spawn_request(
     thread::Builder::new()
         .name(ENGINE_THREAD.to_string())
         .spawn(move || {
-            let EngineRequest {
-                generation,
-                hash,
-                game,
-            } = request;
-            let outcome = run_engine(engine.as_ref(), &game, local_search_move);
+            let outcome = run_engine(engine.as_ref(), &request.game, local_search_move);
             // A send error means the UI has gone; nobody is left to tell.
-            let _ = tx.send(EngineReply {
-                generation,
-                hash,
-                outcome,
-            });
+            let _ = tx.send(EngineReply::new(&request, outcome));
         })
         // Detached: quitting never waits for a slow engine call.
         .map(drop)
@@ -220,6 +241,7 @@ fn local_search_move(game: &Game, started: Instant) -> Option<ComputerMove> {
         latency: started.elapsed(),
         input_tokens: None,
         note: Some(ENGINE_ERROR_NOTE.to_string()),
+        exchange: None,
     })
 }
 
@@ -243,7 +265,10 @@ mod tests {
     use std::time::Duration;
 
     use crate::engine::JevClient;
-    use crate::tui::test_support::engine::{FakeEngine, REPLY_TIMEOUT, Turn, jev_move};
+    use crate::tui::test_support::engine::{
+        FakeEngine, REPLY_TIMEOUT, Turn, jev_exchange, jev_move,
+    };
+    use crate::tui::test_support::game_from;
 
     /// Fool's mate: White is checkmated, so nobody has a move.
     const MATED: &str = "rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 1 3";
@@ -300,6 +325,44 @@ mod tests {
             EngineOutcome::Move(jev_move(game.position(), "e2e4"))
         );
         assert_eq!(engine.threads(), vec![Some("engine".to_string())]);
+    }
+
+    #[test]
+    fn a_traced_move_sends_its_exchange_beside_it() {
+        let game = game_from(crate::core::START_FEN, &["e2e4"]);
+        let reply = round_trip(
+            fake(Turn::Traced("e7e5")),
+            EngineRequest::new(2, game.clone()),
+        );
+        assert_eq!(
+            reply.outcome,
+            EngineOutcome::Move(jev_move(game.position(), "e7e5")),
+            "the move no longer holds the exchange"
+        );
+        let exchange = reply.exchange.expect("the exchange travels in the reply");
+        assert_eq!(exchange.http, jev_exchange());
+        assert_eq!((exchange.ply, exchange.fullmove), (1, 1));
+        assert_eq!(exchange.san, "e5");
+        assert_eq!(exchange.source, "Jev");
+        assert!(!exchange.body().is_empty(), "rendered on the engine thread");
+    }
+
+    #[test]
+    fn untraced_replies_carry_no_exchange() {
+        let request = EngineRequest::new(1, Game::new());
+        assert_eq!(
+            round_trip(fake(Turn::Play("e2e4")), request.clone()).exchange,
+            None
+        );
+        assert_eq!(
+            round_trip(fake(Turn::GameOver), request.clone()).exchange,
+            None
+        );
+        let failed = EngineReply::new(&request, EngineOutcome::Failed("no thread".into()));
+        assert_eq!(
+            (failed.generation, failed.hash, failed.exchange),
+            (1, request.hash, None)
+        );
     }
 
     #[test]
@@ -427,6 +490,7 @@ mod tests {
             generation: 4,
             hash: 0xABCD,
             outcome: EngineOutcome::GameOver,
+            exchange: None,
         };
         assert!(is_current(&reply, 4, 0xABCD));
         assert!(!is_current(&reply, 5, 0xABCD), "generation moved on");

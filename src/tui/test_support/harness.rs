@@ -11,7 +11,7 @@ use ratatui::crossterm::event::{
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind,
 };
 
-use super::engine::{FakeEngine, chord, jev_move, key, mouse};
+use super::engine::{FakeEngine, chord, jev_exchange, jev_move, key, mouse};
 use super::{TEST_DATE, buffer_text, uci_moves};
 use crate::core::{Color as Side, Square};
 use crate::engine::ComputerMove;
@@ -96,8 +96,9 @@ impl Harness {
     pub(crate) fn send(&mut self, event: AppEvent) -> Vec<Action> {
         let actions = self.app.handle(event, self.now);
         for action in &actions {
-            let Action::RequestEngine(request) = action;
-            self.request = Some(request.clone());
+            if let Action::RequestEngine(request) = action {
+                self.request = Some(request.clone());
+            }
         }
         self.draw();
         actions
@@ -231,11 +232,7 @@ impl Harness {
             Some(computer) => EngineOutcome::Move(computer),
             None => EngineOutcome::GameOver,
         };
-        EngineReply {
-            generation: request.generation,
-            hash: request.hash,
-            outcome,
-        }
+        EngineReply::new(request, outcome)
     }
 
     /// Answers `request` the way the fake engine would.
@@ -244,22 +241,27 @@ impl Harness {
         self.send(AppEvent::Engine(reply))
     }
 
-    /// Answers `request` with `outcome`.
+    /// Answers `request` with `outcome`, as the worker would (a traced move's exchange
+    /// travels beside it, see [`EngineReply::new`]).
     pub(crate) fn answer(
         &mut self,
         request: &EngineRequest,
         outcome: EngineOutcome,
     ) -> Vec<Action> {
-        self.send(AppEvent::Engine(EngineReply {
-            generation: request.generation,
-            hash: request.hash,
-            outcome,
-        }))
+        self.send(AppEvent::Engine(EngineReply::new(request, outcome)))
     }
 
     /// Answers the latest engine request with Jev playing `uci`.
     pub(crate) fn reply(&mut self, uci: &str) -> Vec<Action> {
         self.reply_with(uci, |_| {})
+    }
+
+    /// Answers the latest engine request with Jev playing `uci`, its exchange with Jev
+    /// recorded ([`jev_exchange`]), as in debug mode.
+    pub(crate) fn reply_traced(&mut self, uci: &str) -> Vec<Action> {
+        self.reply_with(uci, |computer| {
+            computer.exchange = Some(Box::new(jev_exchange()));
+        })
     }
 
     /// Answers the latest engine request with Jev playing `uci`, after `adjust` changes how

@@ -10,7 +10,7 @@ use crate::core::{Game, Move};
 use super::annotate::{Annotation, Bucket, annotate};
 use super::config::{EngineConfig, MAX_CHOICE_OPTIONS};
 use super::describe::describe;
-use super::jev::{ChoiceOption, ChoiceRequest, JevClient, MoveChooser, printable};
+use super::jev::{ChoiceOption, ChoiceRequest, JevClient, JevExchange, MoveChooser, printable};
 use super::search::{MATE, analyse};
 
 /// Longest part of an unknown option key echoed back in a note.
@@ -73,6 +73,10 @@ pub struct ComputerMove {
     pub input_tokens: Option<u32>,
     /// Why a fallback or veto happened.
     pub note: Option<String>,
+    /// The HTTP exchange with Jev, when [`EngineConfig::trace`] is on and Jev was
+    /// asked (a Jev or vetoed move, or a fallback after Jev failed or answered
+    /// unusably); `None` otherwise.
+    pub exchange: Option<Box<JevExchange>>,
 }
 
 /// Chooses computer moves: local search, plus Jev through `C` when available.
@@ -129,6 +133,7 @@ impl<C: MoveChooser> ComputerPlayer<C> {
             latency: started.elapsed(),
             input_tokens: None,
             note,
+            exchange: None,
         };
 
         if scored.len() == 1 {
@@ -162,11 +167,21 @@ impl<C: MoveChooser> ComputerPlayer<C> {
                 .collect(),
         };
 
-        let answer = match chooser.choose(&request) {
+        let mut trace = None;
+        let answer = if self.config.trace {
+            chooser.choose_traced(&request, &mut trace)
+        } else {
+            chooser.choose(&request)
+        };
+        let exchange = trace.map(Box::new);
+        let answer = match answer {
             Ok(answer) => answer,
             Err(error) => {
                 let note = format!("Jev unavailable ({error}) — local search");
-                return Some(plain(best.mv, MoveSource::Fallback, Some(note)));
+                return Some(ComputerMove {
+                    exchange,
+                    ..plain(best.mv, MoveSource::Fallback, Some(note))
+                });
             }
         };
         let Some(pick) = candidates.iter().find(|a| a.san == answer.choice) else {
@@ -179,7 +194,10 @@ impl<C: MoveChooser> ComputerPlayer<C> {
                 "Jev returned an unknown option ({}{cut}) — local search",
                 printable(&answer.choice, NOTE_KEY_CHARS)
             );
-            return Some(plain(best.mv, MoveSource::Fallback, Some(note)));
+            return Some(ComputerMove {
+                exchange,
+                ..plain(best.mv, MoveSource::Fallback, Some(note))
+            });
         };
 
         let margin = self.config.veto_margin_cp;
@@ -223,6 +241,7 @@ impl<C: MoveChooser> ComputerPlayer<C> {
             latency: started.elapsed(),
             input_tokens: Some(answer.input_tokens),
             note,
+            exchange,
         })
     }
 }
@@ -245,8 +264,10 @@ fn shortlist(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::jev::{ChoiceAnswer, JevError, http_error};
+    use crate::engine::jev::{ChoiceAnswer, JevAttempt, JevError, JevExchange, http_error};
+    use serde_json::json;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// What the mock returns: a fixed answer or an error.
     enum Reply {
@@ -260,6 +281,8 @@ mod tests {
     struct MockChooser {
         reply: Reply,
         seen: Mutex<Vec<ChoiceRequest>>,
+        /// How many of the requests came through `choose_traced`.
+        traced: AtomicUsize,
     }
 
     impl MockChooser {
@@ -270,6 +293,7 @@ mod tests {
                     probabilities,
                 },
                 seen: Mutex::new(Vec::new()),
+                traced: AtomicUsize::new(0),
             }
         }
 
@@ -277,11 +301,32 @@ mod tests {
             MockChooser {
                 reply: Reply::Error(error),
                 seen: Mutex::new(Vec::new()),
+                traced: AtomicUsize::new(0),
             }
         }
 
         fn requests(&self) -> Vec<ChoiceRequest> {
             self.seen.lock().unwrap().clone()
+        }
+
+        fn traced_calls(&self) -> usize {
+            self.traced.load(Ordering::SeqCst)
+        }
+    }
+
+    /// The exchange every traced mock call records, answer or error.
+    fn mock_exchange() -> JevExchange {
+        JevExchange {
+            method: "POST".to_string(),
+            url: "http://mock/v1/systemone".to_string(),
+            headers: vec![("Authorization".to_string(), "Bearer <redacted>".to_string())],
+            body: json!({ "model": "jev-latest" }),
+            attempts: vec![JevAttempt {
+                status: Some(200),
+                response: Some("{}".to_string()),
+                error: None,
+                elapsed: Duration::from_millis(7),
+            }],
         }
     }
 
@@ -305,10 +350,38 @@ mod tests {
                 Reply::Error(error) => Err(error.clone()),
             }
         }
+
+        fn choose_traced(
+            &self,
+            request: &ChoiceRequest,
+            trace: &mut Option<JevExchange>,
+        ) -> Result<ChoiceAnswer, JevError> {
+            self.traced.fetch_add(1, Ordering::SeqCst);
+            *trace = Some(mock_exchange());
+            self.choose(request)
+        }
+    }
+
+    /// A chooser that keeps the default `choose_traced`, which records nothing.
+    struct Untraced(MockChooser);
+
+    impl MoveChooser for Untraced {
+        fn choose(&self, request: &ChoiceRequest) -> Result<ChoiceAnswer, JevError> {
+            self.0.choose(request)
+        }
     }
 
     fn player(mock: MockChooser) -> ComputerPlayer<MockChooser> {
         ComputerPlayer::new(Some(mock), EngineConfig::default())
+    }
+
+    /// A player with `trace` on, as the TUI builds it in debug mode.
+    fn traced_player(mock: MockChooser) -> ComputerPlayer<MockChooser> {
+        let config = EngineConfig {
+            trace: true,
+            ..EngineConfig::default()
+        };
+        ComputerPlayer::new(Some(mock), config)
     }
 
     fn game(fen: &str) -> Game {
@@ -602,5 +675,100 @@ mod tests {
         let result = p.choose_move(&game(HANGING_QUEEN_TRAP)).unwrap();
         assert_eq!(result.source, MoveSource::Jev);
         assert_eq!(result.top, vec![("Kd2".to_string(), 0.4)]);
+    }
+
+    #[test]
+    fn trace_attaches_the_exchange_to_a_jev_move() {
+        let p = traced_player(MockChooser::answering("Kd2", vec![("Kd2", 1.0)]));
+        let result = p.choose_move(&game(HANGING_QUEEN_TRAP)).unwrap();
+        assert_eq!(result.source, MoveSource::Jev);
+        assert_eq!(result.exchange, Some(Box::new(mock_exchange())));
+        assert_eq!(p.chooser.as_ref().unwrap().traced_calls(), 1);
+    }
+
+    #[test]
+    fn trace_attaches_the_exchange_to_a_vetoed_move() {
+        let config = EngineConfig {
+            filter_losing: false,
+            trace: true,
+            ..EngineConfig::default()
+        };
+        let mock = MockChooser::answering("Qxd5", vec![("Qxd5", 0.7), ("Kd2", 0.3)]);
+        let p = ComputerPlayer::new(Some(mock), config);
+        let result = p.choose_move(&game(HANGING_QUEEN_TRAP)).unwrap();
+        assert!(matches!(result.source, MoveSource::Vetoed { .. }));
+        assert_eq!(result.exchange, Some(Box::new(mock_exchange())));
+    }
+
+    #[test]
+    fn trace_attaches_the_exchange_to_a_fallback_after_jev_was_asked() {
+        let p = traced_player(MockChooser::failing(http_error(503, "overloaded", None)));
+        let result = p.choose_move(&Game::new()).unwrap();
+        assert_eq!(result.source, MoveSource::Fallback);
+        assert!(result.note.unwrap().contains("HTTP 503"));
+        assert_eq!(result.exchange, Some(Box::new(mock_exchange())));
+
+        let p = traced_player(MockChooser::answering("Qh8", vec![("Qh8", 1.0)]));
+        let result = p.choose_move(&game(HANGING_QUEEN_TRAP)).unwrap();
+        assert_eq!(result.source, MoveSource::Fallback);
+        assert!(result.note.unwrap().contains("unknown option"));
+        assert_eq!(
+            result.exchange,
+            Some(Box::new(mock_exchange())),
+            "Jev was asked, so an unusable answer is recorded too"
+        );
+    }
+
+    #[test]
+    fn no_exchange_without_trace() {
+        let p = player(MockChooser::answering("Kd2", vec![("Kd2", 1.0)]));
+        let result = p.choose_move(&game(HANGING_QUEEN_TRAP)).unwrap();
+        assert_eq!(result.source, MoveSource::Jev);
+        assert_eq!(result.exchange, None);
+        let mock = p.chooser.as_ref().unwrap();
+        assert_eq!(mock.requests().len(), 1);
+        assert_eq!(mock.traced_calls(), 0, "the untraced path calls `choose`");
+
+        let p = player(MockChooser::failing(JevError::Timeout));
+        assert_eq!(p.choose_move(&Game::new()).unwrap().exchange, None);
+    }
+
+    #[test]
+    fn no_exchange_when_jev_is_not_asked() {
+        for (fen, source) in [
+            ("7k/8/8/8/8/8/6q1/7K w - - 0 1", MoveSource::OnlyMove),
+            (
+                "6k1/5ppp/8/8/8/8/5PPP/4R1K1 w - - 0 1",
+                MoveSource::MateInOne,
+            ),
+        ] {
+            let p = traced_player(MockChooser::answering("x", vec![]));
+            let result = p.choose_move(&game(fen)).unwrap();
+            assert_eq!(result.source, source);
+            assert_eq!(result.exchange, None, "{fen}");
+            assert!(p.chooser.as_ref().unwrap().requests().is_empty());
+        }
+
+        let config = EngineConfig {
+            trace: true,
+            ..EngineConfig::default()
+        };
+        let p: ComputerPlayer<MockChooser> = ComputerPlayer::new(None, config);
+        let result = p.choose_move(&Game::new()).unwrap();
+        assert_eq!(result.source, MoveSource::Fallback);
+        assert_eq!(result.exchange, None, "no key, no request");
+    }
+
+    #[test]
+    fn no_exchange_from_a_chooser_that_does_not_trace() {
+        let config = EngineConfig {
+            trace: true,
+            ..EngineConfig::default()
+        };
+        let chooser = Untraced(MockChooser::answering("Kd2", vec![("Kd2", 1.0)]));
+        let p = ComputerPlayer::new(Some(chooser), config);
+        let result = p.choose_move(&game(HANGING_QUEEN_TRAP)).unwrap();
+        assert_eq!(result.source, MoveSource::Jev);
+        assert_eq!(result.exchange, None);
     }
 }

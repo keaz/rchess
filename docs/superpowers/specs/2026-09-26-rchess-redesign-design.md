@@ -561,14 +561,15 @@ Sub-projects run sequentially; each is merge-ready before the next starts.
    evaluation harness has been run once with its summary recorded in `HANDOFF.md`.
 3. `tui` — done when all three game modes are playable end to end, the headless tests and snapshots
    pass, and the user has smoke-tested `cargo run` in a real terminal.
-4. Cleanup — delete `src/pieces/`, `src/board.rs`, `src/ai.rs` and the old `Game`; remove
+4. `tui-polish` — full-screen layout, piece images and Jev debug mode (section 9); done per 9.6.
+5. Cleanup — delete `src/pieces/`, `src/board.rs`, `src/ai.rs` and the old `Game`; remove
    `drawille`, `mockall` and the `[env]` key; update `CLAUDE.md`; extend CI with
    `cargo fmt --check` and `cargo clippy -- -D warnings`.
 
-New code lives in new modules beside the old code until step 4, so `main` never breaks.
+New code lives in new modules beside the old code until step 5, so `main` never breaks.
 
 Git: one branch per sub-project (`feat/core-bitboards`, `feat/jev-engine`, `feat/tui`,
-`chore/cleanup`), one commit per plan task. The user merges.
+`feat/tui-polish`, `chore/cleanup`), one commit per plan task. The user merges.
 
 ## 8. Handoff Protocol
 
@@ -610,3 +611,173 @@ cargo test core:: && cargo test --release perft
 ## Log (newest first)
 - 2026-09-26 task 7 done, perft depth 3 matches all 6 positions
 ```
+
+## 9. Sub-project 4 — `tui-polish` (full-screen board, piece images, Jev debug mode)
+
+Added 2026-09-27 after the user's manual smoke test of the merged TUI: the TUI does not fill the
+terminal, the board is small and the piece glyphs are hard to identify, and there is no way to see
+what is sent to Jev. Sections 6.x still hold except where this section changes them. Branch
+`feat/tui-polish`.
+
+### 9.1 Scope and dependencies
+
+- `src/tui/` changes throughout (layout, board, glyphs, app, panels, a new `pieces.rs`, a new
+  `debug.rs`); `src/engine/` gains exchange recording (9.5). `src/core/` and the legacy modules are
+  not touched.
+- New dependencies: `ratatui-image = { version = "11.1", default-features = false, features =
+  ["crossterm"] }` (MIT; built on ratatui `^0.30.1`; the default `chafa-dyn` feature would need
+  libchafa, so default features stay off) and `image = { version = "0.25", default-features = false,
+  features = ["png"] }` for decoding and compositing, and `rustix = { version = "1", features =
+  ["event"] }` (already in the tree through crossterm) for `poll` on stdin during the graphics query
+  (9.3). Nothing else.
+- Piece art: the Cburnett set (Colin M.L. Burnett, Wikimedia Commons `Chess_{k,q,r,b,n,p}{l,d}t45.svg`),
+  used under its BSD licence (it is also offered under GPL and GFDL). The licence is confirmed from
+  the Commons file pages when the files are fetched; if BSD is not offered, stop and ask the user.
+  The 12 SVGs are rasterized once to 256×256 RGBA PNGs with `rsvg-convert` and committed under
+  `assets/pieces/` with `LICENSE` (BSD text and attribution) and a `README.md` recording the source
+  URLs and the conversion command. The PNGs are embedded with `include_bytes!`, so the binary needs
+  no files at runtime.
+
+### 9.2 Layout fills the terminal
+
+- The Playing screen uses every cell. The left column holds the board panel and the command box; the
+  right column (status, Jev, moves, captured) takes all remaining width. `SIDE_MAX_WIDTH` and the
+  centring of the whole layout are removed; `SIDE_MIN_WIDTH` (30) stays.
+- Square size is no longer one of three presets. For a square height `square_h` (≥ 1 row) the
+  width is `square_w = max(3, round(square_h × cell_h / cell_w))`, bumped up to the next odd number
+  so a text glyph sits in the middle column; squares then look square in pixels. `cell_w × cell_h` is
+  the font size in pixels reported by the terminal (9.3), or 10×20 when unknown. The board uses the
+  largest `square_h` for which 8 squares plus labels and borders fit the terminal height and the
+  width left after `SIDE_MIN_WIDTH`. Rank and file labels stay one cell. If the board is limited by width, it is centred vertically inside its panel,
+  and the panel still fills the column.
+- The right column's panels stretch: Status and Captured keep their current heights; Jev and Moves
+  share the remaining rows (Moves at least `MOVES_MIN_ROWS`, Jev grows first up to its content).
+- Menu, dialogs, help and the game-over overlay stay centred boxes drawn over a full-screen
+  background. The 60×20 minimum and the too-small notice are unchanged.
+- Hit-testing keeps using the rectangles saved during the last draw, so mouse input follows the new
+  sizes without other changes.
+
+### 9.3 Piece images
+
+- Styles: `GlyphSet` gains `Image` as the first entry: `g` cycles Image → Solid → Outline → Ascii →
+  Image; `--glyphs image|solid|outline|ascii` and `RCHESS_GLYPHS` accept `image`. `NO_COLOR` still
+  starts in Outline (the colour-independent marks of 6.3 apply to text styles only).
+- Graphics detection: at start-up, after raw mode and the alternate screen are entered and before
+  mouse capture, bracketed paste and the event loop start, the TUI writes the capability query from
+  `ratatui_image::picker::cap_parser::Parser::query` and reads the answers itself on the UI thread
+  with `poll` and a 1 s deadline, feeding `Parser::push` until the status report arrives.
+  (`Picker::from_query_stdio` is not used: when a terminal never answers, its reader thread stays
+  blocked on stdin after the timeout and swallows keystrokes.) The result picks Kitty (Ghostty,
+  Kitty), iTerm2 (WezTerm, iTerm2, from the environment as ratatui-image does), Sixel or
+  Halfblocks, and the font size from the cell-size answer, else from
+  `crossterm::terminal::window_size()` pixels, else 10×20; the `Picker` is then built for that
+  protocol and font size. The query
+  is skipped (text styles only, `Image` removed from the `g` cycle) when `--glyphs`/`RCHESS_GLYPHS`
+  names a text style, when `NO_COLOR` is set, or when `RCHESS_IMAGES=off`. A query error or timeout
+  never stops the program: it falls back to Halfblocks and adds a menu warning. A reported or
+  measured font size outside 1..=256 pixels per cell is ignored (the next source is used), and no
+  picture is built larger than 4096 pixels per side (the square shows the Solid glyph instead).
+  When the query timed out, a kitty answer that arrives later (a slow SSH link) would reach
+  crossterm as key presses (`Alt+_`, `G`, `i`, `=`, ...); for 10 s after such a query one run of key
+  presses shaped like that answer is dropped. The other answers never become key presses.
+- Font changes: after a Resize, when the protocol is Sixel, iTerm2 or Kitty (their pictures are
+  encoded at a pixel size; Kitty and Ghostty size a placeholder picture from its pixel size and the
+  current cell size, so it does not follow a zoom; only half-blocks scale with the cells), the font
+  size is measured
+  again the same way (cell-size query and status request, `poll`, 1 s deadline, else window pixels ÷
+  cells, else unchanged), once per batch of resize events; a changed size rebuilds the picker and
+  clears the picture cache. The font is never guessed from pixel sizes and padding alone. crossterm
+  drops the cell-size and status answers but would then block reading until the next input, so a
+  measurement that gives up also asks for the device attributes (`ESC [ c`), whose answer comes last
+  and wakes crossterm; the answers such a measurement still owes are skipped by the next one. Known
+  limits on terminals that answer more than 1 s late: keys typed during a measurement's wait are
+  lost, and a stale font can stay until the next resize.
+- Default style: `Image` when the picker found Kitty, iTerm2 or Sixel; otherwise Solid, with `Image`
+  still in the cycle (drawn with half-blocks).
+- Drawing: in `Image` style each occupied square at least 5×2 cells (Kitty, iTerm2, Sixel) or 11×5
+  cells (half-blocks, which are unrecognisable smaller) gets an image; smaller squares fall back to
+  the Solid glyph for that frame. A picture is never drawn under a dialog or the game-over box. The image area is the square minus its leftmost and
+  rightmost columns, which stay text cells for the keyboard cursor's `[ ]` and the colour-independent
+  side marks. The piece PNG is scaled to fit the image area's pixel size (aspect kept), centred, and
+  composited (alpha over) onto a solid RGB rectangle of exactly that pixel size in the square's current
+  background colour: light or dark, or the highlight colour for selection, last move, capture target
+  or check.
+  Terminal transparency handling is never relied on. The composite is scaled with a filter that
+  keeps edges clean (`image::imageops::FilterType::Lanczos3`) and cached in a `pieces::ImageCache`
+  keyed by (piece, background RGB, pixel width, pixel height); a size change clears the cache. The
+  cache holds the ratatui-image protocol object built for that composite, so a piece that moves to a
+  square of the same colour reuses it. Legal-target dots on empty squares, the keyboard cursor and
+  the labels are text as in 6.3; nothing is drawn on top of an image. Kitty pictures are sent as
+  virtual placements (unicode placeholders), which Kitty deletes only by image id, so with the Kitty
+  protocol the TUI builds each picture with an id it chooses (`ratatui_image::protocol::kitty::Kitty::new`),
+  remembers every id it sent, and every restore path writes one delete-by-id command per id
+  (`ESC _ G a=d,d=I,i=<id> ESC \`, tmux-wrapped when needed) before leaving the alternate screen, so
+  the pictures do not stay in the terminal's image memory.
+- Indexed palettes (no truecolor) composite onto the RGB value of the indexed colour's xterm
+  default. Colours used for compositing come from the same `Palette` as the text rendering.
+- Tests: snapshots keep using text styles; unit tests cover square-size maths, the composite (pixel
+  checks on a known background), the cache key and eviction, style cycling with and without a
+  graphics protocol, and a Halfblocks render of one piece into a `TestBackend` (deterministic). The
+  pty smoke test runs with the query skipped, plus one scenario where the query times out (the pty
+  does not answer) to prove start-up continues, no query bytes are echoed, and the terminal is
+  restored.
+
+### 9.4 Debug mode (TUI)
+
+- On with `--debug` or `RCHESS_DEBUG` set to anything other than empty or `0`; off by default. The
+  Status panel's top border shows `DEBUG` beside the mode title while it is on; when both do not fit,
+  the mode title keeps the border and `DEBUG` starts the first status line. `--help` lists the flag and the variables
+  `RCHESS_DEBUG`, `RCHESS_DEBUG_LOG` and `RCHESS_IMAGES`.
+- Exchange view: `d` (board focus) opens a full-screen "Jev exchange" screen. Header: `exchange N of
+  M · move <fullmove> · <SAN played> · <source> · <status> · <attempts> attempt(s) · <latency> ms`,
+  plus `stale — not played` for a reply that was discarded. Body: `REQUEST` (method, URL, headers
+  with `Authorization: Bearer <redacted>`, then the pretty-printed JSON body), then one `RESPONSE`
+  block per attempt (status or error, elapsed ms, and the body pretty-printed when it parses as JSON,
+  otherwise the raw text with control characters escaped). Keys: ↑/↓, PgUp/PgDn, Home/End scroll;
+  ←/→ older/newer exchange; Esc closes. The view is a screen above Playing: engine replies are still
+  applied underneath and the view's exchange list grows while it is open. With no exchanges yet it
+  says "no Jev requests yet". With debug off, `d` shows "debug mode is off (start with --debug)".
+- History: the last 50 exchanges in memory, newest last, including stale replies (marked).
+- Log file: one JSON object per line, appended to `RCHESS_DEBUG_LOG` when set (a leading `~` is
+  expanded as for save paths), else `$XDG_STATE_HOME/rchess/jev-debug.jsonl`, else
+  `~/.local/state/rchess/jev-debug.jsonl` (macOS too). Missing directories are created with mode
+  0700 (existing ones are left alone) and the file is opened for append with mode 0600; an existing
+  log with a looser mode is set to 0600. Fields:
+  `time` (UTC, RFC 3339), `ply` (game ply when requested), `played` (SAN), `source` (the
+  `MoveSource` label), `stale` (bool), `request` (method, URL, redacted headers, JSON body),
+  `attempts` (each: `status` or null, `elapsed_ms`, `response` as JSON when it parses else a string,
+  `error` or null). The UI thread sends each record over a channel to a dedicated thread named
+  `debug-log`, which writes and flushes; the UI never waits on disk. The first write error shows one
+  status warning ("debug log disabled: <reason>", kept until a game screen can show it) and stops
+  logging for the session; the screen view keeps working. The key is also redacted when a server
+  echoes it JSON-escaped (for example `\/`), both in the raw text and after decoding.
+
+### 9.5 Engine changes for debug mode
+
+- New public types in `engine::jev`: `JevExchange { method: String, url: String, headers:
+  Vec<(String, String)>, body: serde_json::Value, attempts: Vec<JevAttempt> }` and `JevAttempt {
+  status: Option<u16>, response: Option<String>, error: Option<String>, elapsed: Duration }`. The
+  `Authorization` header value is always the literal `Bearer <redacted>`.
+- `MoveChooser` gains `fn choose_traced(&self, request: &ChoiceRequest, trace: &mut
+  Option<JevExchange>) -> Result<ChoiceAnswer, JevError>` with a default body that calls `choose`
+  and leaves `trace` as `None`, so existing fakes compile unchanged. `JevClient` overrides it: it
+  fills the exchange and records every attempt, including retried ones, with the response body read
+  under the existing 1 MiB cap.
+- `EngineConfig` gains `pub trace: bool` (default false; not read from the environment by the
+  engine — the TUI sets it from `--debug`/`RCHESS_DEBUG`). `ComputerMove` gains `pub exchange:
+  Option<Box<JevExchange>>`, filled only when `trace` is true and Jev was asked (Jev, Vetoed, and
+  Fallback after a Jev error); never for OnlyMove, MateInOne or the no-key fallback. With `trace`
+  false the request path is unchanged.
+- Tests: the existing offline transport tests (local TCP server) gain cases that assert the exchange
+  records method, URL, redacted headers, body, statuses and bodies across a retry, and that a
+  sentinel API key appears nowhere in the exchange, its `Debug` output, the rendered exchange view or
+  the log line. Player tests with a fake chooser cover when `exchange` is filled.
+
+### 9.6 Done criteria
+
+- Offline tests, snapshots (updated for the new layout; each change reviewed by hand) and the pty
+  smoke test pass; `cargo fmt --check` clean; clippy clean for `src/tui`, `src/engine` and
+  `src/main.rs`.
+- The user confirms in a real terminal (Ghostty and one other) that the TUI fills the terminal, the
+  board scales with it, pieces are images and easy to identify, `g` cycles styles, and `--debug`
+  plus `d` shows the Jev request and response and writes the log file.

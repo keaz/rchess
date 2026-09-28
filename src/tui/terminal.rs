@@ -1,11 +1,12 @@
 //! Terminal setup and teardown (spec 6.6).
 //!
-//! [`enter`] puts the terminal in raw mode on the alternate screen with
-//! click-and-drag mouse reporting and bracketed paste. [`leave`] undoes all of it
-//! and is reached on every exit path: a normal return or `?` error (through
-//! [`Guard`]), a panic on the UI thread (through the panic hook) and SIGINT,
-//! SIGTERM or SIGHUP (through the flag from [`register_signals`], which the main
-//! loop checks every tick; the program then ends by that signal with
+//! [`enter`] puts the terminal in raw mode on the alternate screen, runs the
+//! caller's start-up step (the graphics query), then turns on click-and-drag
+//! mouse reporting and bracketed paste. [`leave`] undoes all of it (deleting any
+//! Kitty pictures first) and is reached on every exit path: a normal return or `?`
+//! error (through [`Guard`]), a panic on the UI thread (through the panic hook) and
+//! SIGINT, SIGTERM or SIGHUP (through the flag from [`register_signals`], which the
+//! main loop checks every tick; the program then ends by that signal with
 //! [`exit_by_signal`]). If the loop does not react within [`STUCK_GRACE`], the
 //! signal thread restores the terminal itself and ends the process. That is also
 //! how a hangup ends when the UI is idle: crossterm keeps polling a hung-up tty
@@ -21,7 +22,7 @@ use std::fmt;
 use std::io::{self, stdout};
 use std::panic;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -32,10 +33,18 @@ use ratatui::crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use ratatui::crossterm::terminal::disable_raw_mode;
 use ratatui::crossterm::terminal::is_raw_mode_enabled;
 use ratatui::crossterm::{Command, execute};
+use ratatui_image::picker::cap_parser::Parser;
 
 /// True between a successful [`enter`] and the first [`leave`], which makes
 /// `leave` idempotent and a no-op when the terminal was never set up.
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// The ids of the Kitty pictures this session built, which [`leave`] deletes.
+static KITTY_IDS: KittyIds = KittyIds::new();
+
+/// How many ids a session can use, and the highest base: a base is at most this
+/// and a session's ids are at most this many past it, so they never wrap to 0.
+const KITTY_ID_SPAN: u32 = 1 << 31;
 
 /// The only thread whose panic may touch the terminal: the one running the UI.
 const UI_THREAD: &str = "main";
@@ -94,10 +103,155 @@ impl Command for DisableClickMouse {
     }
 }
 
+/// Deletes the Kitty pictures `ids` and frees their data, one `a=d,d=I,i=<id>`
+/// command each, so Kitty and Ghostty do not keep them after the program ends.
+/// ratatui-image sends Kitty pictures as virtual placements (unicode placeholders),
+/// which Kitty deletes only by image id: the delete-all command (`d=A`) leaves them.
+/// With `tmux` each command is wrapped for tmux's passthrough, as ratatui-image
+/// wraps the pictures. It prints nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeleteKittyImages {
+    /// The image ids, in the order they were sent.
+    pub ids: Vec<u32>,
+    /// The pictures went through tmux.
+    pub tmux: bool,
+}
+
+impl Command for DeleteKittyImages {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        let (start, escape, end) = Parser::tmux_start_escape_end(self.tmux);
+        for id in &self.ids {
+            write!(f, "{start}{escape}_Ga=d,d=I,i={id}{escape}\\{end}")?;
+        }
+        Ok(())
+    }
+
+    /// The Windows console draws no Kitty pictures.
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The image ids a session gives its Kitty pictures, and how the pictures reached
+/// the terminal. The ids are consecutive from a base derived from the process id
+/// ([`kitty_base`]), so two sessions in one terminal do not share one, and every id
+/// handed out is remembered (as a count), including those of pictures dropped since.
+/// It takes no lock, so the panic hook and the signal thread can read it at any time.
+#[derive(Debug)]
+struct KittyIds {
+    /// The first id, 0 until the first picture is built.
+    base: AtomicU32,
+    /// How many ids were handed out since the last [`KittyIds::cleanup`].
+    count: AtomicU32,
+    /// The last picture went through tmux.
+    tmux: AtomicBool,
+}
+
+impl KittyIds {
+    /// No id handed out yet; the base is chosen from the process id at the first.
+    const fn new() -> KittyIds {
+        KittyIds::starting_at(0)
+    }
+
+    /// Ids from `base` (1..=[`KITTY_ID_SPAN`]), or from the process id's base when 0.
+    const fn starting_at(base: u32) -> KittyIds {
+        KittyIds {
+            base: AtomicU32::new(base),
+            count: AtomicU32::new(0),
+            tmux: AtomicBool::new(false),
+        }
+    }
+
+    /// The first id.
+    fn base(&self) -> u32 {
+        let base = self.base.load(Ordering::SeqCst);
+        if base != 0 {
+            return base;
+        }
+        let chosen = kitty_base(std::process::id());
+        match self
+            .base
+            .compare_exchange(0, chosen, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => chosen,
+            Err(other) => other,
+        }
+    }
+
+    /// The `index`th id: nonzero, and unique for the first [`KITTY_ID_SPAN`].
+    fn id(base: u32, index: u32) -> u32 {
+        // base ≤ 2^31 and index % 2^31 < 2^31, so the sum fits and is at least 1.
+        base + index % KITTY_ID_SPAN
+    }
+
+    /// A new id for a picture sent through tmux when `tmux`, remembered for
+    /// [`KittyIds::cleanup`].
+    fn next(&self, tmux: bool) -> u32 {
+        let base = self.base();
+        self.tmux.store(tmux, Ordering::SeqCst);
+        KittyIds::id(base, self.count.fetch_add(1, Ordering::SeqCst))
+    }
+
+    /// Every id handed out so far, oldest first.
+    #[cfg(test)]
+    fn recorded(&self) -> Vec<u32> {
+        let count = self.count.load(Ordering::SeqCst);
+        let base = self.base.load(Ordering::SeqCst);
+        (0..count).map(|index| KittyIds::id(base, index)).collect()
+    }
+
+    /// The command that deletes every picture handed an id, once; `None` when there
+    /// was none.
+    fn cleanup(&self) -> Option<DeleteKittyImages> {
+        let count = self.count.swap(0, Ordering::SeqCst);
+        if count == 0 {
+            return None;
+        }
+        let base = self.base.load(Ordering::SeqCst);
+        Some(DeleteKittyImages {
+            ids: (0..count).map(|index| KittyIds::id(base, index)).collect(),
+            tmux: self.tmux.load(Ordering::SeqCst),
+        })
+    }
+}
+
+/// The first Kitty image id of the process `pid`: a mix of its bits, so sessions
+/// with neighbouring process ids start far apart, in 1..=[`KITTY_ID_SPAN`].
+fn kitty_base(pid: u32) -> u32 {
+    // The finaliser of MurmurHash3, a bijection on u32 that spreads every bit.
+    let mut x = pid;
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x85eb_ca6b);
+    x ^= x >> 13;
+    x = x.wrapping_mul(0xc2b2_ae35);
+    x ^= x >> 16;
+    x % KITTY_ID_SPAN + 1
+}
+
+/// A new image id for a Kitty picture (sent through tmux when `tmux`): nonzero,
+/// unique for the session, and deleted by [`leave`] before it leaves the alternate
+/// screen. Build every Kitty picture with one.
+pub fn next_kitty_id(tmux: bool) -> u32 {
+    KITTY_IDS.next(tmux)
+}
+
+/// Every Kitty image id handed out so far.
+#[cfg(test)]
+pub fn recorded_kitty_ids() -> Vec<u32> {
+    KITTY_IDS.recorded()
+}
+
 /// Sets up the terminal: raw mode and the alternate screen (`ratatui::try_init`),
-/// then click-and-drag mouse reporting and bracketed paste, then a thread-aware
-/// panic hook. Call it once, from the main thread, and hold a [`Guard`] for as
-/// long as the terminal is in use.
+/// then `before_input`, then click-and-drag mouse reporting and bracketed paste,
+/// then a thread-aware panic hook. Returns the terminal with what `before_input`
+/// returned. Call it once, from the main thread, and hold a [`Guard`] for as long
+/// as the terminal is in use.
+///
+/// `before_input` is for the graphics query (spec 9.3): it runs in raw mode, so
+/// the terminal's answers are not echoed, on the alternate screen, so nothing it
+/// writes stays on the main screen, and before any mouse or paste report can mix
+/// into the answers.
 ///
 /// The panic hook replaces the one `try_init` installs (ratatui's prints when its
 /// restore fails, which panics on a hung-up tty). A panic on the "main" thread
@@ -113,8 +267,9 @@ impl Command for DisableClickMouse {
 ///
 /// When there is no usable terminal (for example no controlling tty) or it
 /// rejects the setup sequences. Whatever was set up is restored first, and the
-/// panic hook is put back as it was.
-pub fn enter() -> io::Result<DefaultTerminal> {
+/// panic hook is put back as it was. `before_input` does not run when raw mode or
+/// the alternate screen could not be entered.
+pub fn enter<T>(before_input: impl FnOnce() -> T) -> io::Result<(DefaultTerminal, T)> {
     // Taken before `try_init` wraps it in ratatui's hook, which is then dropped.
     let original = panic::take_hook();
     let terminal = match ratatui::try_init() {
@@ -126,19 +281,34 @@ pub fn enter() -> io::Result<DefaultTerminal> {
         }
     };
     ACTIVE.store(true, Ordering::SeqCst);
-    finish_enter(
-        original,
-        || execute!(stdout(), EnableClickMouse, EnableBracketedPaste),
-        leave,
-    )?;
-    Ok(terminal)
+    let value = query_then_enable(before_input, || {
+        finish_enter(
+            original,
+            || execute!(stdout(), EnableClickMouse, EnableBracketedPaste),
+            leave,
+        )
+    })?;
+    Ok((terminal, value))
+}
+
+/// The order [`enter`] keeps once raw mode and the alternate screen are on: first
+/// `before_input` (the graphics query), then `enable` (mouse reporting and bracketed
+/// paste), so no mouse or paste report can mix into the query's answers.
+fn query_then_enable<T>(
+    before_input: impl FnOnce() -> T,
+    enable: impl FnOnce() -> io::Result<()>,
+) -> io::Result<T> {
+    let value = before_input();
+    enable()?;
+    Ok(value)
 }
 
 /// The rest of [`enter`] once `try_init` succeeded: `enable` turns on mouse
 /// reporting and bracketed paste. If it fails, `undo` restores the terminal and
 /// `original` becomes the panic hook again (dropping ratatui's); otherwise the
 /// thread-aware hook replaces ratatui's. Until then ratatui's hook is in place,
-/// and nothing in between can panic.
+/// which restores the terminal too (only without the care for a hung-up tty);
+/// the start-up step that runs in between does not panic.
 fn finish_enter(
     original: PanicHook,
     enable: impl FnOnce() -> io::Result<()>,
@@ -153,17 +323,27 @@ fn finish_enter(
     Ok(())
 }
 
-/// Restores the terminal: turns off mouse reporting and bracketed paste, then
+/// Restores the terminal: deletes the Kitty pictures if any were built
+/// ([`next_kitty_id`]), turns off mouse reporting and bracketed paste, then
 /// raw mode and the alternate screen (`ratatui::try_restore`), then shows the
 /// cursor. Every error is ignored and nothing is printed, so this never panics,
 /// even on a hung-up tty. Only the first call after [`enter`] does anything, so
 /// every exit path may call it.
 pub fn leave() {
     leave_once(&ACTIVE, || {
-        let _ = execute!(stdout(), DisableClickMouse, DisableBracketedPaste);
+        write_teardown(&mut stdout(), KITTY_IDS.cleanup());
         let _ = ratatui::try_restore();
         let _ = execute!(stdout(), Show);
     });
+}
+
+/// What [`leave`] writes while still on the alternate screen: `kitty` (the pictures'
+/// deletion) first, then mouse reporting and bracketed paste off. Errors are ignored.
+fn write_teardown(out: &mut impl io::Write, kitty: Option<DeleteKittyImages>) {
+    if let Some(delete) = kitty {
+        let _ = execute!(out, delete);
+    }
+    let _ = execute!(out, DisableClickMouse, DisableBracketedPaste);
 }
 
 /// Calls [`leave`] when dropped. Bind it to a named variable for the lifetime of
@@ -329,7 +509,7 @@ fn is_ui_thread(name: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
 
     fn ansi(command: impl Command) -> String {
         let mut out = String::new();
@@ -371,6 +551,89 @@ mod tests {
             String::from_utf8(teardown).unwrap(),
             "\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?2004l"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kitty_pictures_are_deleted_by_id_first_and_only_after_kitty_drew() {
+        let delete = |ids: &[u32], tmux| {
+            ansi(DeleteKittyImages {
+                ids: ids.to_vec(),
+                tmux,
+            })
+        };
+        // Uppercase I also frees the data; one command per picture, as virtual
+        // placements are deleted only by id.
+        assert_eq!(
+            delete(&[7, 4_000_000_000], false),
+            "\x1b_Ga=d,d=I,i=7\x1b\\\x1b_Ga=d,d=I,i=4000000000\x1b\\"
+        );
+        assert_eq!(
+            delete(&[7], true),
+            "\x1bPtmux;\x1b\x1b_Ga=d,d=I,i=7\x1b\x1b\\\x1b\\"
+        );
+        let teardown = |kitty| {
+            let mut out = Vec::new();
+            write_teardown(&mut out, kitty);
+            String::from_utf8(out).unwrap()
+        };
+        assert_eq!(
+            teardown(Some(DeleteKittyImages {
+                ids: vec![9],
+                tmux: false
+            })),
+            "\x1b_Ga=d,d=I,i=9\x1b\\\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?2004l"
+        );
+        assert_eq!(
+            teardown(None),
+            "\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?2004l"
+        );
+
+        let ids = KittyIds::starting_at(40);
+        assert_eq!(ids.cleanup(), None, "no kitty picture was drawn");
+        let sent = [ids.next(true), ids.next(false), ids.next(false)];
+        assert_eq!(sent, [40, 41, 42]);
+        assert_eq!(
+            ids.cleanup(),
+            Some(DeleteKittyImages {
+                ids: sent.to_vec(),
+                tmux: false
+            }),
+            "every id sent, the last way it went"
+        );
+        assert_eq!(ids.cleanup(), None, "cleaned up once");
+    }
+
+    #[test]
+    fn kitty_ids_are_nonzero_unique_and_start_from_the_process_id() {
+        // Two sessions in one terminal start far apart, so their ids do not collide.
+        let bases: Vec<u32> = [1, 2, 999, 1000, 1001, 65_535, 4_194_304, u32::MAX]
+            .into_iter()
+            .map(kitty_base)
+            .collect();
+        for (i, &a) in bases.iter().enumerate() {
+            assert!((1..=KITTY_ID_SPAN).contains(&a), "{a}");
+            for &b in &bases[i + 1..] {
+                assert!(a.abs_diff(b) > 1 << 16, "{a} and {b} are too close");
+            }
+        }
+        // The highest base still gives nonzero ids that do not wrap around.
+        let ids = KittyIds::starting_at(KITTY_ID_SPAN);
+        let sent: Vec<u32> = (0..3).map(|_| ids.next(false)).collect();
+        assert_eq!(sent, [KITTY_ID_SPAN, KITTY_ID_SPAN + 1, KITTY_ID_SPAN + 2]);
+
+        // The session's ids start from its process id's base, and each is new.
+        let first = next_kitty_id(false);
+        let second = next_kitty_id(false);
+        assert_ne!(first, 0);
+        assert!(second > first);
+        let base = kitty_base(std::process::id());
+        assert!(
+            first >= base && first - base < KITTY_ID_SPAN,
+            "{first} from {base}"
+        );
+        let recorded = recorded_kitty_ids();
+        assert!(recorded.contains(&first) && recorded.contains(&second));
     }
 
     #[test]
@@ -438,6 +701,28 @@ mod tests {
         panic::set_hook(found);
         assert!(failed_enable_restores, "original hook put back");
         assert!(success_installs_thread_hook, "thread-aware hook installed");
+    }
+
+    #[test]
+    fn the_query_runs_before_mouse_and_paste_are_enabled() {
+        // `enter` calls this once raw mode and the alternate screen are on (the pty
+        // smoke test checks the query comes after ?1049h on the wire).
+        let steps = RefCell::new(Vec::new());
+        let value = query_then_enable(
+            || {
+                steps.borrow_mut().push("query");
+                7
+            },
+            || {
+                steps.borrow_mut().push("enable");
+                Ok(())
+            },
+        );
+        assert_eq!(value.unwrap(), 7);
+        assert_eq!(*steps.borrow(), ["query", "enable"]);
+
+        let failed = query_then_enable(|| 7, || Err(io::Error::other("no mouse")));
+        assert_eq!(failed.unwrap_err().to_string(), "no mouse");
     }
 
     #[test]

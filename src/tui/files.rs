@@ -49,15 +49,7 @@ pub fn resolve_path(raw: &str, ext: &str, home: Option<&Path>) -> Result<PathBuf
         return Err(format!("{raw} is a folder; add a file name"));
     }
 
-    let mut path = match raw.strip_prefix('~') {
-        Some(rest) if rest.starts_with(is_separator) => {
-            let home = home
-                .filter(|home| !home.as_os_str().is_empty())
-                .ok_or_else(|| format!("cannot expand ~ in {raw}: HOME is not set"))?;
-            home.join(rest.trim_start_matches(is_separator))
-        }
-        _ => PathBuf::from(raw),
-    };
+    let mut path = expand_tilde(raw, home)?;
 
     let ext = ext.trim_start_matches('.');
     let has_ext = Path::new(name)
@@ -72,6 +64,26 @@ pub fn resolve_path(raw: &str, ext: &str, home: Option<&Path>) -> Result<PathBuf
         path.push(ext);
     }
     Ok(path)
+}
+
+/// `raw` with a leading `~` followed by a path separator replaced by `home`, as
+/// [`resolve_path`] does; `~name` and a `~` later in the path are left alone. Relative
+/// paths stay relative to the working directory.
+///
+/// # Errors
+///
+/// A message for the status line when `raw` starts with `~/` while `home` is `None` or
+/// empty.
+pub fn expand_tilde(raw: &str, home: Option<&Path>) -> Result<PathBuf, String> {
+    match raw.strip_prefix('~') {
+        Some(rest) if rest.starts_with(is_separator) => {
+            let home = home
+                .filter(|home| !home.as_os_str().is_empty())
+                .ok_or_else(|| format!("cannot expand ~ in {raw}: HOME is not set"))?;
+            Ok(home.join(rest.trim_start_matches(is_separator)))
+        }
+        _ => Ok(PathBuf::from(raw)),
+    }
 }
 
 /// Why [`write_file`] did not write.
@@ -181,7 +193,7 @@ fn sync_parent(path: &Path) {
 }
 
 /// A short, user-facing reason for a failed file operation.
-fn describe(err: &io::Error) -> String {
+pub fn describe(err: &io::Error) -> String {
     match err.kind() {
         ErrorKind::NotFound => "folder does not exist".to_string(),
         ErrorKind::PermissionDenied => "permission denied".to_string(),

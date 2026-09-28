@@ -1,0 +1,26 @@
+---
+source: src/tui/board.rs
+expression: "pixels(buf, area, pal.dark)"
+---
+|                     |
+|                     |
+|                     |
+|     ++++++          |
+|     +###+#++        |
+|     ++++o++#++      |
+|    +#+oooooo+#+     |
+|    ++++oooooo+#+    |
+|   +#++oooooooo++    |
+|   ++ooooo++oooo++   |
+|  +#oooooo++oooo++   |
+|  ++ooooo+#ooooo+#   |
+|  #++oo+++#oooooo#+  |
+|  #++++#+++oooooo++  |
+|  ++###+++ooooooo++  |
+|  +++#++#+ooooooo++  |
+|      +#+oooooooo++  |
+|      ++ooooooooo++  |
+|      #++++++++++#+  |
+|      +++++++++++++  |
+|                     |
+|                     |

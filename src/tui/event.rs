@@ -136,6 +136,7 @@ mod tests {
             generation,
             hash: 0,
             outcome: EngineOutcome::GameOver,
+            exchange: None,
         }
     }
 

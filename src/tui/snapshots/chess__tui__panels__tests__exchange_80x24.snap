@@ -1,0 +1,28 @@
+---
+source: src/tui/panels.rs
+expression: h.terminal.backend()
+---
+"┌ Jev exchange ──────────────────────────────────────────────────── 1-20 of 50 ┐"
+"│ exchange 2 of 2 · move 1 · c5 · Jev · HTTP 200 · 2 attempts · 1234 ms        │"
+"│                                                                              │"
+"│ REQUEST                                                                      │"
+"│ POST https://api.typesafe.ai/v1/systemone                                    │"
+"│ Authorization: Bearer <redacted>                                             │"
+"│ Content-Type: application/json                                               │"
+"│                                                                              │"
+"│ {                                                                            │"
+"│   "model": "jev-test",                                                       │"
+"│   "questions": {                                                             │"
+"│     "move": {                                                                │"
+"│       "criteria": {                                                          │"
+"│         "d4": {                                                              │"
+"│           "assessment": "good",                                              │"
+"│           "effect": "takes the centre"                                       │"
+"│         },                                                                   │"
+"│         "e4": {                                                              │"
+"│           "assessment": "good",                                              │"
+"│           "effect": "opens the bishop's diagonal"                            │"
+"│         }                                                                    │"
+"│       },                                                                     │"
+"│       "type": "choice"                                                       │"
+"└ ↑↓ PgUp PgDn Home End · ←→ older/newer · Esc closes ─────────────────────────┘"

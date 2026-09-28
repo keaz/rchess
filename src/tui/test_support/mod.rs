@@ -17,6 +17,7 @@
 pub(crate) mod engine;
 pub(crate) mod harness;
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -68,6 +69,24 @@ pub(crate) fn chord_event(code: KeyCode, modifiers: KeyModifiers) -> Event {
     Event::Key(KeyEvent::new(code, modifiers))
 }
 
+/// The key presses crossterm makes of Kitty's answer to the graphics probe,
+/// `ESC _ G i=31;OK ESC \`, when it arrives after the query gave up waiting: Alt+`_`,
+/// the characters in between (upper case with Shift), then Alt+`\`. The other answers
+/// never become key presses (crossterm keeps them to itself or drops them).
+pub(crate) fn late_kitty_answer() -> Vec<Event> {
+    let mut keys = vec![chord_event(KeyCode::Char('_'), KeyModifiers::ALT)];
+    keys.extend("Gi=31;OK".chars().map(|c| {
+        let modifiers = if c.is_uppercase() {
+            KeyModifiers::SHIFT
+        } else {
+            KeyModifiers::NONE
+        };
+        chord_event(KeyCode::Char(c), modifiers)
+    }));
+    keys.push(chord_event(KeyCode::Char('\\'), KeyModifiers::ALT));
+    keys
+}
+
 /// A mouse event at cell (`column`, `row`), as the terminal reports it.
 pub(crate) fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> Event {
     Event::Mouse(MouseEvent {
@@ -98,6 +117,18 @@ pub(crate) fn buffer_text(buffer: &Buffer) -> String {
         text.push('\n');
     }
     text
+}
+
+// ----- environment -----
+
+/// An environment variable reader over `pairs` only, for the functions that take
+/// `get` in place of `std::env::var`.
+pub(crate) fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+    let map: HashMap<String, String> = pairs
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect();
+    move |key| map.get(key).cloned()
 }
 
 // ----- files -----
