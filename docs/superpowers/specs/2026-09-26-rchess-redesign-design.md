@@ -628,7 +628,7 @@ what is sent to Jev. Sections 6.x still hold except where this section changes t
   ["crossterm"] }` (MIT; built on ratatui `^0.30.1`; the default `chafa-dyn` feature would need
   libchafa, so default features stay off) and `image = { version = "0.25", default-features = false,
   features = ["png"] }` for decoding and compositing, and `rustix = { version = "1", features =
-  ["event"] }` (already in the tree through crossterm) for `poll` on stdin during the graphics query
+  ["event", "fs"] }` (`fs` added by section 10.5 for `O_NOFOLLOW`) (already in the tree through crossterm) for `poll` on stdin during the graphics query
   (9.3). Nothing else.
 - Piece art: the Cburnett set (Colin M.L. Burnett, Wikimedia Commons `Chess_{k,q,r,b,n,p}{l,d}t45.svg`),
   used under its BSD licence (it is also offered under GPL and GFDL). The licence is confirmed from
@@ -809,7 +809,8 @@ except where this section changes them.
 - Redaction: the response body is parsed as received; the key is redacted only in what is recorded
   (the exchange, error text, notes), so the untraced path is unchanged. A non-JSON body whose
   decoded form (JSON string escapes such as `\uXXXX` and `\/` resolved) contains the key is recorded
-  as `<redacted: the body contained the API key>`.
+  as `<redacted: the body contained the API key>`; a key that appears plainly or as `\/` is still
+  replaced in place, and the whole body is withheld only when the key survives that replacement.
 - Tests: the failed-connection test connects to a port that is never listened on (`127.0.0.1:1`)
   instead of a freed ephemeral port; the private `Attempt` is renamed `RawAttempt`.
 - Docs: the public path of the endpoint constant is `chess::engine::JEV_ENDPOINT` everywhere it is
@@ -825,8 +826,11 @@ except where this section changes them.
   hangup path within about 1 s instead of spinning.
 - Graphics query: answers still owed after a deadline, a split answer, or a quit signal during the
   query are drained (read and discarded with `poll`, at most 200 ms) before input handling starts or
-  before exit, so they never become key presses or reach the shell. WezTerm and Konsole get the
-  device-attributes request so their answers end in an event crossterm reports. When the
+  before exit, so they never become key presses or reach the shell. Every start-up query ends with a
+  device-attributes request after the status request (for WezTerm and Konsole it is the only
+  attributes request); its answer is read and dropped after the status report, or, when the answers
+  come late, reaches crossterm last as an event, so a late answer never leaves crossterm's read
+  waiting for a key. A terminal that does not answer it adds up to 200 ms to start-up. When the
   environment names iTerm2 or WezTerm, the iTerm2 protocol wins over a Sixel answer. Without any
   font size a detected Kitty or Sixel answer falls back to half-blocks (recorded here as intended:
   pictures encoded at a guessed size spill into neighbouring squares). Non-unix builds skip the
@@ -859,17 +863,20 @@ except where this section changes them.
 
 - Saving without overwrite links the finished temp file into place (`hard_link`, which fails if the
   name exists) and falls back to the existing check-then-rename only where hard links are not
-  supported; saving over a symlink writes to the link's target.
+  supported (reported as `Unsupported`, or `PermissionDenied` as Linux does for FAT); saving over a symlink writes to the link's target.
 - Debug log: a path that is a symbolic link or has more than one hard link is refused ("debug log
-  disabled: <path> is a link"); a log whose last byte is not a newline gets one before the next
+  disabled: <path> is a link"), and the file is opened with `O_NOFOLLOW` so a link planted after the
+  check is refused too; a log whose last byte is not a newline gets one before the next
   record; the record channel holds at most 64 records (a full channel drops the record and shows one
   warning); response bodies are pre-rendered only for the exchange on screen (cached per exchange
   and width); a reply held while watch mode is paused is recorded in the history and the log when it
-  arrives (marked held), so quitting never loses it.
+  arrives (marked held), so quitting never loses it; the `stale` field of a held record is its state
+  on arrival (a later outcome updates only the in-memory history).
 - Exchange view: switching exchanges or opening the view keeps the last known page size, so End,
   PgDn and ↓ in the same input batch work.
-- Environment: non-UTF-8 values of `RCHESS_GLYPHS`, `RCHESS_DEBUG_LOG`, `XDG_STATE_HOME` and `HOME`
-  give a menu warning; a relative `HOME` or `XDG_STATE_HOME` is ignored for the log path;
+- Environment: non-UTF-8 values of `RCHESS_GLYPHS`, `RCHESS_IMAGES` and `NO_COLOR` give a menu
+  warning, and so do `RCHESS_DEBUG_LOG`, `XDG_STATE_HOME` and `HOME` in debug mode (the only mode
+  that reads them); a relative `HOME` or `XDG_STATE_HOME` is ignored for the log path;
   `RCHESS_IMAGES` treats `off`, `0`, `false` and `no` (any case) as off, `on`, `1`, `true` and `yes`
   as on, and warns on other values.
 
@@ -889,14 +896,18 @@ except where this section changes them.
 - The PGN `Date` is the UTC date (a local date needs a timezone dependency).
 - Saving and picture encoding run on the UI thread (about 0.1-0.2 s for a large Sixel board).
 - Half-block pictures are written in 24-bit colour even on the 256-colour palette (ratatui-image).
-- Keys typed while waiting for a terminal that answers more than 1 s late are lost.
+- Keys typed while waiting for a terminal that answers more than 1 s late are lost, and so are keys
+  typed during the start-up drain or before the trailing device-attributes answer.
+- No CI job builds for a non-unix target; the non-unix graphics path is checked by reading only.
 - Historical plan documents are not rewritten.
 
 ### 10.8 CI
 
 `.github/workflows/rust.yml` (push and pull request on `main`, Ubuntu): `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, `cargo test`, then `cargo build` and
-`python3 tests/pty_smoke.py --no-build`, all with `JEV_API_KEY` and `TYPESAFE_API_KEY` unset. Timing
+`python3 tests/pty_smoke.py --no-build`, all with `JEV_API_KEY` and `TYPESAFE_API_KEY` unset. The Rust
+toolchain is pinned in the workflow (bumped deliberately), so a new clippy lint cannot turn CI red
+without a code change. Timing
 checks in the smoke test get margins that hold on a shared runner.
 
 ### 10.9 Done criteria
