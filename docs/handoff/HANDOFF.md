@@ -142,6 +142,7 @@ Minor findings from the final review, deferred; none blocks the merge.
 - src/tui/glyphs.rs:508: `shorten` may cut inside a ZWJ emoji sequence (it keeps combining marks, not zero-width joiners).
 - src/tui/debug.rs:907: the newline check on an existing debug log re-opens the log by name (`ends_with_newline`) instead of reading through the opened, link-checked file.
 - src/tui/debug.rs:917: a FIFO at the debug log path blocks the `debug-log` thread in `open` until a reader appears (quitting still ends after `LOG_GRACE`).
+- src/tui/terminal.rs:1384 the test `a_closed_terminal_is_reported_once` uses the unix-only `HANGUP_LOOK` without `#[cfg(unix)]`, so the tests would not compile for a non-unix target (no CI job builds one; gate the test or drop the cfg on the constant).
 
 ## Open questions for user
 - None.
