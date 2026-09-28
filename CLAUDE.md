@@ -88,7 +88,8 @@ is tracked in `docs/handoff/HANDOFF.md` (the protocol is spec section 8).
 - `mod.rs`: `run`: command line (`--glyphs`, `--debug`, `--help`, `--version`), environment
   warnings for the menu, terminal set-up, the graphics query, the main loop.
 - `app.rs`: the state machine. `App::handle` takes `AppEvent`s and returns `Action`s (start the
-  engine, measure the font); it never blocks or spawns threads. Screens are Menu, Playing and
+  engine, measure the font); it never spawns threads, and saving a file (written and fsynced
+  in place) is the only blocking work it does. Screens are Menu, Playing and
   GameOver with a dialog stack on top.
 - `panels.rs`: draws every screen from `App`'s accessors and returns the `HitMap` for the next
   mouse event. `board.rs`: board layout, drawing, hit-testing, and `PieceImages`, the encoded
@@ -151,12 +152,14 @@ terminal, so anything written to it would corrupt the screen.
 
 ## CI
 
-`.github/workflows/rust.yml` runs on pushes and pull requests to `main` (ubuntu-latest, Rust 1.98
-with rustfmt and clippy, cached): `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
-`cargo test`, `cargo build`, then `python3 tests/pty_smoke.py --no-build`, each with
-`JEV_API_KEY` and `TYPESAFE_API_KEY` unset. It uses no secrets. Run the same commands locally
-before pushing. The toolchain is pinned so that a new clippy lint cannot turn CI red on its own;
-bumping it is a deliberate change that fixes whatever the new version finds.
+`.github/workflows/rust.yml` runs on pushes and pull requests to `main`, and by hand
+(`workflow_dispatch`). A matrix of `ubuntu-latest` and `macos-latest` (Rust 1.98.1 with rustfmt
+and clippy, cached) runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+`cargo build` and `cargo test`, each with `JEV_API_KEY` and `TYPESAFE_API_KEY` unset. It uses no
+secrets. `tests/pty_smoke.py` is not part of CI: run it locally (see Commands) before pushing a
+change to the terminal, signal or graphics code, together with the commands CI runs. The
+toolchain is pinned exactly so that a new clippy lint cannot turn CI red on its own; bumping it
+is a deliberate change that fixes whatever the new version finds.
 
 ## graphify
 

@@ -6,8 +6,8 @@ Read this first. Follow the protocol in section 8 of
 ## Current
 Sub-project: cleanup (spec section 10) | Plan: docs/superpowers/plans/2026-09-28-cleanup.md
 Branch: chore/cleanup (all 7 tasks done). main has feat/tui-polish merged locally at f18dd32, not pushed.
-Last completed task: 7 (CI and docs)
-Next task: user reviews chore/cleanup and merges it into main; the first push of main runs the new CI workflow on GitHub
+Last completed task: 7 (CI and docs), then the final fix wave
+Next task: push `chore/cleanup` (and `main`) and open a PR from `chore/cleanup` to main, so the new workflow runs on the PR (Linux and macOS); merge only when it is green. Pushing `main` alone first would run the workflow on the legacy code of main, not on this branch.
 State: green (`cargo test` fully green, fmt and clippy `-D warnings` clean, pty smoke green)
 
 ## Verify before continuing
@@ -120,8 +120,9 @@ Run `cargo run` in a real terminal (Ghostty, Kitty, WezTerm or Alacritty) and ch
 - cleanup rulings: saving without overwrite hard-links the temp file into place and falls back to check-then-rename only when the file system reports hard links as `Unsupported` or, as Linux does for FAT, `PermissionDenied` (EPERM).
 - cleanup rulings: the debug log is opened with `O_NOFOLLOW` (rustix's `fs` feature, the only dependency change of the sub-project), so a symbolic link planted after the link check is refused ("is a link") without its target being opened or created; `ELOOP` maps to that refusal.
 - cleanup rulings: a reply held while Jev vs Jev is paused is logged on arrival, so its log line's `stale` is its state then (`held: true`); whether it was later played or dropped changes only the in-memory history.
-- cleanup rulings: CI pins the Rust toolchain (1.98); bumping it is a deliberate change that fixes whatever the new clippy finds.
-- cleanup task 7: CI (`.github/workflows/rust.yml`) runs fmt, clippy `-D warnings` on all targets, `cargo test`, `cargo build` and `tests/pty_smoke.py --no-build` on ubuntu-latest with the Rust toolchain pinned to 1.98 (`dtolnay/rust-toolchain@1.98`; bump it deliberately, so a new clippy lint cannot turn CI red without a code change), each command under `env -u JEV_API_KEY -u TYPESAFE_API_KEY` and with no secret. The pty smoke test's timing bounds each sit below a fixed wait the bug they catch would fall into (the query's 1 s deadline, the 1 s stuck-UI grace); the signal and hangup checks during the graphics query are now timed from when the query was seen, waits for something that must happen got seconds, and the busy-hangup scenario uses a 250x800 window plus 20 resizes so its frames overflow a Linux pty buffer too, and on Linux checks through `/proc/<pid>/syscall` that the UI really is blocked in a write before the hangup. The split-answer and signal-with-answers scenarios skip their timing checks with a NOTE when the harness itself saw the query or acted too late for them to mean anything. There is no setting to scale the bounds. The pty smoke test has not yet run on Linux: the first CI run is its first Linux run.
+- cleanup rulings: CI pins the Rust toolchain exactly (1.98.1); bumping it is a deliberate change that fixes whatever the new clippy finds.
+- cleanup task 7: CI (`.github/workflows/rust.yml`) runs fmt, clippy `-D warnings` on all targets, `cargo test`, `cargo build` and `tests/pty_smoke.py --no-build` on ubuntu-latest with the Rust toolchain pinned to 1.98 (`dtolnay/rust-toolchain@1.98`; bump it deliberately, so a new clippy lint cannot turn CI red without a code change), each command under `env -u JEV_API_KEY -u TYPESAFE_API_KEY` and with no secret. The pty smoke test's timing bounds each sit below a fixed wait the bug they catch would fall into (the query's 1 s deadline, the 1 s stuck-UI grace); the signal and hangup checks during the graphics query are now timed from when the query was seen, waits for something that must happen got seconds, and the busy-hangup scenario uses a 250x800 window plus 20 resizes so its frames overflow a Linux pty buffer too, and on Linux checks through `/proc/<pid>/syscall` that the UI really is blocked in a write before the hangup. The split-answer and signal-with-answers scenarios skip their timing checks with a NOTE when the harness itself saw the query or acted too late for them to mean anything. There is no setting to scale the bounds. (Superseded by the final fix wave: CI no longer runs the pty smoke test, see below.)
+- cleanup final fix wave: CI is a matrix of ubuntu-latest and macos-latest running `cargo fmt --check`, clippy `-D warnings` on all targets, `cargo build` and `cargo test`, with the toolchain pinned to `dtolnay/rust-toolchain@1.98.1` and a `workflow_dispatch` trigger; the pty smoke test is a local check only (CLAUDE.md, Commands). The user has built and run the branch on Ubuntu without errors. A UI that fails with an error on a terminal that closed without SIGHUP now ends by SIGHUP when stdin looks closed (`signal_after_error` in src/tui/mod.rs), instead of exiting with status 1 when the "hangup" thread's next look comes just after the 100 ms signal grace. The menu never shows "+0 more warnings": when no warning is among the notes that do not fit, there is no count.
 
 ## Known open issues
 Limits kept on purpose (spec 10.7):
@@ -132,10 +133,21 @@ Limits kept on purpose (spec 10.7):
 - No CI job builds for a non-unix target; the non-unix graphics path (the query skipped without a warning) is checked by reading only.
 - Historical plan documents are not rewritten: the engine plan still uses the old "undefended against capture" wording and mentions `JEV_BASE_URL`.
 
+### Follow-ups (not spec limits)
+Minor findings from the final review, deferred; none blocks the merge.
+- src/engine/player.rs:124: `redacted()` redacts the key but does not apply `printable()` (src/engine/jev.rs:241), so the "Jev unavailable" note built from another chooser's error (line 191) could carry control characters or run long.
+- src/tui/graphics.rs:319: the tail of a Kitty answer split by the query deadline that arrives more than 200 ms (`DRAIN_TIME`) late is not drained and can reach the event loop.
+- src/tui/terminal.rs:679: macOS reports POLLNVAL on a stdin redirected from `/dev/tty` (`< /dev/tty`), which `look` takes as a closed terminal, so the "hangup" thread ends such a session.
+- src/tui/graphics.rs:340: the drain (200 ms) plus the device-attributes read (up to another 200 ms) after a late query can delay a quit by about 450 ms.
+- src/tui/glyphs.rs:508: `shorten` may cut inside a ZWJ emoji sequence (it keeps combining marks, not zero-width joiners).
+- src/tui/debug.rs:907: the newline check on an existing debug log re-opens the log by name (`ends_with_newline`) instead of reading through the opened, link-checked file.
+- src/tui/debug.rs:917: a FIFO at the debug log path blocks the `debug-log` thread in `open` until a reader appears (quitting still ends after `LOG_GRACE`).
+
 ## Open questions for user
 - None.
 
 ## Log (newest first)
+- 2026-09-28 cleanup final fix wave: CI matrix on Linux and macOS with an exact toolchain pin and a manual trigger (pty smoke local only), an error on a closed terminal ends by SIGHUP, no "+0 more warnings", HANDOFF follow-ups, CLAUDE.md fixes, stronger fallback and picture-cache tests
 - 2026-09-28 cleanup task 7 done: CI workflow (fmt, clippy -D warnings, test, build, pty smoke), CLAUDE.md rewritten for core/engine/tui, HANDOFF open issues cut to the spec 10.7 limits, pty smoke timing margins for CI; cleanup complete, awaiting the user's review and merge
 - 2026-09-28 cleanup task 6 done: Test quality and the pty hangup helper
 - 2026-09-28 cleanup task 5 done: Saving and the debug log
