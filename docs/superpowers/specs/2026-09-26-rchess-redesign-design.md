@@ -166,7 +166,7 @@ examples/jev_eval.rs   evaluation harness (section 5.8)
 ```rust
 pub struct EngineConfig {
     // api_key, model, max_options, filter_losing, timeout, veto_margin_cp, warnings
-    // (no URL: the endpoint is the fixed jev::JEV_ENDPOINT)
+    // (no URL: the endpoint is the fixed chess::engine::JEV_ENDPOINT)
 }
 impl EngineConfig {
     pub fn from_env() -> EngineConfig;                                  // never fails
