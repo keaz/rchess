@@ -4,10 +4,10 @@ Read this first. Follow the protocol in section 8 of
 `docs/superpowers/specs/2026-09-26-rchess-redesign-design.md`.
 
 ## Current
-Sub-project: tui-polish | Plan: docs/superpowers/plans/2026-09-27-tui-polish.md
-Branch: feat/tui-polish (all 8 tasks done; final whole-branch review fixed and re-reviewed; ready for the user's manual test and merge)
-Last completed task: tui-polish final whole-branch review fix wave (re-reviewed: all four findings addressed)
-Next task: the user runs the manual test below (spec 9.6) and merges feat/tui-polish; then plan the cleanup sub-project (spec section 7 step 5)
+Sub-project: cleanup (not started) | Plan: to be written from spec section 7 step 5
+Branch: main (feat/tui-polish merged locally at f18dd32; feat/tui at 575c3f6; not pushed — main is ahead of origin/main)
+Last completed task: tui-polish sub-project merged (all 8 tasks, final review fixed and re-reviewed)
+Next task: the user's manual test of tui-polish in a real terminal (below) if not yet done; then plan the cleanup sub-project (spec section 7 step 5)
 State: green (except 3 pre-existing old-code test failures)
 
 ## Verify before continuing
@@ -208,6 +208,7 @@ Copied from the git-ignored SDD ledger (.superpowers/sdd/2026-09-27-tui-polish/p
 - None.
 
 ## Log (newest first)
+- 2026-09-28 feat/tui-polish merged into main locally (f18dd32); merged result verified: tui:: 451, engine:: 112, whole crate only the 3 known old-code failures, pty smoke green
 - 2026-09-28 tui-polish complete: tasks 1-8 applied and reviewed, final five-lens review fixed (Kitty font zoom, dev-profile Sixel crates, handoff minors) and re-reviewed; awaiting the user's manual test and merge
 - 2026-09-28 tui-polish final fix wave: Kitty pictures follow a font zoom (spec 9.3 corrected); dev profile optimises `quantette`, `base64-simd` and `vsimd`; deferred review minors copied into this file
 - 2026-09-28 tui-polish task 8 fix round 1: Kitty pictures built with session ids and deleted by id (`a=d,d=I,i=<id>`) on every restore path; the task 8 note now discloses the `report_log_failure` conflict; `tui::` 450 passed, `engine::` 112 passed
