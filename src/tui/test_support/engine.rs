@@ -77,6 +77,28 @@ pub(crate) fn jev_move(pos: &ChessPosition, uci: &str) -> ComputerMove {
     }
 }
 
+/// The note a player without a Jev key puts on its moves.
+pub(crate) const LOCAL_NOTE: &str = "JEV_API_KEY not set — local search";
+
+/// `uci` played in `pos` as a player without a Jev key reports it: the local search's
+/// move, with none of Jev's details (runners-up, confidence, model, tokens) and 1234 ms
+/// latency, so screens that show it are deterministic.
+pub(crate) fn local_move(pos: &ChessPosition, uci: &str) -> ComputerMove {
+    let mv = pos.parse_uci(uci).expect("scripted move is legal");
+    ComputerMove {
+        mv,
+        san: pos.to_san(mv),
+        source: MoveSource::Fallback,
+        top: Vec::new(),
+        confidence: None,
+        model: None,
+        latency: Duration::from_millis(1234),
+        input_tokens: None,
+        note: Some(LOCAL_NOTE.to_string()),
+        exchange: None,
+    }
+}
+
 /// An API key no recorded exchange, screen or log line may ever contain.
 pub(crate) const SENTINEL_KEY: &str = "sk-sentinel-7f3a9c";
 
@@ -141,7 +163,8 @@ pub(crate) fn traced_jev_move(pos: &ChessPosition, uci: &str) -> ComputerMove {
 
 /// What a [`FakeEngine`] does with one request.
 pub(crate) enum Turn {
-    /// Plays this UCI move, reported as [`jev_move`] reports it.
+    /// Plays this UCI move, reported as [`jev_move`] reports it ([`local_move`] for
+    /// [`FakeEngine::local`]).
     Play(&'static str),
     /// Finds no move, as for a finished game.
     GameOver,
@@ -153,15 +176,17 @@ pub(crate) enum Turn {
     PanicOther,
     /// Sleeps this long, then panics with a `&str` payload.
     SlowPanic(Duration),
-    /// Plays this UCI move with [`jev_exchange`] recorded ([`traced_jev_move`]).
+    /// Plays this UCI move with [`jev_exchange`] recorded ([`traced_jev_move`]); for
+    /// [`FakeEngine::local`], which asks Jev nothing, as [`Turn::Play`].
     Traced(&'static str),
 }
 
 /// A scripted engine that never touches the network.
 ///
 /// Each request takes the next scripted [`Turn`]. Once the script is used up it plays the
-/// first legal move in UCI order, or finds none when the game is over. It records the name
-/// of every thread it ran on.
+/// first legal move in UCI order, or finds none when the game is over. Its moves look like
+/// Jev's ([`FakeEngine::jev`]) or like the local search's ([`FakeEngine::local`]). It records
+/// the name of every thread it ran on.
 pub(crate) struct FakeEngine {
     uses_jev: bool,
     warnings: Vec<String>,
@@ -175,7 +200,8 @@ impl FakeEngine {
         FakeEngine::new(true)
     }
 
-    /// A player without a Jev key: status [`LOCAL_SEARCH_STATUS`].
+    /// A player without a Jev key: status [`LOCAL_SEARCH_STATUS`], and moves reported as
+    /// the local search's ([`local_move`]).
     pub(crate) fn local() -> FakeEngine {
         FakeEngine::new(false)
     }
@@ -222,9 +248,17 @@ impl Engine for FakeEngine {
             .expect("threads lock")
             .push(thread::current().name().map(str::to_string));
         let turn = self.script.lock().expect("script lock").pop_front();
+        let computer_move = |uci: &str| {
+            if self.uses_jev {
+                jev_move(game.position(), uci)
+            } else {
+                local_move(game.position(), uci)
+            }
+        };
         match turn {
-            Some(Turn::Play(uci)) => Some(jev_move(game.position(), uci)),
-            Some(Turn::Traced(uci)) => Some(traced_jev_move(game.position(), uci)),
+            Some(Turn::Play(uci)) => Some(computer_move(uci)),
+            Some(Turn::Traced(uci)) if self.uses_jev => Some(traced_jev_move(game.position(), uci)),
+            Some(Turn::Traced(uci)) => Some(computer_move(uci)),
             Some(Turn::GameOver) => None,
             Some(Turn::Panic(message)) => panic::panic_any(message),
             Some(Turn::PanicString(message)) => panic::panic_any(message),
@@ -241,7 +275,7 @@ impl Engine for FakeEngine {
                 let mut moves: Vec<Move> = pos.legal_moves().iter().copied().collect();
                 moves.sort_by_key(|m| m.to_uci());
                 let first = moves.first()?.to_uci();
-                let mut computer = jev_move(pos, &first);
+                let mut computer = computer_move(&first);
                 computer.top.truncate(1);
                 Some(computer)
             }
@@ -262,5 +296,49 @@ impl Engine for FakeEngine {
 
     fn warnings(&self) -> Vec<String> {
         self.warnings.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::START_FEN;
+    use crate::tui::test_support::game_from;
+
+    #[test]
+    fn the_local_fake_reports_local_search_moves() {
+        let game = game_from(START_FEN, &[]);
+        let engine = FakeEngine::local().scripted([Turn::Play("e2e4"), Turn::Traced("d2d4")]);
+        for expected in ["e4", "d4", "a3"] {
+            let computer = engine.choose(&game).expect("a move");
+            assert_eq!(computer.san, expected);
+            assert_eq!(computer.source, MoveSource::Fallback, "{expected}");
+            assert!(computer.top.is_empty(), "{expected}");
+            assert_eq!(
+                (computer.confidence, computer.model, computer.input_tokens),
+                (None, None, None),
+                "{expected}"
+            );
+            assert_eq!(computer.note.as_deref(), Some(LOCAL_NOTE));
+            assert!(
+                computer.exchange.is_none(),
+                "a local player records no exchange"
+            );
+        }
+        assert!(!engine.uses_jev());
+        assert_eq!(engine.status(), LOCAL_SEARCH_STATUS);
+    }
+
+    #[test]
+    fn the_jev_fake_reports_jev_moves() {
+        let game = game_from(START_FEN, &[]);
+        let engine = FakeEngine::jev().scripted([Turn::Play("e2e4"), Turn::Traced("d2d4")]);
+        let played = engine.choose(&game).expect("a move");
+        assert_eq!(played, jev_move(game.position(), "e2e4"));
+        let traced = engine.choose(&game).expect("a move");
+        assert_eq!(traced, traced_jev_move(game.position(), "d2d4"));
+        let unscripted = engine.choose(&game).expect("a move");
+        assert_eq!((unscripted.san.as_str(), unscripted.top.len()), ("a3", 1));
+        assert_eq!(unscripted.source, MoveSource::Jev);
     }
 }

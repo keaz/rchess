@@ -1,0 +1,24 @@
+---
+source: src/tui/panels.rs
+expression: h.terminal.backend()
+---
+"┌ rchess ──────────────────────────────────────────────────┐"
+"│  New game                                                │"
+"│                                                          │"
+"│  > 1. Human vs Human                                     │"
+"│    2. Human vs Local search: play White                  │"
+"│    3. Human vs Local search: play Black                  │"
+"│    4. Human vs Local search: random side                 │"
+"│    5. Local search vs Local search (watch)               │"
+"│    6. Load FEN                                           │"
+"│    7. Quit                                               │"
+"│                                                          │"
+"│  Two players take turns at this keyboard.                │"
+"│                                                          │"
+"│  No JEV_API_KEY — local search                           │"
+"│  ! warning 1: something at start-up was not as expected  │"
+"│  ! warning 2: something at start-up was not as expected  │"
+"│  +4 more warnings                                        │"
+"│                                                          │"
+"│  arrows/jk choose · Enter/1-7 start · q quit             │"
+"└──────────────────────────────────────────────────────────┘"

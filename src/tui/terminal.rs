@@ -12,32 +12,58 @@
 //! how a hangup ends when the UI is idle: crossterm keeps polling a hung-up tty
 //! without ever returning an error.
 //!
+//! A terminal can also close without a SIGHUP reaching the program (it is not in the
+//! tty's session, or a supervisor keeps the signal from it). crossterm then spins on
+//! stdin, which is at end of file or fails with EIO. [`watch_hangup`] looks at stdin
+//! from a thread of its own and raises SIGHUP when it finds it closed, so that ends
+//! the same way.
+//!
 //! Nothing here may panic while restoring. After a hangup every write to the tty
 //! fails, and `eprintln!` panics on a failed write, so a restore that printed its
 //! error (as `ratatui::restore` and ratatui's panic hook do) would panic inside the
-//! panic hook and abort the process. [`leave`] ignores every error instead, and the
-//! panic hook calls the standard hook, not ratatui's.
+//! panic hook and abort the process. [`leave`] ignores every error instead, runs every
+//! step even when an earlier one failed, and the panic hook calls the standard hook,
+//! not ratatui's.
 
 use std::fmt;
 use std::io::{self, stdout};
 use std::panic;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::cursor::Show;
 use ratatui::crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
-#[cfg(unix)]
-use ratatui::crossterm::terminal::disable_raw_mode;
-use ratatui::crossterm::terminal::is_raw_mode_enabled;
+use ratatui::crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode, is_raw_mode_enabled};
 use ratatui::crossterm::{Command, execute};
 use ratatui_image::picker::cap_parser::Parser;
 
-/// True between a successful [`enter`] and the first [`leave`], which makes
-/// `leave` idempotent and a no-op when the terminal was never set up.
-static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Where the terminal is between [`enter`] and [`leave`]: [`ACTIVE`] after a
+/// successful `enter`, [`RESTORING`] while the first `leave` runs, [`DONE`] before
+/// `enter` and once that `leave` has finished. It makes `leave` run once, a no-op when
+/// the terminal was never set up, and makes a second caller wait for the first.
+static STATE: AtomicU8 = AtomicU8::new(DONE);
+
+/// [`STATE`]: set up, nothing restored yet.
+const ACTIVE: u8 = 1;
+/// [`STATE`]: a [`leave`] is restoring the terminal.
+const RESTORING: u8 = 2;
+/// [`STATE`]: nothing to restore (never set up, or restored).
+const DONE: u8 = 0;
+
+/// How long a [`leave`] waits for one already restoring on another thread before it
+/// returns anyway.
+const LEAVE_WAIT: Duration = Duration::from_secs(1);
+
+/// How often the "hangup" thread looks at stdin ([`watch_hangup`]).
+#[cfg(unix)]
+const HANGUP_LOOK: Duration = Duration::from_millis(100);
+
+/// How many looks in a row must find stdin at end of file before it counts as closed:
+/// one such look can also be crossterm reading the bytes between the two halves of it.
+const EOF_LOOKS: u32 = 3;
 
 /// The ids of the Kitty pictures this session built, which [`leave`] deletes.
 static KITTY_IDS: KittyIds = KittyIds::new();
@@ -135,15 +161,21 @@ impl Command for DeleteKittyImages {
 
 /// The image ids a session gives its Kitty pictures, and how the pictures reached
 /// the terminal. The ids are consecutive from a base derived from the process id
-/// ([`kitty_base`]), so two sessions in one terminal do not share one, and every id
-/// handed out is remembered (as a count), including those of pictures dropped since.
+/// ([`kitty_base`]), so two sessions in one terminal do not share one. Every id
+/// handed out is remembered (as a count), and so is how many of them were dropped
+/// (the cache drops every picture at once) and how many were deleted, so each picture
+/// is deleted once: before the next draw once dropped, or at exit while still shown.
 /// It takes no lock, so the panic hook and the signal thread can read it at any time.
 #[derive(Debug)]
 struct KittyIds {
     /// The first id, 0 until the first picture is built.
     base: AtomicU32,
-    /// How many ids were handed out since the last [`KittyIds::cleanup`].
+    /// How many ids were handed out.
     count: AtomicU32,
+    /// How many of the first ids handed out belong to pictures that were dropped.
+    dropped: AtomicU32,
+    /// How many of the first ids handed out were deleted (or are being deleted).
+    deleted: AtomicU32,
     /// The last picture went through tmux.
     tmux: AtomicBool,
 }
@@ -159,6 +191,8 @@ impl KittyIds {
         KittyIds {
             base: AtomicU32::new(base),
             count: AtomicU32::new(0),
+            dropped: AtomicU32::new(0),
+            deleted: AtomicU32::new(0),
             tmux: AtomicBool::new(false),
         }
     }
@@ -186,7 +220,7 @@ impl KittyIds {
     }
 
     /// A new id for a picture sent through tmux when `tmux`, remembered for
-    /// [`KittyIds::cleanup`].
+    /// [`KittyIds::write_dropped`] and [`KittyIds::cleanup`].
     fn next(&self, tmux: bool) -> u32 {
         let base = self.base();
         self.tmux.store(tmux, Ordering::SeqCst);
@@ -201,18 +235,52 @@ impl KittyIds {
         (0..count).map(|index| KittyIds::id(base, index)).collect()
     }
 
-    /// The command that deletes every picture handed an id, once; `None` when there
-    /// was none.
-    fn cleanup(&self) -> Option<DeleteKittyImages> {
-        let count = self.count.swap(0, Ordering::SeqCst);
-        if count == 0 {
+    /// Every picture handed an id so far was dropped (the picture cache was cleared).
+    fn drop_all(&self) {
+        self.dropped
+            .fetch_max(self.count.load(Ordering::SeqCst), Ordering::SeqCst);
+    }
+
+    /// The command that deletes the pictures from the `from`th id up to the `upto`th;
+    /// `None` when there is none.
+    fn delete_between(&self, from: u32, upto: u32) -> Option<DeleteKittyImages> {
+        if from >= upto {
             return None;
         }
         let base = self.base.load(Ordering::SeqCst);
         Some(DeleteKittyImages {
-            ids: (0..count).map(|index| KittyIds::id(base, index)).collect(),
+            ids: (from..upto)
+                .map(|index| KittyIds::id(base, index))
+                .collect(),
             tmux: self.tmux.load(Ordering::SeqCst),
         })
+    }
+
+    /// Writes the deletion of the pictures dropped since the last time to `out`, so
+    /// the terminal frees them before the next draw. They count as deleted only once
+    /// the write succeeded.
+    ///
+    /// # Errors
+    ///
+    /// When `out` fails; those pictures are then left for the next call or the exit.
+    fn write_dropped(&self, out: &mut impl io::Write) -> io::Result<()> {
+        let dropped = self.dropped.load(Ordering::SeqCst);
+        let from = self.deleted.load(Ordering::SeqCst);
+        if let Some(delete) = self.delete_between(from, dropped) {
+            execute!(out, delete)?;
+            self.deleted.fetch_max(dropped, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    /// The command that deletes every picture not deleted yet (those still shown, and
+    /// dropped ones [`KittyIds::write_dropped`] has not written), and counts them as
+    /// deleted, so it is given once; `None` when there is none. It is the last chance
+    /// (the exit), so they count as deleted whether or not the write then succeeds.
+    fn cleanup(&self) -> Option<DeleteKittyImages> {
+        let count = self.count.load(Ordering::SeqCst);
+        let from = self.deleted.fetch_max(count, Ordering::SeqCst);
+        self.delete_between(from, count)
     }
 }
 
@@ -231,9 +299,28 @@ fn kitty_base(pid: u32) -> u32 {
 
 /// A new image id for a Kitty picture (sent through tmux when `tmux`): nonzero,
 /// unique for the session, and deleted by [`leave`] before it leaves the alternate
-/// screen. Build every Kitty picture with one.
+/// screen, unless [`drop_kitty_pictures`] and [`delete_dropped_kitty_pictures`] deleted
+/// it before. Build every Kitty picture with one.
 pub fn next_kitty_id(tmux: bool) -> u32 {
     KITTY_IDS.next(tmux)
+}
+
+/// Every Kitty picture built so far ([`next_kitty_id`]) was dropped: the picture cache
+/// was cleared, and they are not drawn again. [`delete_dropped_kitty_pictures`] then
+/// deletes them.
+pub fn drop_kitty_pictures() {
+    KITTY_IDS.drop_all();
+}
+
+/// Writes to `out` the deletion of the Kitty pictures dropped since the last call
+/// ([`drop_kitty_pictures`]), so the terminal does not keep them in its image memory
+/// until the program ends. Call it before each draw.
+///
+/// # Errors
+///
+/// When writing to `out` fails; [`leave`] then deletes those pictures.
+pub fn delete_dropped_kitty_pictures(out: &mut impl io::Write) -> io::Result<()> {
+    KITTY_IDS.write_dropped(out)
 }
 
 /// Every Kitty image id handed out so far.
@@ -280,7 +367,7 @@ pub fn enter<T>(before_input: impl FnOnce() -> T) -> io::Result<(DefaultTerminal
             return Err(err);
         }
     };
-    ACTIVE.store(true, Ordering::SeqCst);
+    STATE.store(ACTIVE, Ordering::SeqCst);
     let value = query_then_enable(before_input, || {
         finish_enter(
             original,
@@ -323,27 +410,39 @@ fn finish_enter(
     Ok(())
 }
 
-/// Restores the terminal: deletes the Kitty pictures if any were built
-/// ([`next_kitty_id`]), turns off mouse reporting and bracketed paste, then
-/// raw mode and the alternate screen (`ratatui::try_restore`), then shows the
-/// cursor. Every error is ignored and nothing is printed, so this never panics,
-/// even on a hung-up tty. Only the first call after [`enter`] does anything, so
-/// every exit path may call it.
+/// Restores the terminal: deletes the Kitty pictures still in the
+/// terminal ([`next_kitty_id`]), turns off mouse reporting, bracketed paste and raw
+/// mode, leaves the alternate screen and shows the cursor. Every error is ignored and
+/// nothing is printed, so this never panics, even on a hung-up tty.
+///
+/// Only the first call after [`enter`] restores, so every exit path may call it. A
+/// call made while another thread restores (the panic hook, the signal thread) waits
+/// until that one has finished, so the process does not end halfway through the
+/// restore (it gives up after 1 s).
 pub fn leave() {
-    leave_once(&ACTIVE, || {
-        write_teardown(&mut stdout(), KITTY_IDS.cleanup());
-        let _ = ratatui::try_restore();
-        let _ = execute!(stdout(), Show);
+    leave_once(&STATE, LEAVE_WAIT, || {
+        restore(&mut stdout(), KITTY_IDS.cleanup(), disable_raw_mode);
     });
 }
 
-/// What [`leave`] writes while still on the alternate screen: `kitty` (the pictures'
-/// deletion) first, then mouse reporting and bracketed paste off. Errors are ignored.
-fn write_teardown(out: &mut impl io::Write, kitty: Option<DeleteKittyImages>) {
+/// The restore steps of [`leave`], each on its own so that a failed one does not stop
+/// the rest: `kitty` (the pictures' deletion, while still on the alternate screen),
+/// mouse reporting off, bracketed paste off, `raw_off` (raw mode off, which writes
+/// nothing), the alternate screen left (`?1049l`) and the cursor shown (`?25h`).
+/// Errors are ignored.
+fn restore(
+    out: &mut impl io::Write,
+    kitty: Option<DeleteKittyImages>,
+    raw_off: impl FnOnce() -> io::Result<()>,
+) {
     if let Some(delete) = kitty {
         let _ = execute!(out, delete);
     }
-    let _ = execute!(out, DisableClickMouse, DisableBracketedPaste);
+    let _ = execute!(out, DisableClickMouse);
+    let _ = execute!(out, DisableBracketedPaste);
+    let _ = raw_off();
+    let _ = execute!(out, LeaveAlternateScreen);
+    let _ = execute!(out, Show);
 }
 
 /// Calls [`leave`] when dropped. Bind it to a named variable for the lifetime of
@@ -474,11 +573,134 @@ fn undo_partial_init() {
     }
 }
 
-/// Runs `restore` if `active` was set, clearing it.
-fn leave_once(active: &AtomicBool, restore: impl FnOnce()) {
-    if active.swap(false, Ordering::SeqCst) {
-        restore();
+/// Runs `restore` if `state` is [`ACTIVE`], marking it [`RESTORING`] meanwhile and
+/// [`DONE`] after. When another caller is restoring, waits until it is done, at most
+/// `wait` (a restore that panicked, or one stuck writing to a dead terminal, must not
+/// keep the process alive). Otherwise does nothing.
+fn leave_once(state: &AtomicU8, wait: Duration, restore: impl FnOnce()) {
+    match state.compare_exchange(ACTIVE, RESTORING, Ordering::SeqCst, Ordering::SeqCst) {
+        Ok(_) => {
+            restore();
+            state.store(DONE, Ordering::SeqCst);
+        }
+        Err(RESTORING) => {
+            let deadline = Instant::now() + wait;
+            while state.load(Ordering::SeqCst) == RESTORING && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+        Err(_) => {}
     }
+}
+
+/// Starts the "hangup" thread, which looks at stdin every 100 ms and raises SIGHUP
+/// once it finds it closed: hung up, or at end of file for three looks in a row. The program then ends through the hangup path ([`register_signals`]), as
+/// when the terminal sent the signal itself. Call it once the terminal is set up; the
+/// thread runs until the process ends. On non-Unix platforms it does nothing.
+///
+/// # Errors
+///
+/// When the thread cannot be started.
+pub fn watch_hangup() -> io::Result<()> {
+    #[cfg(unix)]
+    thread::Builder::new()
+        .name("hangup".to_string())
+        .spawn(|| {
+            watch_closed(
+                || look(io::stdin()),
+                HANGUP_LOOK,
+                || {
+                    let _ = signal_hook::low_level::raise(signal_hook::consts::SIGHUP);
+                },
+            );
+        })
+        .map(drop)?;
+    Ok(())
+}
+
+/// Whether stdin, looked at once, is closed: hung up, failing or at end of file. Ask it
+/// only once nothing reads stdin any more (the UI loop has ended): then end of file
+/// cannot be bytes read between the two halves of the look, as it can for
+/// [`watch_hangup`]. Always false on non-Unix platforms.
+pub fn stdin_looks_closed() -> bool {
+    #[cfg(unix)]
+    {
+        look(io::stdin()) != Tty::Open
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// What a look at the terminal's input found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+enum Tty {
+    /// Nothing to read, or bytes waiting: a working terminal.
+    Open,
+    /// Readable with nothing waiting: at end of file, unless the bytes were read
+    /// between the two halves of the look.
+    AtEof,
+    /// Hung up, or failing.
+    Closed,
+}
+
+/// What a look found: `hung_up` (the poll reported a hangup, an error or a bad file),
+/// `readable`, and how many bytes wait to be read (`FIONREAD`).
+#[cfg_attr(not(unix), allow(dead_code))]
+fn tty_state(hung_up: bool, readable: bool, waiting: io::Result<u64>) -> Tty {
+    if hung_up {
+        return Tty::Closed;
+    }
+    if !readable {
+        return Tty::Open;
+    }
+    match waiting {
+        Ok(0) => Tty::AtEof,
+        Ok(_) => Tty::Open,
+        Err(_) => Tty::Closed,
+    }
+}
+
+/// Looks at `fd` without reading from it: a poll that does not wait, then how many
+/// bytes wait. A poll that fails (a signal cut it short) counts as open.
+#[cfg(unix)]
+fn look(fd: impl std::os::fd::AsFd) -> Tty {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+
+    let fd = fd.as_fd();
+    let mut fds = [PollFd::new(&fd, PollFlags::IN)];
+    if poll(&mut fds, Some(&Timespec::default())).is_err() {
+        return Tty::Open;
+    }
+    let revents = fds[0].revents();
+    tty_state(
+        revents.intersects(PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL),
+        revents.contains(PollFlags::IN),
+        rustix::io::ioctl_fionread(fd).map_err(io::Error::from),
+    )
+}
+
+/// Takes a `look` every `interval` until it finds the terminal [`Tty::Closed`], or at
+/// end of file [`EOF_LOOKS`] times in a row, then calls `on_closed` and returns.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn watch_closed(mut look: impl FnMut() -> Tty, interval: Duration, on_closed: impl FnOnce()) {
+    let mut at_eof = 0;
+    loop {
+        match look() {
+            Tty::Closed => break,
+            Tty::AtEof => {
+                at_eof += 1;
+                if at_eof >= EOF_LOOKS {
+                    break;
+                }
+            }
+            Tty::Open => at_eof = 0,
+        }
+        thread::sleep(interval);
+    }
+    on_closed();
 }
 
 /// The panic hook signature `std::panic::take_hook` returns.
@@ -493,7 +715,7 @@ fn install_panic_hook(original: PanicHook) {
         if !is_ui_thread(thread::current().name()) {
             // Restoring here would pull the terminal out from under the running
             // UI, and printing would scribble over it. The engine thread's panic
-            // is caught and reported to the UI as a failed reply.
+            // is caught by the worker, which plays the local search move instead.
             log::error!("{info}");
             return;
         }
@@ -510,6 +732,8 @@ fn is_ui_thread(name: Option<&str>) -> bool {
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+    use std::sync::{Mutex, PoisonError};
 
     fn ansi(command: impl Command) -> String {
         let mut out = String::new();
@@ -553,9 +777,138 @@ mod tests {
         );
     }
 
+    /// A terminal that records what reaches it, or refuses the writes that contain
+    /// `refuse` (every write when it is empty), as a tty that hung up does.
+    #[derive(Clone, Default)]
+    struct Wire {
+        bytes: Rc<RefCell<Vec<u8>>>,
+        refuse: Option<&'static str>,
+        attempts: Rc<Cell<usize>>,
+    }
+
+    impl Wire {
+        fn refusing(refuse: &'static str) -> Wire {
+            Wire {
+                refuse: Some(refuse),
+                ..Wire::default()
+            }
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8(self.bytes.borrow().clone()).unwrap()
+        }
+    }
+
+    impl io::Write for Wire {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.attempts.set(self.attempts.get() + 1);
+            let refused = self.refuse.is_some_and(|refuse| {
+                refuse.is_empty() || String::from_utf8_lossy(buf).contains(refuse)
+            });
+            if refused {
+                return Err(io::Error::other("the tty is gone"));
+            }
+            self.bytes.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    const MOUSE_AND_PASTE_OFF: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?2004l";
+    const SCREEN_AND_CURSOR_BACK: &str = "\x1b[?1049l\x1b[?25h";
+
+    #[test]
+    fn restore_writes_exactly_these_bytes_and_turns_raw_mode_off_in_between() {
+        // Kitty pictures are deleted first, while still on the alternate screen; raw mode
+        // goes off before the alternate screen is left, as `ratatui::restore` does.
+        for (kitty, deletes) in [
+            (
+                Some(DeleteKittyImages {
+                    ids: vec![9, 10],
+                    tmux: false,
+                }),
+                "\x1b_Ga=d,d=I,i=9\x1b\\\x1b_Ga=d,d=I,i=10\x1b\\",
+            ),
+            (None, ""),
+        ] {
+            let wire = Wire::default();
+            let raw_off_after = RefCell::new(None);
+            restore(&mut wire.clone(), kitty, || {
+                *raw_off_after.borrow_mut() = Some(wire.text());
+                Ok(())
+            });
+            assert_eq!(
+                wire.text(),
+                format!("{deletes}{MOUSE_AND_PASTE_OFF}{SCREEN_AND_CURSOR_BACK}")
+            );
+            assert_eq!(
+                raw_off_after.take(),
+                Some(format!("{deletes}{MOUSE_AND_PASTE_OFF}")),
+                "raw mode goes off after ?2004l and before ?1049l"
+            );
+        }
+    }
+
+    #[test]
+    fn every_restore_step_runs_when_an_earlier_one_fails() {
+        // Mouse reporting cannot be turned off: paste, raw mode, the screen and the
+        // cursor are still restored.
+        let wire = Wire::refusing("?1006l");
+        let raw_off = Cell::new(false);
+        restore(
+            &mut wire.clone(),
+            Some(DeleteKittyImages {
+                ids: vec![3],
+                tmux: false,
+            }),
+            || {
+                raw_off.set(true);
+                Ok(())
+            },
+        );
+        assert_eq!(
+            wire.text(),
+            format!("\x1b_Ga=d,d=I,i=3\x1b\\\x1b[?2004l{SCREEN_AND_CURSOR_BACK}")
+        );
+        assert!(raw_off.get());
+
+        // Raw mode cannot be turned off: the screen and the cursor still come back.
+        let wire = Wire::default();
+        restore(&mut wire.clone(), None, || Err(io::Error::other("no tty")));
+        assert_eq!(
+            wire.text(),
+            format!("{MOUSE_AND_PASTE_OFF}{SCREEN_AND_CURSOR_BACK}")
+        );
+
+        // Nothing can be written: every step is still tried, raw mode included.
+        let wire = Wire::refusing("");
+        let raw_off = Cell::new(false);
+        restore(
+            &mut wire.clone(),
+            Some(DeleteKittyImages {
+                ids: vec![3],
+                tmux: false,
+            }),
+            || {
+                raw_off.set(true);
+                Ok(())
+            },
+        );
+        assert!(raw_off.get(), "raw mode is turned off");
+        assert_eq!(
+            wire.attempts.get(),
+            5,
+            "the kitty deletes, mouse, paste, alternate screen and cursor are each tried"
+        );
+        assert_eq!(wire.text(), "");
+    }
+
     #[cfg(unix)]
     #[test]
-    fn kitty_pictures_are_deleted_by_id_first_and_only_after_kitty_drew() {
+    fn kitty_pictures_are_deleted_by_id_and_only_after_kitty_drew() {
         let delete = |ids: &[u32], tmux| {
             ansi(DeleteKittyImages {
                 ids: ids.to_vec(),
@@ -572,22 +925,6 @@ mod tests {
             delete(&[7], true),
             "\x1bPtmux;\x1b\x1b_Ga=d,d=I,i=7\x1b\x1b\\\x1b\\"
         );
-        let teardown = |kitty| {
-            let mut out = Vec::new();
-            write_teardown(&mut out, kitty);
-            String::from_utf8(out).unwrap()
-        };
-        assert_eq!(
-            teardown(Some(DeleteKittyImages {
-                ids: vec![9],
-                tmux: false
-            })),
-            "\x1b_Ga=d,d=I,i=9\x1b\\\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?2004l"
-        );
-        assert_eq!(
-            teardown(None),
-            "\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?2004l"
-        );
 
         let ids = KittyIds::starting_at(40);
         assert_eq!(ids.cleanup(), None, "no kitty picture was drawn");
@@ -602,6 +939,88 @@ mod tests {
             "every id sent, the last way it went"
         );
         assert_eq!(ids.cleanup(), None, "cleaned up once");
+    }
+
+    #[test]
+    fn kitty_pictures_dropped_by_a_cache_clear_are_deleted_before_the_next_draw() {
+        let ids = KittyIds::starting_at(40);
+        let mut wire = Vec::new();
+        ids.write_dropped(&mut wire).unwrap();
+        assert!(wire.is_empty(), "nothing dropped yet");
+
+        let first = [ids.next(false), ids.next(false)];
+        assert_eq!(first, [40, 41]);
+        // The cache is cleared (a new font): both pictures are gone, and new ones follow.
+        ids.drop_all();
+        let second = ids.next(false);
+        assert_eq!(second, 42);
+        ids.write_dropped(&mut wire).unwrap();
+        assert_eq!(
+            String::from_utf8(wire.clone()).unwrap(),
+            "\x1b_Ga=d,d=I,i=40\x1b\\\x1b_Ga=d,d=I,i=41\x1b\\"
+        );
+        wire.clear();
+        ids.write_dropped(&mut wire).unwrap();
+        assert!(wire.is_empty(), "each is deleted once");
+        assert_eq!(
+            ids.cleanup(),
+            Some(DeleteKittyImages {
+                ids: vec![42],
+                tmux: false
+            }),
+            "exit deletes only the pictures still alive"
+        );
+        assert_eq!(ids.cleanup(), None);
+
+        // Pictures dropped just before exit, not deleted yet, are deleted by the exit.
+        let ids = KittyIds::starting_at(7);
+        ids.next(true);
+        ids.drop_all();
+        ids.next(true);
+        assert_eq!(
+            ids.cleanup(),
+            Some(DeleteKittyImages {
+                ids: vec![7, 8],
+                tmux: true
+            })
+        );
+        let mut wire = Vec::new();
+        ids.write_dropped(&mut wire).unwrap();
+        assert!(wire.is_empty(), "the exit deleted them");
+    }
+
+    #[test]
+    fn dropped_pictures_whose_delete_could_not_be_written_are_deleted_later() {
+        let ids = KittyIds::starting_at(40);
+        ids.next(false);
+        ids.next(false);
+        ids.drop_all();
+        ids.next(false);
+        // The tty refuses the write: the two pictures are not deleted yet.
+        let refusing = Wire::refusing("");
+        assert!(ids.write_dropped(&mut refusing.clone()).is_err());
+        assert_eq!(refusing.text(), "");
+        // The next call tries them again.
+        let wire = Wire::default();
+        ids.write_dropped(&mut wire.clone()).unwrap();
+        assert_eq!(
+            wire.text(),
+            "\x1b_Ga=d,d=I,i=40\x1b\\\x1b_Ga=d,d=I,i=41\x1b\\"
+        );
+
+        // Refused again at the last draw: the exit deletes them with the live one.
+        let ids = KittyIds::starting_at(40);
+        ids.next(false);
+        ids.drop_all();
+        ids.next(false);
+        assert!(ids.write_dropped(&mut Wire::refusing("")).is_err());
+        assert_eq!(
+            ids.cleanup(),
+            Some(DeleteKittyImages {
+                ids: vec![40, 41],
+                tmux: false
+            })
+        );
     }
 
     #[test]
@@ -638,36 +1057,149 @@ mod tests {
 
     #[test]
     fn leave_once_restores_only_once() {
-        let active = AtomicBool::new(true);
+        let state = AtomicU8::new(ACTIVE);
         let calls = Cell::new(0);
-        leave_once(&active, || calls.set(calls.get() + 1));
-        leave_once(&active, || calls.set(calls.get() + 1));
+        leave_once(&state, LEAVE_WAIT, || calls.set(calls.get() + 1));
+        leave_once(&state, LEAVE_WAIT, || calls.set(calls.get() + 1));
         assert_eq!(calls.get(), 1);
-        assert!(!active.load(Ordering::SeqCst));
+        assert_eq!(state.load(Ordering::SeqCst), DONE);
     }
 
     #[test]
     fn leave_once_does_nothing_when_never_entered() {
-        let active = AtomicBool::new(false);
-        leave_once(&active, || panic!("must not restore"));
+        let state = AtomicU8::new(DONE);
+        leave_once(&state, LEAVE_WAIT, || panic!("must not restore"));
+    }
+
+    #[test]
+    fn a_second_leave_waits_until_the_first_has_finished() {
+        // The panic hook or the signal thread may call `leave` while the main thread is
+        // restoring; the process must not end until the restore is done.
+        use std::sync::mpsc;
+        let state = Arc::new(AtomicU8::new(ACTIVE));
+        let restored = Arc::new(AtomicBool::new(false));
+        let (started_tx, started) = mpsc::channel();
+        let (finish, finish_rx) = mpsc::channel::<()>();
+        let first = thread::spawn({
+            let (state, restored) = (Arc::clone(&state), Arc::clone(&restored));
+            move || {
+                leave_once(&state, LEAVE_WAIT, || {
+                    started_tx.send(()).unwrap();
+                    finish_rx.recv().unwrap();
+                    restored.store(true, Ordering::SeqCst);
+                });
+            }
+        });
+        started.recv().unwrap();
+        assert_eq!(state.load(Ordering::SeqCst), RESTORING);
+        let second = thread::spawn({
+            let (state, restored) = (Arc::clone(&state), Arc::clone(&restored));
+            move || {
+                leave_once(&state, Duration::from_secs(10), || {
+                    panic!("only the first caller restores")
+                });
+                restored.load(Ordering::SeqCst)
+            }
+        });
+        // A second caller that did not wait would return (false) meanwhile.
+        thread::sleep(Duration::from_millis(50));
+        finish.send(()).unwrap();
+        assert!(
+            second.join().unwrap(),
+            "the second caller returns only after the restore finished"
+        );
+        first.join().unwrap();
+        assert_eq!(state.load(Ordering::SeqCst), DONE);
+    }
+
+    #[test]
+    fn a_second_leave_waits_at_most_its_limit() {
+        use std::time::Instant;
+        let state = AtomicU8::new(RESTORING);
+        let started = Instant::now();
+        leave_once(&state, Duration::from_millis(50), || {
+            panic!("only the first caller restores")
+        });
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(50), "{waited:?}");
+        assert!(waited < Duration::from_secs(5), "{waited:?}");
+        assert_eq!(state.load(Ordering::SeqCst), RESTORING, "left to the first");
+        assert_eq!(LEAVE_WAIT, Duration::from_secs(1));
     }
 
     #[test]
     fn leave_and_guard_are_no_ops_without_enter() {
         // No terminal was set up in this process, so neither may write anything.
-        assert!(!ACTIVE.load(Ordering::SeqCst));
+        assert_eq!(STATE.load(Ordering::SeqCst), DONE);
         leave();
         leave();
         drop(Guard);
-        assert!(!ACTIVE.load(Ordering::SeqCst));
+        assert_eq!(STATE.load(Ordering::SeqCst), DONE);
+    }
+
+    /// Serialises the tests that replace the process-global panic hook.
+    static PANIC_HOOK: Mutex<()> = Mutex::new(());
+
+    /// Runs `test` with the panic hook to itself ([`put_the_hook_back_after`]).
+    fn with_the_panic_hook(test: impl FnOnce()) {
+        let _only_me = PANIC_HOOK.lock().unwrap_or_else(PoisonError::into_inner);
+        put_the_hook_back_after(test);
+    }
+
+    /// Runs `test`, then puts back the panic hook it found, also when `test` fails (its
+    /// message is then raised again, under the hook found).
+    fn put_the_hook_back_after(test: impl FnOnce()) {
+        let found = panic::take_hook();
+        let outcome = panic::catch_unwind(panic::AssertUnwindSafe(test));
+        panic::set_hook(found);
+        if let Err(payload) = outcome {
+            let message = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| {
+                    payload
+                        .downcast_ref::<&str>()
+                        .map(|text| (*text).to_string())
+                })
+                .unwrap_or_default();
+            panic!("{message}");
+        }
+    }
+
+    #[test]
+    fn the_panic_hook_found_is_put_back_even_when_a_test_fails() {
+        static MARKS: AtomicI32 = AtomicI32::new(0);
+        const MARK: &str = "hook marker";
+        with_the_panic_hook(|| {
+            panic::set_hook(Box::new(|info| {
+                if info.payload().downcast_ref::<&str>() == Some(&MARK) {
+                    MARKS.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+            let failed = panic::catch_unwind(|| {
+                put_the_hook_back_after(|| {
+                    panic::set_hook(Box::new(|_| {}));
+                    panic!("an assertion failed");
+                });
+            });
+            let payload = failed.expect_err("the failure is raised again");
+            assert_eq!(
+                payload.downcast_ref::<String>().map(String::as_str),
+                Some("an assertion failed")
+            );
+            assert!(panic::catch_unwind(|| panic::panic_any(MARK)).is_err());
+            assert_eq!(
+                MARKS.load(Ordering::SeqCst),
+                1,
+                "the hook in place before is back"
+            );
+        });
     }
 
     #[test]
     fn a_failed_enable_puts_the_original_panic_hook_back() {
-        // The panic hook is global: this is the only test that changes it, and it puts
-        // back the one it found. A panic on this test thread (not "main") reaches the
-        // original hook only when that hook is installed again; the thread-aware hook
-        // would just log it.
+        // A panic on this test thread (not "main") reaches the original hook only when
+        // that hook is installed again; the thread-aware hook would just log it.
         static PROBES: AtomicI32 = AtomicI32::new(0);
         const PROBE: &str = "terminal hook probe";
         fn probe() -> PanicHook {
@@ -682,25 +1214,21 @@ mod tests {
             assert!(panic::catch_unwind(|| panic::panic_any(PROBE)).is_err());
             PROBES.load(Ordering::SeqCst) > before
         };
-        let found = panic::take_hook();
+        with_the_panic_hook(|| {
+            let undone = Cell::new(false);
+            let result = finish_enter(
+                probe(),
+                || Err(io::Error::other("no mouse")),
+                || undone.set(true),
+            );
+            assert_eq!(result.unwrap_err().to_string(), "no mouse");
+            assert!(undone.get(), "the terminal is restored");
+            assert!(reaches_original(), "original hook put back");
 
-        let undone = Cell::new(false);
-        let result = finish_enter(
-            probe(),
-            || Err(io::Error::other("no mouse")),
-            || undone.set(true),
-        );
-        assert_eq!(result.unwrap_err().to_string(), "no mouse");
-        assert!(undone.get(), "the terminal is restored");
-        let failed_enable_restores = reaches_original();
-
-        let result = finish_enter(probe(), || Ok(()), || panic!("must not restore"));
-        assert!(result.is_ok());
-        let success_installs_thread_hook = !reaches_original();
-
-        panic::set_hook(found);
-        assert!(failed_enable_restores, "original hook put back");
-        assert!(success_installs_thread_hook, "thread-aware hook installed");
+            let result = finish_enter(probe(), || Ok(()), || panic!("must not restore"));
+            assert!(result.is_ok());
+            assert!(!reaches_original(), "thread-aware hook installed");
+        });
     }
 
     #[test]
@@ -811,5 +1339,79 @@ mod tests {
         thread::sleep(Duration::from_millis(100));
         assert_eq!(STUCK_CALLS.load(Ordering::SeqCst), 1);
         assert_eq!(received.load(Ordering::SeqCst), SIGUSR2);
+    }
+
+    // ----- a terminal closed without SIGHUP -----
+
+    #[test]
+    fn a_look_at_the_input_tells_a_closed_terminal() {
+        // Hung up (POLLHUP, POLLERR or POLLNVAL): closed, whatever else it says.
+        assert_eq!(tty_state(true, true, Ok(3)), Tty::Closed);
+        assert_eq!(tty_state(true, false, Ok(0)), Tty::Closed);
+        // Nothing to read: open.
+        assert_eq!(tty_state(false, false, Ok(0)), Tty::Open);
+        // Bytes waiting: open (a key press).
+        assert_eq!(tty_state(false, true, Ok(1)), Tty::Open);
+        // Readable with nothing waiting: at end of file, unless crossterm read the bytes
+        // in between, so it takes a few such looks in a row.
+        assert_eq!(tty_state(false, true, Ok(0)), Tty::AtEof);
+        // Readable, and asking how much waits fails (EIO): closed.
+        assert_eq!(
+            tty_state(false, true, Err(io::Error::other("input/output error"))),
+            Tty::Closed
+        );
+    }
+
+    /// How many looks `watch_closed` takes at `script` before it calls `on_closed`,
+    /// and how often it calls it; `None` when the script runs out first.
+    fn looks_until_closed(script: &[Tty]) -> Option<(usize, usize)> {
+        let looks = Cell::new(0);
+        let closed = Cell::new(0);
+        let outcome = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            watch_closed(
+                || {
+                    let look = *script.get(looks.get()).expect("script ran out");
+                    looks.set(looks.get() + 1);
+                    look
+                },
+                Duration::ZERO,
+                || closed.set(closed.get() + 1),
+            );
+        }));
+        outcome.ok().map(|()| (looks.get(), closed.get()))
+    }
+
+    #[test]
+    fn a_closed_terminal_is_reported_once() {
+        use Tty::{AtEof, Closed, Open};
+        assert_eq!(looks_until_closed(&[Open, Open, Closed]), Some((3, 1)));
+        assert_eq!(
+            looks_until_closed(&[Open, AtEof, AtEof, AtEof]),
+            Some((4, 1)),
+            "three looks in a row at end of file"
+        );
+        assert_eq!(
+            looks_until_closed(&[AtEof, AtEof, Open, AtEof, AtEof, AtEof]),
+            Some((6, 1)),
+            "a key in between starts the count again"
+        );
+        assert_eq!(EOF_LOOKS, 3);
+        assert!(HANGUP_LOOK <= Duration::from_millis(100), "{HANGUP_LOOK:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_whose_writer_is_gone_looks_at_end_of_file_or_closed() {
+        use std::io::{Read, Write};
+        let (mut reader, mut writer) = io::pipe().unwrap();
+        assert_eq!(look(&reader), Tty::Open, "nothing written yet");
+        writer.write_all(b"k").unwrap();
+        assert_eq!(look(&reader), Tty::Open, "a byte waits");
+        drop(writer);
+        let mut byte = [0];
+        reader.read_exact(&mut byte).unwrap();
+        // macOS reports a readable pipe with nothing in it, Linux a hangup.
+        let gone = look(&reader);
+        assert!(matches!(gone, Tty::AtEof | Tty::Closed), "{gone:?}");
     }
 }

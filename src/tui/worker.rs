@@ -14,15 +14,15 @@
 //! position, and a panic in it must not reach the UI.
 //!
 //! In debug mode the engine records its exchange with Jev in the move; the thread
-//! moves it into the reply as a [`debug::Exchange`](super::debug::Exchange), whose
-//! text for the exchange view is rendered there too, off the UI thread.
+//! moves it into the reply as a [`debug::Exchange`](super::debug::Exchange). Its text
+//! is rendered on the UI thread, and only while the exchange view shows it.
 
 use std::any::Any;
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use super::debug::Exchange;
@@ -163,11 +163,14 @@ impl EngineReply {
     }
 }
 
-/// Runs `request` on a new detached thread named "engine" and sends the reply on
-/// `tx`. A panic inside the engine is answered with the local search's best move
-/// (see [`EngineOutcome::Move`]); only when that panics as well is the reply
+/// Runs `request` on a new thread named "engine" and sends the reply on `tx`. A
+/// panic inside the engine is answered with the local search's best move (see
+/// [`EngineOutcome::Move`]); only when that panics as well is the reply
 /// [`EngineOutcome::Failed`]. Nothing is computed on the calling thread. If the
 /// receiver is gone (the UI quit), the reply is dropped.
+///
+/// The thread's handle is returned for tests, which join it; the app drops it, which
+/// detaches the thread, so quitting never waits for a slow engine call.
 ///
 /// # Errors
 ///
@@ -176,7 +179,7 @@ pub fn spawn_request(
     engine: Arc<dyn Engine>,
     request: EngineRequest,
     tx: Sender<EngineReply>,
-) -> io::Result<()> {
+) -> io::Result<JoinHandle<()>> {
     thread::Builder::new()
         .name(ENGINE_THREAD.to_string())
         .spawn(move || {
@@ -184,8 +187,6 @@ pub fn spawn_request(
             // A send error means the UI has gone; nobody is left to tell.
             let _ = tx.send(EngineReply::new(&request, outcome));
         })
-        // Detached: quitting never waits for a slow engine call.
-        .map(drop)
 }
 
 /// True when `reply` answers the request for the app's current `generation`
@@ -344,7 +345,10 @@ mod tests {
         assert_eq!((exchange.ply, exchange.fullmove), (1, 1));
         assert_eq!(exchange.san, "e5");
         assert_eq!(exchange.source, "Jev");
-        assert!(!exchange.body().is_empty(), "rendered on the engine thread");
+        assert!(
+            !exchange.body().is_empty(),
+            "its body renders when it is shown"
+        );
     }
 
     #[test]
@@ -448,26 +452,22 @@ mod tests {
     }
 
     #[test]
-    fn engine_survives_a_panic_and_keeps_answering() {
-        let (tx, rx) = mpsc::channel();
-        let exploding: Arc<dyn Engine> = fake(Turn::Panic("chooser exploded"));
-        let playing: Arc<dyn Engine> = fake(Turn::Play("g1f3"));
-        spawn_request(exploding, EngineRequest::new(1, Game::new()), tx.clone()).unwrap();
-        spawn_request(playing, EngineRequest::new(2, Game::new()), tx).unwrap();
-
-        let mut replies = [
-            rx.recv_timeout(REPLY_TIMEOUT).unwrap(),
-            rx.recv_timeout(REPLY_TIMEOUT).unwrap(),
-        ];
-        replies.sort_by_key(|reply| reply.generation);
+    fn the_same_engine_answers_again_after_a_panic() {
+        let engine = Arc::new(
+            FakeEngine::jev().scripted([Turn::Panic("chooser exploded"), Turn::Play("g1f3")]),
+        );
+        let first = round_trip(engine.clone(), EngineRequest::new(1, Game::new()));
         assert!(matches!(
-            &replies[0].outcome,
+            &first.outcome,
             EngineOutcome::Move(mv) if mv.note.as_deref() == Some(ENGINE_ERROR_NOTE)
         ));
+        let second = round_trip(engine.clone(), EngineRequest::new(2, Game::new()));
+        assert_eq!(second.generation, 2);
         assert!(matches!(
-            &replies[1].outcome,
-            EngineOutcome::Move(mv) if mv.source == MoveSource::Jev
+            &second.outcome,
+            EngineOutcome::Move(mv) if mv.source == MoveSource::Jev && mv.san == "Nf3"
         ));
+        assert_eq!(engine.threads().len(), 2, "one engine, asked twice");
     }
 
     #[test]
@@ -475,13 +475,13 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         drop(rx);
         let engine = fake(Turn::Play("e2e4"));
-        spawn_request(engine.clone(), EngineRequest::new(1, Game::new()), tx).unwrap();
-        // The thread must still run to completion; wait for it to record its run.
-        let deadline = std::time::Instant::now() + REPLY_TIMEOUT;
-        while engine.threads().is_empty() && std::time::Instant::now() < deadline {
-            thread::yield_now();
-        }
-        assert_eq!(engine.threads().len(), 1);
+        let thread = spawn_request(engine.clone(), EngineRequest::new(1, Game::new()), tx)
+            .expect("engine thread spawns");
+        // The thread ends after its send, so a panic there would fail the join.
+        thread
+            .join()
+            .expect("the send to the closed channel does not panic");
+        assert_eq!(engine.threads().len(), 1, "the engine was asked");
     }
 
     #[test]

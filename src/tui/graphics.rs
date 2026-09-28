@@ -10,17 +10,26 @@
 //! that ends the answers. It never starts a thread, so nothing is left reading stdin
 //! when a terminal does not answer (`Picker::from_query_stdio` would leave one behind,
 //! swallowing keystrokes), and it stops reading right after the status report, so keys
-//! typed after it reach the event loop.
+//! typed after it reach the event loop. When it stops before the status report (the
+//! deadline passed, maybe in the middle of an answer, or a quit signal came), it goes
+//! on reading and dropping the answers for up to [`DRAIN_TIME`], so the rest of them
+//! neither becomes key presses nor reaches the shell after the program ends.
 //!
 //! The answers map to a protocol the way ratatui-image maps them: Kitty when the
 //! terminal accepted the kitty graphics probe, else Sixel when its device attributes
 //! list sixel, else iTerm2 when the environment says so (WezTerm, iTerm2 and a few
-//! others), else half-blocks. WezTerm and Konsole are never sent the Kitty and Sixel
-//! probes (neither draws those correctly). A protocol needs a real font size; it comes
-//! from the cell-size answer, else from the window's pixel size, and without either the
-//! picker draws half-blocks at 10×20. A query that fails or times out never stops the
-//! program: it falls back to half-blocks with a warning for the menu, and an answer
-//! that arrives after the deadline is kept out of the input ([`LateAnswers`]).
+//! others), else half-blocks; except that iTerm2 wins over a Sixel answer when the
+//! environment names iTerm2 or WezTerm, which draw iTerm2 pictures better. WezTerm and
+//! Konsole are never sent the Kitty and Sixel probes (neither draws those correctly).
+//! Every query ends with the device attributes request after the status report: the
+//! query reads its answer too, but never as a capability, and when the answers come
+//! too late for the query, it is the last one and wakes crossterm's reader. A
+//! protocol needs a real font size; it comes from the cell-size answer, else from the
+//! window's pixel size, and without either the picker draws half-blocks at 10×20. A
+//! query that fails or times out never stops the program: it falls back to half-blocks
+//! with a warning for the menu, and an answer that arrives after the deadline is kept
+//! out of the input ([`LateAnswers`]). Where stdin cannot be polled (not unix) the
+//! query is not asked at all, without a warning.
 
 use std::fmt;
 use std::io::{self, Write};
@@ -41,6 +50,10 @@ pub const QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 /// The longest single wait for input while reading the answers, so that a quit
 /// signal ends the query within this time rather than at the deadline.
 const POLL_SLICE: Duration = Duration::from_millis(50);
+
+/// How long the start-up query ([`detect`]) goes on reading, and dropping, the
+/// answers still owed once it stopped waiting for them.
+pub const DRAIN_TIME: Duration = Duration::from_millis(200);
 
 /// How long after a query that gave up waiting its answer may still arrive and is
 /// kept out of the input ([`LateAnswers`]).
@@ -66,8 +79,9 @@ pub struct Graphics {
     pub cell_size: CellSize,
     /// Why the query failed, for the menu.
     pub warning: Option<String>,
-    /// True when the query timed out or was interrupted, so the terminal may still
-    /// answer; crossterm would read that answer as key presses ([`LateAnswers`]).
+    /// True when the query timed out or was interrupted and the answers did not come
+    /// in [`DRAIN_TIME`] either, so the terminal may still answer; crossterm would read
+    /// that answer as key presses ([`LateAnswers`]).
     pub answers_pending: bool,
 }
 
@@ -124,6 +138,8 @@ enum QueryError {
     Interrupted,
     /// Writing the query or reading stdin failed, or stdin ended.
     Io(io::Error),
+    /// This platform cannot read the answers, so the query was not asked.
+    Unsupported,
 }
 
 impl fmt::Display for QueryError {
@@ -132,6 +148,7 @@ impl fmt::Display for QueryError {
             QueryError::Timeout => write!(f, "no answer within {} s", QUERY_TIMEOUT.as_secs()),
             QueryError::Interrupted => f.write_str("interrupted"),
             QueryError::Io(error) => error.fmt(f),
+            QueryError::Unsupported => f.write_str("unsupported"),
         }
     }
 }
@@ -157,8 +174,21 @@ pub fn detect(stop: impl Fn() -> bool) -> Graphics {
     // the kitty probe needs to reach the outer terminal (`from_query_stdio` does the
     // same before its query).
     let is_tmux = Picker::halfblocks().tmux_detected();
-    let answers = ask(&query_text(is_tmux, get), stop);
-    Graphics::from(interpret(answers, is_tmux, get, window_cell_size()))
+    let asked = ask(&query_text(is_tmux, get), stop);
+    Graphics::from(detect_from(asked, is_tmux, get, window_cell_size()))
+}
+
+/// What [`ask`] found out: the answers ([`interpret`]), and whether some may still come
+/// ([`Graphics::answers_pending`]).
+fn detect_from(
+    asked: Asked,
+    is_tmux: bool,
+    get: impl Fn(&str) -> Option<String>,
+    window: Option<CellSize>,
+) -> Detection {
+    let mut detection = interpret(asked.answers, is_tmux, get, window);
+    detection.answers_pending &= asked.owed;
+    detection
 }
 
 /// [`Graphics::off`] with the font size from the window's pixel size, for when
@@ -180,26 +210,55 @@ pub fn picker_for(protocol: ProtocolType, cell_size: CellSize) -> Picker {
 
 /// The capability query: the kitty graphics probe, device attributes (sixel),
 /// the cell size in pixels and a status report, which every terminal answers and
-/// which therefore ends the answers. WezTerm and Konsole are not sent the kitty
-/// and sixel probes, as ratatui-image does: neither draws those correctly, and
-/// WezTerm gets iTerm2 from the environment instead.
+/// which therefore ends the answers the query interprets. WezTerm and Konsole are not
+/// sent the kitty and sixel probes, as ratatui-image does: neither draws those
+/// correctly, and WezTerm gets iTerm2 from the environment instead.
+///
+/// The device attributes are asked for again after the status report, so that the
+/// answers end with one that crossterm reports, as [`FontMeter::measure`]'s do:
+/// crossterm drops the cell size and status reports, and when they arrive too late
+/// for the query, alone in a read, they would leave its reader waiting for the next
+/// key. In time, [`ask_with`] reads that answer itself, after the status report, so
+/// it is never taken for a capability (WezTerm's lists sixel) nor left for crossterm.
 fn query_text(is_tmux: bool, get: impl Fn(&str) -> Option<String>) -> String {
     let set = |name: &str| get(name).is_some_and(|value| !value.is_empty());
     let mut options = QueryStdioOptions::default();
     if set("WEZTERM_EXECUTABLE") || set("KONSOLE_VERSION") {
         options.blacklist_protocols = vec![ProtocolType::Kitty, ProtocolType::Sixel];
     }
-    Parser::query(is_tmux, options)
+    let query = Parser::query(is_tmux, options);
+    let (_, escape, end) = Parser::tmux_start_escape_end(is_tmux);
+    let body = query.strip_suffix(end).unwrap_or(&query);
+    format!("{body}{escape}[c{end}")
 }
 
-/// Writes `query` to stdout and reads the answers from stdin. Where the answers
-/// cannot be read at all ([`ANSWERS_READABLE`] is false: every platform but unix, see
-/// [`read_stdin_byte`]'s stub below), the query is never written either: otherwise the
-/// terminal's reply would still land on the wire with nothing here left to read it, and
-/// crossterm's event reader would pick it up as ordinary key presses once the event
-/// loop starts (`ESC [ ? 1 ; 6 ; ...` reads as `Esc`, `[`, `?`, `1`, ...).
-fn ask(query: &str, stop: impl Fn() -> bool) -> Result<Vec<Response>, QueryError> {
-    ask_with(ANSWERS_READABLE, write_stdout, read_stdin_byte, query, stop)
+/// Writes `query` to stdout and reads the answers from stdin ([`ask_with`], with
+/// [`QUERY_TIMEOUT`] and [`DRAIN_TIME`]). Where the answers cannot be read at all
+/// ([`ANSWERS_READABLE`] is false: every platform but unix, see [`read_stdin_byte`]'s
+/// stub below), the query is never written either: otherwise the terminal's reply would
+/// still land on the wire with nothing here left to read it, and crossterm's event
+/// reader would pick it up as ordinary key presses once the event loop starts
+/// (`ESC [ ? 1 ; 6 ; ...` reads as `Esc`, `[`, `?`, `1`, ...).
+fn ask(query: &str, stop: impl Fn() -> bool) -> Asked {
+    ask_with(
+        ANSWERS_READABLE,
+        write_stdout,
+        read_stdin_byte,
+        query,
+        stop,
+        QUERY_TIMEOUT,
+        DRAIN_TIME,
+    )
+}
+
+/// What [`ask_with`] got.
+#[derive(Debug)]
+struct Asked {
+    /// The answers, or why they did not all come.
+    answers: Result<Vec<Response>, QueryError>,
+    /// Some answers may still come: the query stopped before the status report, and the
+    /// drain did not read it either.
+    owed: bool,
 }
 
 /// Whether this platform's [`read_stdin_byte`] can actually read stdin. Only the unix
@@ -220,20 +279,101 @@ fn write_stdout(bytes: &[u8]) -> io::Result<()> {
 
 /// [`ask`], with `readable`, `write` and `read_byte` injectable so both of its
 /// branches are covered by a test regardless of the platform it runs on: nothing is
-/// written when `readable` is false, otherwise `write` runs before `read_byte` is
-/// asked for the answers.
+/// written when `readable` is false ([`QueryError::Unsupported`]), otherwise `write`
+/// runs before `read_byte` is asked for the answers, for up to `timeout` (less once
+/// `stop` returns true).
+///
+/// When it stops before the status report, it goes on reading for up to `drain`,
+/// whatever `stop` says, and drops what it reads up to the status report: the rest of
+/// an answer the deadline cut in two would reach crossterm as key presses, and answers
+/// still on their way at a quit signal would reach the shell. Keys typed meanwhile are
+/// lost with them. [`Asked::owed`] says whether the status report is still to come.
+///
+/// Once the status report is read, it also reads the answer to the device attributes
+/// request after it ([`query_text`]), waiting up to `drain` for it, without
+/// interpreting it; a byte that cannot be part of it ends that read (and is lost).
 fn ask_with(
     readable: bool,
     write: impl FnOnce(&[u8]) -> io::Result<()>,
-    read_byte: impl FnMut(Duration) -> io::Result<Option<u8>>,
+    mut read_byte: impl FnMut(Duration) -> io::Result<Option<u8>>,
     query: &str,
     stop: impl Fn() -> bool,
-) -> Result<Vec<Response>, QueryError> {
+    timeout: Duration,
+    drain: Duration,
+) -> Asked {
     if !readable {
-        return Err(QueryError::Io(io::ErrorKind::Unsupported.into()));
+        return Asked {
+            answers: Err(QueryError::Unsupported),
+            owed: false,
+        };
     }
-    write(query.as_bytes())?;
-    read_answers(read_byte, QUERY_TIMEOUT, stop)
+    if let Err(error) = write(query.as_bytes()) {
+        return Asked {
+            answers: Err(error.into()),
+            owed: false,
+        };
+    }
+    let mut reader = AnswerReader::new(0);
+    let answers = reader.read(&mut read_byte, Instant::now() + timeout, &stop);
+    if let Err(QueryError::Timeout | QueryError::Interrupted) = answers {
+        match reader.read(&mut read_byte, Instant::now() + drain, &|| false) {
+            Ok(_) => {}
+            Err(QueryError::Timeout | QueryError::Interrupted) => {
+                return Asked {
+                    answers,
+                    owed: true,
+                };
+            }
+            Err(_) => {
+                return Asked {
+                    answers,
+                    owed: false,
+                };
+            }
+        }
+    } else if answers.is_err() {
+        return Asked {
+            answers,
+            owed: false,
+        };
+    }
+    read_attributes_answer(&mut read_byte, Instant::now() + drain);
+    Asked {
+        answers,
+        owed: false,
+    }
+}
+
+/// Reads one device attributes answer (`ESC [ ? <digits and ;> c`) from `read_byte`,
+/// waiting until `deadline` at most, and drops it. Stops early at a byte that cannot be
+/// part of it, or when reading fails. True when the whole answer was read.
+fn read_attributes_answer(
+    read_byte: &mut impl FnMut(Duration) -> io::Result<Option<u8>>,
+    deadline: Instant,
+) -> bool {
+    let mut read = 0;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        let byte = match read_byte(left.min(POLL_SLICE)) {
+            Ok(Some(byte)) => byte,
+            Ok(None) => continue,
+            Err(_) => return false,
+        };
+        let fits = match read {
+            0 => byte == 0x1b,
+            1 => byte == b'[',
+            2 => byte == b'?',
+            _ if byte == b'c' => return true,
+            _ => byte.is_ascii_digit() || byte == b';',
+        };
+        if !fits {
+            return false;
+        }
+        read += 1;
+    }
 }
 
 /// Asks the terminal for its font size again after resizes ([`FontMeter::measure`]),
@@ -266,7 +406,7 @@ impl FontMeter {
     /// start-up query) and reads the answers as [`detect`] does, up to its own status
     /// report (see [`FontMeter`]), taking at most [`QUERY_TIMEOUT`], less once `stop`
     /// returns true. The size is the cell-size answer, else the window's pixels per
-    /// cell, else `None`: keep the current one ([`measured_font`]).
+    /// cell, else `None`: keep the current one.
     ///
     /// The answers need no [`LateAnswers`]: all three are CSI sequences that crossterm
     /// cannot take for a key. It drops the cell size and status reports (ending in `t`
@@ -279,15 +419,35 @@ impl FontMeter {
     /// measurement reads (keys typed in those milliseconds) are fed to the answer
     /// parser and lost.
     pub fn measure(&mut self, is_tmux: bool, stop: impl Fn() -> bool) -> Option<CellSize> {
-        let answers = if ANSWERS_READABLE {
-            match write_stdout(font_query_text(is_tmux).as_bytes()) {
-                Ok(()) => self.read(read_stdin_byte, QUERY_TIMEOUT, stop),
-                Err(error) => Err(error.into()),
-            }
-        } else {
-            Err(QueryError::Io(io::ErrorKind::Unsupported.into()))
-        };
+        let answers = self.ask_with(
+            ANSWERS_READABLE,
+            write_stdout,
+            read_stdin_byte,
+            is_tmux,
+            QUERY_TIMEOUT,
+            stop,
+        );
         measured_font(answers, window_cell_size())
+    }
+
+    /// Writes the font query with `write` and reads the answers with `read_byte`
+    /// ([`FontMeter::read`]), waiting up to `timeout`. Where the answers cannot be read
+    /// (`readable` is false, see [`ANSWERS_READABLE`]) nothing is written or read, as in
+    /// [`ask_with`], and nothing is owed.
+    fn ask_with(
+        &mut self,
+        readable: bool,
+        write: impl FnOnce(&[u8]) -> io::Result<()>,
+        read_byte: impl FnMut(Duration) -> io::Result<Option<u8>>,
+        is_tmux: bool,
+        timeout: Duration,
+        stop: impl Fn() -> bool,
+    ) -> Result<Vec<Response>, QueryError> {
+        if !readable {
+            return Err(QueryError::Unsupported);
+        }
+        write(font_query_text(is_tmux).as_bytes())?;
+        self.read(read_byte, timeout, stop)
     }
 
     /// Reads the answers to a measurement with [`read_answers_after`], skipping those
@@ -360,57 +520,85 @@ fn cell_size_answer(responses: &[Response]) -> Option<CellSize> {
         .flatten()
 }
 
-/// Feeds the bytes from `read_byte` to the answer parser until the status report
-/// arrives, and returns the answers before it. Nothing after the status report is
-/// read, so keys typed later stay for the event loop.
+/// Feeds the bytes from `read_byte` to the answer parser, skipping `owed` status
+/// reports and the answers before each, and returns the answers before the status
+/// report numbered `owed + 1`. Nothing after that status report is read, so keys typed
+/// later stay for the event loop. When the deadline passes after at least one status
+/// report, the answers before the last one read are the result (the owed ones did not
+/// come; that one was the query's own).
 ///
 /// `read_byte(wait)` returns the next byte, or `None` when none arrived within
 /// `wait`; it is never asked to wait past the deadline `timeout` from now, nor
 /// longer than 50 ms at a time. `stop` is checked before every read.
-fn read_answers(
-    read_byte: impl FnMut(Duration) -> io::Result<Option<u8>>,
-    timeout: Duration,
-    stop: impl Fn() -> bool,
-) -> Result<Vec<Response>, QueryError> {
-    read_answers_after(read_byte, timeout, stop, 0)
-}
-
-/// [`read_answers`] after skipping `owed` status reports and the answers before each:
-/// it returns the answers before the status report numbered `owed + 1`. When the
-/// deadline passes after at least one status report, the answers before the last one
-/// read are the result (the owed ones did not come; that one was the query's own).
 fn read_answers_after(
     mut read_byte: impl FnMut(Duration) -> io::Result<Option<u8>>,
     timeout: Duration,
     stop: impl Fn() -> bool,
     owed: usize,
 ) -> Result<Vec<Response>, QueryError> {
-    let deadline = Instant::now() + timeout;
-    let mut parser = Parser::new();
-    let mut responses = Vec::new();
-    // The answers before the last status report skipped, and how many were.
-    let mut last = None;
-    let mut skipped = 0;
-    loop {
-        if stop() {
-            return Err(QueryError::Interrupted);
+    AnswerReader::new(owed).read(&mut read_byte, Instant::now() + timeout, &stop)
+}
+
+/// Reads answers up to a status report, in as many calls to [`AnswerReader::read`] as
+/// it takes: a call that stops early keeps what it read, a partly read answer included,
+/// for the next.
+struct AnswerReader {
+    parser: Parser,
+    /// The status reports to skip, with the answers before each.
+    owed: usize,
+    /// How many were skipped.
+    skipped: usize,
+    /// The answers since the last status report.
+    responses: Vec<Response>,
+    /// The answers before the last status report skipped.
+    last: Option<Vec<Response>>,
+}
+
+impl AnswerReader {
+    /// A reader that skips `owed` status reports first.
+    fn new(owed: usize) -> AnswerReader {
+        AnswerReader {
+            parser: Parser::new(),
+            owed,
+            skipped: 0,
+            responses: Vec::new(),
+            last: None,
         }
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return last.ok_or(QueryError::Timeout);
-        }
-        let Some(byte) = read_byte(left.min(POLL_SLICE))? else {
-            continue;
-        };
-        // The answers are ASCII; ratatui-image feeds its parser the same way.
-        for response in parser.push(char::from(byte)) {
-            match response {
-                Response::Status if skipped == owed => return Ok(responses),
-                Response::Status => {
-                    skipped += 1;
-                    last = Some(std::mem::take(&mut responses));
+    }
+
+    /// Feeds the bytes from `read_byte` to the parser until the status report after
+    /// those owed arrives, and returns the answers before it; see
+    /// [`read_answers_after`]. Gives up at `deadline`, or when `stop` returns true
+    /// (checked before every read).
+    fn read(
+        &mut self,
+        read_byte: &mut impl FnMut(Duration) -> io::Result<Option<u8>>,
+        deadline: Instant,
+        stop: &impl Fn() -> bool,
+    ) -> Result<Vec<Response>, QueryError> {
+        loop {
+            if stop() {
+                return Err(QueryError::Interrupted);
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return self.last.take().ok_or(QueryError::Timeout);
+            }
+            let Some(byte) = read_byte(left.min(POLL_SLICE))? else {
+                continue;
+            };
+            // The answers are ASCII; ratatui-image feeds its parser the same way.
+            for response in self.parser.push(char::from(byte)) {
+                match response {
+                    Response::Status if self.skipped == self.owed => {
+                        return Ok(std::mem::take(&mut self.responses));
+                    }
+                    Response::Status => {
+                        self.skipped += 1;
+                        self.last = Some(std::mem::take(&mut self.responses));
+                    }
+                    other => self.responses.push(other),
                 }
-                other => responses.push(other),
             }
         }
     }
@@ -420,10 +608,15 @@ fn read_answers_after(
 /// (`Picker::from_query_stdio`): the protocol the answers name (Kitty over Sixel),
 /// else one the environment names ([`protocol_from_env`]), else half-blocks; the font
 /// size from the cell-size answer when it is plausible ([`font_size`]), else `window`
-/// (the window's pixel size per cell).
-/// Without any font size the protocol is half-blocks at 10×20, since the other
-/// protocols draw at the pixel size they are given. A failed query is half-blocks
-/// with a warning.
+/// (the window's pixel size per cell). Unlike ratatui-image, iTerm2 wins over a Sixel
+/// answer when the environment names iTerm2 or WezTerm ([`names_iterm2`]).
+///
+/// Without any font size the protocol is half-blocks at 10×20, even when the answers
+/// name Kitty or Sixel. That is intended (spec 10.3): those protocols draw at the pixel
+/// size they are given, and pictures encoded for a guessed font spill into the
+/// neighbouring squares or leave gaps. A failed query is half-blocks with a warning,
+/// except where the query cannot be asked at all ([`QueryError::Unsupported`]), which
+/// the person cannot change.
 fn interpret(
     answers: Result<Vec<Response>, QueryError>,
     is_tmux: bool,
@@ -432,6 +625,14 @@ fn interpret(
 ) -> Detection {
     let responses = match answers {
         Ok(responses) => responses,
+        Err(QueryError::Unsupported) => {
+            return Detection {
+                protocol: ProtocolType::Halfblocks,
+                cell_size: window.unwrap_or_default(),
+                warning: None,
+                answers_pending: false,
+            };
+        }
         Err(error) => {
             return Detection {
                 protocol: ProtocolType::Halfblocks,
@@ -454,11 +655,14 @@ fn interpret(
     let cell_size = cell_size_answer(&responses);
     let (protocol, cell_size) = match cell_size.or(window) {
         Some(cell_size) => {
-            let protocol = answered
-                .or_else(|| protocol_from_env(is_tmux, &get))
-                .unwrap_or(ProtocolType::Halfblocks);
+            let protocol = match answered {
+                Some(ProtocolType::Sixel) if names_iterm2(is_tmux, &get) => ProtocolType::Iterm2,
+                Some(protocol) => protocol,
+                None => protocol_from_env(is_tmux, &get).unwrap_or(ProtocolType::Halfblocks),
+            };
             (protocol, cell_size)
         }
+        // No font size: half-blocks, whatever answered (see above).
         None => (ProtocolType::Halfblocks, CellSize::DEFAULT),
     };
     Detection {
@@ -584,6 +788,19 @@ fn protocol_from_env(is_tmux: bool, get: impl Fn(&str) -> Option<String>) -> Opt
     iterm2.then_some(ProtocolType::Iterm2)
 }
 
+/// Whether the environment names iTerm2 or WezTerm, the terminals whose iTerm2
+/// pictures win over their Sixel answer: `TERM_PROGRAM` names either, `LC_TERMINAL`
+/// names iTerm2, or inside tmux the outer terminal left `ITERM_SESSION_ID` or
+/// `WEZTERM_EXECUTABLE`.
+fn names_iterm2(is_tmux: bool, get: impl Fn(&str) -> Option<String>) -> bool {
+    let set = |name: &str| get(name).is_some_and(|value| !value.is_empty());
+    let contains = |name: &str, part: &str| get(name).is_some_and(|value| value.contains(part));
+    (is_tmux && (set("ITERM_SESSION_ID") || set("WEZTERM_EXECUTABLE")))
+        || contains("TERM_PROGRAM", "iTerm")
+        || contains("TERM_PROGRAM", "WezTerm")
+        || contains("LC_TERMINAL", "iTerm")
+}
+
 /// The font size from the terminal's pixel and cell counts, as ratatui-image
 /// computes it (rounded down); `None` when the terminal reports no pixel size, or
 /// one that gives no plausible font ([`font_size`]).
@@ -644,9 +861,10 @@ fn read_stdin_byte(_wait: Duration) -> io::Result<Option<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::io;
+    use std::rc::Rc;
     use std::time::{Duration, Instant};
 
     use ratatui::crossterm::event::{Event, KeyCode, KeyModifiers};
@@ -669,11 +887,22 @@ mod tests {
     const SIXEL: &[u8] = b"\x1b[?63;1;2;4;6;9;15;22c\x1b[6;20;10t\x1b[0n";
     /// A terminal that knows none of it (Alacritty-like): attributes and status only.
     const PLAIN: &[u8] = b"\x1b[?6c\x1b[0n";
+    /// Kitty's answer to the device attributes request after the status report.
+    const KITTY_ATTRIBUTES: &[u8] = b"\x1b[?62;c";
     /// Both kitty graphics and sixel: Kitty wins, as in ratatui-image.
     const KITTY_AND_SIXEL: &[u8] = b"\x1b[?62;4c\x1b_Gi=31;OK\x1b\\\x1b[6;20;10t\x1b[0n";
 
     /// What the query reader returns.
     type Answers = Result<Vec<Response>, QueryError>;
+
+    /// The answers up to the first status report ([`read_answers_after`], nothing owed).
+    fn read_answers(
+        read_byte: impl FnMut(Duration) -> io::Result<Option<u8>>,
+        timeout: Duration,
+        stop: impl Fn() -> bool,
+    ) -> Answers {
+        read_answers_after(read_byte, timeout, stop, 0)
+    }
 
     /// The answers in `bytes` as the query reader collects them; bytes that end before
     /// the status report are a terminal that never finished answering.
@@ -709,7 +938,13 @@ mod tests {
             "device attributes (sixel): {query:?}"
         );
         assert!(query.contains("\x1b[16t"), "cell size: {query:?}");
-        assert!(query.ends_with("\x1b[5n"), "status report last: {query:?}");
+        // The status report ends the answers the query reads; the device attributes
+        // after it make the answers end in one crossterm reports, should they come late.
+        assert!(
+            query.ends_with("\x1b[16t\x1b[5n\x1b[c"),
+            "status report, then the device attributes again: {query:?}"
+        );
+        assert_eq!(query.matches("\x1b[c").count(), 2, "{query:?}");
         assert!(!query.contains("\x1b]11;?"), "no background colour query");
         assert!(!query.contains("\x1b[6n"), "no text sizing probe");
     }
@@ -722,10 +957,13 @@ mod tests {
         ] {
             let query = query_text(false, env(pairs));
             assert!(!query.contains("_Gi="), "{pairs:?}: {query:?}");
-            assert!(!query.contains("\x1b[c"), "{pairs:?}: {query:?}");
-            assert!(query.contains("\x1b[16t"), "{pairs:?}");
-            assert!(query.ends_with("\x1b[5n"), "{pairs:?}");
+            // The device attributes come after the status report, so their answer (which
+            // may list sixel) is not read as a capability; it is the last answer, which
+            // crossterm reports, so a late one does not leave its reader waiting.
+            assert_eq!(query, "\x1b[16t\x1b[5n\x1b[c", "{pairs:?}");
         }
+        let query = query_text(true, env(&[("KONSOLE_VERSION", "240802")]));
+        assert_eq!(query, "\x1bPtmux;\x1b\x1b[16t\x1b\x1b[5n\x1b\x1b[c\x1b\\");
         // Empty values do not count, as in ratatui-image.
         assert!(query_text(false, env(&[("WEZTERM_EXECUTABLE", "")])).contains("_Gi=31"));
     }
@@ -734,7 +972,7 @@ mod tests {
     fn inside_tmux_the_query_is_wrapped_for_passthrough() {
         let query = query_text(true, env(&[]));
         assert!(query.starts_with("\x1bPtmux;\x1b\x1b_Gi=31"), "{query:?}");
-        assert!(query.ends_with("\x1b\x1b[5n\x1b\\"), "{query:?}");
+        assert!(query.ends_with("\x1b\x1b[5n\x1b\x1b[c\x1b\\"), "{query:?}");
     }
 
     // ----- asking (writing the query and reading the answers) -----
@@ -742,7 +980,7 @@ mod tests {
     #[test]
     fn ask_writes_nothing_where_the_answers_cannot_be_read() {
         let mut written = Vec::new();
-        let result = ask_with(
+        let asked = ask_with(
             false,
             |bytes| {
                 written.extend_from_slice(bytes);
@@ -751,22 +989,26 @@ mod tests {
             |_| Ok(None),
             "query bytes",
             || false,
+            QUERY_TIMEOUT,
+            DRAIN_TIME,
         );
         assert!(
             written.is_empty(),
             "nothing must reach the terminal: {written:?}"
         );
-        let Err(QueryError::Io(error)) = result else {
-            panic!("expected an I/O error, got {result:?}");
-        };
-        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(
+            matches!(asked.answers, Err(QueryError::Unsupported)),
+            "{:?}",
+            asked.answers
+        );
+        assert!(!asked.owed);
     }
 
     #[test]
     fn ask_writes_then_reads_where_the_answers_can_be_read() {
         let mut written = Vec::new();
         let mut source = VecDeque::from(KITTY.to_vec());
-        let result = ask_with(
+        let asked = ask_with(
             true,
             |bytes| {
                 written.extend_from_slice(bytes);
@@ -775,11 +1017,250 @@ mod tests {
             |_| Ok(source.pop_front()),
             "query bytes",
             || false,
+            QUERY_TIMEOUT,
+            DRAIN_TIME,
         );
         assert_eq!(written, b"query bytes");
         assert_eq!(
-            result.expect("complete"),
+            asked.answers.expect("complete"),
             [Response::Kitty, Response::CellSize(Some((9, 18)))]
+        );
+        assert!(!asked.owed);
+    }
+
+    /// The answers a [`slow_terminal`] has not sent yet.
+    type Unread = Rc<RefCell<VecDeque<u8>>>;
+
+    /// A terminal whose answers come in two parts: `early` at once, `late` from `at` on
+    /// (a slow link), then nothing.
+    fn slow_terminal(
+        early: &[u8],
+        at: Instant,
+        late: &[u8],
+    ) -> (
+        Unread,
+        impl FnMut(Duration) -> io::Result<Option<u8>> + use<>,
+    ) {
+        let mut early = VecDeque::from(early.to_vec());
+        let late = Rc::new(RefCell::new(VecDeque::from(late.to_vec())));
+        let unread = Rc::clone(&late);
+        let read_byte = move |wait: Duration| {
+            if let Some(byte) = early.pop_front() {
+                return Ok(Some(byte));
+            }
+            let now = Instant::now();
+            if now >= at
+                && let Some(byte) = late.borrow_mut().pop_front()
+            {
+                return Ok(Some(byte));
+            }
+            let until_late = at.saturating_duration_since(now);
+            std::thread::sleep(if until_late.is_zero() {
+                wait
+            } else {
+                wait.min(until_late)
+            });
+            Ok(None)
+        };
+        (unread, read_byte)
+    }
+
+    /// Asks with a `timeout` and `drain` time, for tests that run in milliseconds.
+    /// A terminal whose answers come in two parts: `early` at once, and `late` only
+    /// after the reader has passed its deadline, `timeout` after it started. That time
+    /// is counted from the first read, which comes after the reader set its deadline, and
+    /// `late` is released only to the reads after one that ended past it: the reader
+    /// checks its deadline before every read, so those reads come after the deadline
+    /// however slow the machine is.
+    fn split_by_the_deadline(
+        early: &[u8],
+        timeout: Duration,
+        late: &[u8],
+    ) -> (
+        Unread,
+        impl FnMut(Duration) -> io::Result<Option<u8>> + use<>,
+    ) {
+        let mut early = VecDeque::from(early.to_vec());
+        let late = Rc::new(RefCell::new(VecDeque::from(late.to_vec())));
+        let unread = Rc::clone(&late);
+        let mut deadline = None;
+        let mut passed = false;
+        let read_byte = move |wait: Duration| {
+            let deadline = *deadline.get_or_insert_with(|| Instant::now() + timeout);
+            if let Some(byte) = early.pop_front() {
+                return Ok(Some(byte));
+            }
+            if passed && let Some(byte) = late.borrow_mut().pop_front() {
+                return Ok(Some(byte));
+            }
+            std::thread::sleep(wait);
+            passed = passed || Instant::now() >= deadline;
+            Ok(None)
+        };
+        (unread, read_byte)
+    }
+
+    fn ask_quickly(
+        read_byte: impl FnMut(Duration) -> io::Result<Option<u8>>,
+        stop: impl Fn() -> bool,
+        timeout: Duration,
+        drain: Duration,
+    ) -> Asked {
+        ask_with(true, |_| Ok(()), read_byte, "query", stop, timeout, drain)
+    }
+
+    #[test]
+    fn an_answer_split_by_the_deadline_is_drained() {
+        // The deadline falls inside the kitty answer: its tail must not reach crossterm,
+        // which would read `3` and start a game. A key typed after the answers is kept.
+        let timeout = Duration::from_millis(40);
+        let (unread, read_byte) = split_by_the_deadline(
+            b"\x1b_Gi=",
+            timeout,
+            b"31;OK\x1b\\\x1b[?62;c\x1b[6;18;9t\x1b[0n\x1b[?62;cq",
+        );
+        let asked = ask_quickly(read_byte, || false, timeout, Duration::from_secs(5));
+        assert!(
+            matches!(asked.answers, Err(QueryError::Timeout)),
+            "{:?}",
+            asked.answers
+        );
+        assert!(!asked.owed, "the drain read the rest of the answers");
+        assert_eq!(
+            Vec::from(unread.borrow().clone()),
+            b"q",
+            "read up to the status report only"
+        );
+    }
+
+    #[test]
+    fn answers_owed_at_a_quit_signal_are_drained() {
+        // A quit signal after a few bytes: the rest is read and dropped, so the shell does
+        // not get it once the program has ended.
+        let mut source = VecDeque::from([KITTY, KITTY_ATTRIBUTES, b"q"].concat());
+        let read = Cell::new(0);
+        let asked = ask_quickly(
+            |_| {
+                read.set(read.get() + 1);
+                Ok(source.pop_front())
+            },
+            || read.get() >= 3,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        );
+        assert!(
+            matches!(asked.answers, Err(QueryError::Interrupted)),
+            "{:?}",
+            asked.answers
+        );
+        assert!(!asked.owed);
+        assert_eq!(Vec::from(source), b"q");
+    }
+
+    #[test]
+    fn the_device_attributes_after_the_status_report_are_read_but_not_as_sixel() {
+        // A Sixel terminal's second device attributes answer, after the status report:
+        // it is read (so crossterm never sees it), and it names no capability.
+        let mut source = VecDeque::from([PLAIN, b"\x1b[?63;4c".as_slice(), b"q"].concat());
+        let asked = ask_quickly(
+            |_| Ok(source.pop_front()),
+            || false,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        );
+        assert!(!asked.owed);
+        assert_eq!(asked.answers.expect("complete"), []);
+        assert_eq!(Vec::from(source), b"q", "nothing after it is read");
+    }
+
+    #[test]
+    fn a_missing_attributes_answer_is_waited_for_at_most_the_drain_time() {
+        let mut source = VecDeque::from(KITTY.to_vec());
+        let started = Instant::now();
+        let asked = ask_quickly(
+            |wait| {
+                let byte = source.pop_front();
+                if byte.is_none() {
+                    std::thread::sleep(wait);
+                }
+                Ok(byte)
+            },
+            || false,
+            Duration::from_secs(5),
+            Duration::from_millis(60),
+        );
+        let took = started.elapsed();
+        assert!(asked.answers.is_ok());
+        assert!(!asked.owed, "the answers the query reads all came");
+        assert!(took >= Duration::from_millis(60), "{took:?}");
+        assert!(took < Duration::from_secs(2), "{took:?}");
+    }
+
+    #[test]
+    fn the_drain_waits_at_most_its_time() {
+        // Nothing comes: after the deadline the drain waits its 200 ms, no longer, and the
+        // answers are still owed.
+        let started = Instant::now();
+        let asked = ask_quickly(
+            |wait| {
+                std::thread::sleep(wait);
+                Ok(None)
+            },
+            || false,
+            Duration::from_millis(20),
+            Duration::from_millis(60),
+        );
+        let took = started.elapsed();
+        assert!(matches!(asked.answers, Err(QueryError::Timeout)));
+        assert!(asked.owed, "the answers may still come");
+        assert!(took >= Duration::from_millis(80), "{took:?}");
+        assert!(took < Duration::from_secs(2), "{took:?}");
+        // Bytes that never end in a status report do not keep it going either.
+        let started = Instant::now();
+        let asked = ask_quickly(
+            |_| Ok(Some(b'x')),
+            || false,
+            Duration::from_millis(20),
+            Duration::from_millis(60),
+        );
+        assert!(asked.owed);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(DRAIN_TIME, Duration::from_millis(200));
+    }
+
+    #[test]
+    fn a_complete_answer_needs_no_drain() {
+        let (unread, read_byte) =
+            slow_terminal(&[KITTY, KITTY_ATTRIBUTES].concat(), Instant::now(), b"q");
+        let asked = ask_quickly(read_byte, || false, Duration::from_secs(5), Duration::ZERO);
+        assert!(asked.answers.is_ok());
+        assert!(!asked.owed);
+        assert_eq!(Vec::from(unread.borrow().clone()), b"q");
+    }
+
+    #[test]
+    fn late_answers_are_expected_only_when_the_drain_did_not_read_them() {
+        let owed = |answers: Answers, owed| {
+            detect_from(Asked { answers, owed }, false, env(&[]), None).answers_pending
+        };
+        assert!(owed(Err(QueryError::Timeout), true));
+        assert!(owed(Err(QueryError::Interrupted), true));
+        assert!(!owed(Err(QueryError::Timeout), false), "drained");
+        assert!(!owed(Err(QueryError::Interrupted), false), "drained");
+        assert!(!owed(answers(KITTY), false));
+        // The warning stays: the query did not finish in time.
+        let drained = detect_from(
+            Asked {
+                answers: Err(QueryError::Timeout),
+                owed: false,
+            },
+            false,
+            env(&[]),
+            None,
+        );
+        assert_eq!(
+            drained.warning.as_deref(),
+            Some("graphics query: no answer within 1 s; images use half-blocks")
         );
     }
 
@@ -919,11 +1400,40 @@ mod tests {
             interpret(answers(SIXEL), false, env(&[]), None),
             detection(ProtocolType::Sixel, (10, 20))
         );
-        // The answer wins over an environment hint.
+        // Other terminals the environment names only decide when nothing answers.
+        for pairs in [
+            &[("TERM_PROGRAM", "vscode")][..],
+            &[("TERM_PROGRAM", "mintty")],
+        ] {
+            assert_eq!(
+                interpret(answers(SIXEL), false, env(pairs), None).protocol,
+                ProtocolType::Sixel,
+                "{pairs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn iterm2_wins_over_a_sixel_answer_when_the_environment_names_iterm2_or_wezterm() {
+        // iTerm2 and WezTerm answer the sixel probe too, but draw iTerm2 pictures better.
+        for (is_tmux, pairs) in [
+            (false, &[("TERM_PROGRAM", "iTerm.app")][..]),
+            (false, &[("LC_TERMINAL", "iTerm2")]),
+            (false, &[("TERM_PROGRAM", "WezTerm")]),
+            (true, &[("ITERM_SESSION_ID", "w0t0p0")]),
+            (true, &[("WEZTERM_EXECUTABLE", "/usr/bin/wezterm-gui")]),
+        ] {
+            assert_eq!(
+                interpret(answers(SIXEL), is_tmux, env(pairs), None),
+                detection(ProtocolType::Iterm2, (10, 20)),
+                "{pairs:?}"
+            );
+        }
+        // A kitty answer still wins.
         let get = env(&[("TERM_PROGRAM", "iTerm.app")]);
         assert_eq!(
-            interpret(answers(SIXEL), false, get, None).protocol,
-            ProtocolType::Sixel
+            interpret(answers(KITTY_AND_SIXEL), false, get, None).protocol,
+            ProtocolType::Kitty
         );
     }
 
@@ -1030,6 +1540,24 @@ mod tests {
     }
 
     #[test]
+    fn a_platform_that_cannot_ask_uses_half_blocks_without_a_warning() {
+        // Nothing the person can fix, so nothing on the menu.
+        assert_eq!(
+            interpret(
+                Err(QueryError::Unsupported),
+                false,
+                env(&[("TERM_PROGRAM", "iTerm.app")]),
+                Some(CellSize::new(8, 16))
+            ),
+            detection(ProtocolType::Halfblocks, (8, 16))
+        );
+        assert_eq!(
+            interpret(Err(QueryError::Unsupported), false, env(&[]), None),
+            detection(ProtocolType::Halfblocks, (10, 20))
+        );
+    }
+
+    #[test]
     fn no_answer_falls_back_to_half_blocks_with_a_warning() {
         let silent = interpret(
             Err(QueryError::Timeout),
@@ -1130,6 +1658,56 @@ mod tests {
             [Response::CellSize(Some((8, 16)))]
         );
         assert_eq!(left, b"\x1b[?62;4c");
+    }
+
+    #[test]
+    fn a_measurement_writes_nothing_where_the_answers_cannot_be_read() {
+        let mut meter = FontMeter::default();
+        let mut written = Vec::new();
+        let answers = meter.ask_with(
+            false,
+            |bytes| {
+                written.extend_from_slice(bytes);
+                Ok(())
+            },
+            |_: Duration| -> io::Result<Option<u8>> { panic!("nothing is read") },
+            false,
+            QUERY_TIMEOUT,
+            || false,
+        );
+        assert!(
+            written.is_empty(),
+            "nothing must reach the terminal: {written:?}"
+        );
+        assert!(
+            matches!(answers, Err(QueryError::Unsupported)),
+            "{answers:?}"
+        );
+        assert_eq!(
+            meter.owed_at(Instant::now()),
+            0,
+            "no answers are owed by it"
+        );
+    }
+
+    #[test]
+    fn a_measurement_writes_its_query_then_reads_its_answer() {
+        let mut meter = FontMeter::default();
+        let mut written = Vec::new();
+        let mut source = VecDeque::from(font_answer(11, 22));
+        let answers = meter.ask_with(
+            true,
+            |bytes| {
+                written.extend_from_slice(bytes);
+                Ok(())
+            },
+            |_| Ok(source.pop_front()),
+            true,
+            QUERY_TIMEOUT,
+            || false,
+        );
+        assert_eq!(written, font_query_text(true).as_bytes());
+        assert_eq!(measured_font(answers, None), Some(CellSize::new(11, 22)));
     }
 
     #[test]

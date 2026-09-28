@@ -6,10 +6,7 @@ edition = "2024"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-drawille = "0.3.0"
-# env_logger = "0.10.1"
 log = "0.4.20"
-mockall = "0.13.1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -18,11 +15,9 @@ ratatui = "0.30"
 signal-hook = "0.4"
 ratatui-image = { version = "11.1", default-features = false, features = ["crossterm"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
-rustix = { version = "1", features = ["event"] }
+rustix = { version = "1", features = ["event", "fs"] }
 
 [dev-dependencies]
-env_logger = "0.10.1"
-mockall = "0.13.1"
 proptest = "1"
 criterion = "0.5"
 insta = "1"
@@ -75,6 +70,3 @@ opt-level = 3
 
 [profile.test]
 build-override.debug = true
-
-[env]
-RUST_LOG = "debug"

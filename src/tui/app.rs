@@ -14,8 +14,9 @@
 //! the game-over overlay, else the board. Ctrl+C is the one global key: it asks to quit from anywhere.
 //! Ctrl+S opens the PGN save dialog from the board, the command box and the game-over
 //! overlay. Esc typed quickly before a key arrives as Alt+key: outside text fields it is
-//! handled as both keys; in the command box and the text dialogs Alt chords are ignored, so
-//! readline habits (Alt+B, Alt+F, ...) neither change the text nor reach the board.
+//! handled as both keys (the key is dropped when the Esc put the focus in a text field); in
+//! the command box and the text dialogs Alt chords are ignored, so readline habits (Alt+B,
+//! Alt+F, ...) neither change the text nor reach the board.
 //!
 //! The computer player is called "Jev" when the engine uses Jev ([`Engine::uses_jev`]) and
 //! "Local search" otherwise, in every label, message and saved PGN.
@@ -38,14 +39,16 @@
 //! one ([`EngineOutcome::Failed`]), the app stops asking and says so; space retries, from
 //! the board or an empty command box.
 //!
-//! Actions that throw away a game in progress (quit, new game, menu, resign) ask first, and
-//! their confirmation defaults to No, so a stray Enter never confirms one.
+//! Actions that throw away a game in progress (at least one move played and the game not
+//! over: quit, new game, menu) ask first, and so does resigning; their confirmation defaults
+//! to No, so a stray Enter never confirms one.
 //!
 //! In debug mode ([`App::with_debug`]) every Jev exchange that comes back with an engine
 //! reply is kept in a [`History`], stale replies included, and queued for the debug log.
-//! `d` on the board opens the full-screen exchange view ([`ExchangeView`]), which takes the
-//! keys (after the dialogs and Ctrl+C) until Esc closes it; engine replies are still applied
-//! underneath. The first debug log failure is shown once as a status message.
+//! `d` on the board or the game-over overlay opens the full-screen exchange view
+//! ([`ExchangeView`]), which takes the keys (after the dialogs and Ctrl+C) until Esc closes
+//! it; engine replies are still applied underneath. The first debug log failure is shown
+//! once as a status message.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -59,8 +62,10 @@ use ratatui::crossterm::event::{
 use ratatui::layout::{Position as CellPosition, Rect};
 use ratatui_image::picker::{Picker, ProtocolType};
 
-use super::board::{BoardGeometry, CellSize, Highlights, PieceImages, square_at};
-use super::debug::{DebugLog, DebugSession, Exchange, ExchangeView, History};
+use super::board::{
+    BoardGeometry, CellSize, Highlights, PieceImages, min_picture_square, square_at,
+};
+use super::debug::{self, BodyCache, DebugLog, DebugSession, Exchange, ExchangeView, History};
 use super::event::AppEvent;
 use super::files::{SaveError, pgn_export, resolve_path, tilde_path, today, write_file};
 use super::glyphs::{self, GlyphSet, Palette};
@@ -600,6 +605,14 @@ struct Pending {
     since: Instant,
 }
 
+/// The Jev exchange behind an engine reply, in debug mode.
+enum Trace {
+    /// Not kept yet (`None` without debug mode or without an exchange).
+    New(Option<Box<Exchange>>),
+    /// Kept when the reply arrived while paused: its record number.
+    Held(Option<u64>),
+}
+
 /// A piece picked up with the mouse button still held.
 #[derive(Clone, Copy, Debug)]
 struct Drag {
@@ -633,6 +646,11 @@ pub struct App {
     debug: Option<DebugSession>,
     /// The exchange view, while it is open (only in debug mode).
     exchange_view: Option<ExchangeView>,
+    /// The exchange view's body text for the exchange on screen; empty while the view
+    /// is closed.
+    exchange_body: BodyCache,
+    /// The exchange view's page size at its last draw, kept for when it opens again.
+    exchange_page: usize,
     pick_side: fn() -> Side,
     today: fn() -> String,
     home: Option<PathBuf>,
@@ -651,10 +669,6 @@ pub struct App {
     command: LineEditor,
     command_focused: bool,
     message: Option<Message>,
-    /// A debug log failure found while the Menu is up (`message` is not drawn there and
-    /// [`App::start`] clears `message` for the new game): kept until a game screen
-    /// ([`Screen::Playing`] or [`Screen::GameOver`]) can show it ([`App::report_log_failure`]).
-    pending_log_failure: Option<Message>,
     move_scroll: usize,
 
     generation: u64,
@@ -669,9 +683,9 @@ pub struct App {
     engine_failed: bool,
     /// Jev vs Jev is paused: no request is sent and no move is played.
     paused: bool,
-    /// An answer that arrived while paused, applied when play resumes, with its Jev
-    /// exchange.
-    held: Option<(EngineOutcome, Option<Box<Exchange>>)>,
+    /// An answer that arrived while paused, applied when play resumes, with the number of
+    /// its Jev exchange, kept (marked held) and logged when it arrived.
+    held: Option<(EngineOutcome, Option<u64>)>,
     step_delay: Duration,
     /// When the last Jev vs Jev move was applied; the next request is due one step
     /// delay later. `None` means due now.
@@ -717,6 +731,8 @@ impl App {
             piece_images: PieceImages::new(),
             debug: None,
             exchange_view: None,
+            exchange_body: BodyCache::default(),
+            exchange_page: 0,
             pick_side: random_side,
             today,
             home: std::env::var_os("HOME").map(PathBuf::from),
@@ -733,7 +749,6 @@ impl App {
             command: LineEditor::new(),
             command_focused: false,
             message: None,
-            pending_log_failure: None,
             move_scroll: 0,
             generation: 0,
             pending: None,
@@ -1209,10 +1224,15 @@ impl App {
             if self.typing() {
                 return;
             }
-            // Elsewhere it is most likely Esc typed quickly before the key: handle both.
+            // Elsewhere it is most likely Esc typed quickly before the key: handle both,
+            // unless that Esc put the focus in a text field (it closed a promotion picker
+            // typed from the command box, or declined an overwrite typed in the save
+            // dialog), where the key would be typed into the text.
             if let KeyCode::Char(c) = key.code {
                 self.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-                self.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+                if !self.typing() {
+                    self.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+                }
                 return;
             }
         }
@@ -1319,6 +1339,7 @@ impl App {
                 Some('s') => self.game_over_button(Button::SavePgn),
                 Some('m') => self.game_over_button(Button::Menu),
                 Some('u') => self.undo(),
+                Some('d') => self.open_exchanges(),
                 Some('q') => self.request_quit(),
                 _ => {}
             },
@@ -1388,7 +1409,9 @@ impl App {
     /// Opens the exchange view on the newest exchange, or says debug mode is off.
     fn open_exchanges(&mut self) {
         match &self.debug {
-            Some(debug) => self.exchange_view = Some(ExchangeView::open(debug.history())),
+            Some(debug) => {
+                self.exchange_view = Some(ExchangeView::open(debug.history(), self.exchange_page));
+            }
             None => self.show(Message::info(DEBUG_OFF)),
         }
     }
@@ -1637,32 +1660,29 @@ impl App {
         }
         self.pending = None;
         if self.paused {
-            // Paused while the engine was thinking: nothing is played until space resumes.
-            self.held = Some((reply.outcome, reply.exchange));
+            // Paused while the engine was thinking: nothing is played until space resumes,
+            // but the exchange is kept and logged now, so quitting first never loses it.
+            let held = self.hold_exchange(reply.exchange);
+            self.held = Some((reply.outcome, held));
             return;
         }
-        self.apply_outcome(reply.outcome, reply.exchange, now);
+        self.apply_outcome(reply.outcome, Trace::New(reply.exchange), now);
     }
 
-    /// Plays a move the worker produced, or records why there is none. `exchange` is the
+    /// Plays a move the worker produced, or records why there is none. `trace` is the
     /// Jev exchange behind the move, kept as played or, for an illegal move, as not.
-    fn apply_outcome(
-        &mut self,
-        outcome: EngineOutcome,
-        exchange: Option<Box<Exchange>>,
-        now: Instant,
-    ) {
+    fn apply_outcome(&mut self, outcome: EngineOutcome, trace: Trace, now: Instant) {
         match outcome {
             EngineOutcome::Move(computer) => {
                 if let Err(error) = self.game.play(computer.mv) {
-                    self.record_exchange(exchange, true);
+                    self.keep_trace(trace, true);
                     self.engine_failure(&format!(
                         "engine returned an illegal move {}: {error}",
                         computer.mv
                     ));
                     return;
                 }
-                self.record_exchange(exchange, false);
+                self.keep_trace(trace, false);
                 let recovered = computer.note.as_deref() == Some(ENGINE_ERROR_NOTE);
                 self.last_computer = Some((self.game.moves().len(), computer));
                 // Notes about the turn just played (a move typed too early, an undo) are
@@ -1691,10 +1711,36 @@ impl App {
     /// Plays the answer held while paused, once play has resumed.
     fn release_held(&mut self, now: Instant) {
         if !self.paused
-            && let Some((outcome, exchange)) = self.held.take()
+            && let Some((outcome, held)) = self.held.take()
         {
-            self.apply_outcome(outcome, exchange, now);
+            self.apply_outcome(outcome, Trace::Held(held), now);
         }
+    }
+
+    /// Keeps the Jev exchange behind a reply as played or, when `stale`, as not: a new
+    /// one is recorded ([`App::record_exchange`]), a held one settled.
+    fn keep_trace(&mut self, trace: Trace, stale: bool) {
+        match trace {
+            Trace::New(exchange) => self.record_exchange(exchange, stale),
+            Trace::Held(number) => {
+                if let (Some(debug), Some(number)) = (&mut self.debug, number) {
+                    debug.settle(number, stale);
+                }
+            }
+        }
+    }
+
+    /// Keeps `exchange`, whose reply is held while paused, marked held (and logs it), and
+    /// returns its number. Without debug mode it is dropped.
+    fn hold_exchange(&mut self, exchange: Option<Box<Exchange>>) -> Option<u64> {
+        let (Some(debug), Some(exchange)) = (&mut self.debug, exchange) else {
+            return None;
+        };
+        let number = debug.hold(*exchange, SystemTime::now());
+        if let Some(view) = &mut self.exchange_view {
+            view.follow(debug.history());
+        }
+        Some(number)
     }
 
     /// Keeps `exchange` in debug mode (`stale` when its move was not played) and shows it
@@ -1709,26 +1755,37 @@ impl App {
         }
     }
 
-    /// Shows the debug log's failure, the one time it is reported. Found while a game
-    /// screen is up, it is shown at once; found while the Menu is up (which never draws
-    /// `message`, and whose next game start clears it) it is kept in
-    /// `pending_log_failure` and shown as soon as a game screen can, rather than being
-    /// lost silently.
+    /// Shows the debug log's failure, or that it dropped exchanges ([`debug::LOG_BEHIND`]),
+    /// the one time the log reports it; a failure found at the same time wins. Only a
+    /// game screen ([`Screen::Playing`] or [`Screen::GameOver`]) asks: the Menu never draws
+    /// `message`, and the next game start clears it, so while the Menu is up the log keeps
+    /// what it has to report until a game screen can show it.
     fn report_log_failure(&mut self) {
-        if let Some(failure) = self.debug.as_mut().and_then(DebugSession::log_failure) {
-            let text = format!("debug log disabled: {}", failure.reason);
-            let message = match &failure.path {
-                Some(path) => Message::error(format!("{text}: "))
-                    .with_path(tilde_path(path, self.home.as_deref())),
-                None => Message::error(text),
-            };
-            self.pending_log_failure = Some(message);
+        if !matches!(self.screen, Screen::Playing | Screen::GameOver) {
+            return;
         }
-        if matches!(self.screen, Screen::Playing | Screen::GameOver)
-            && let Some(message) = self.pending_log_failure.take()
-        {
-            self.show(message);
-        }
+        let Some(debug) = self.debug.as_mut() else {
+            return;
+        };
+        let dropped = debug.log_dropped();
+        let message = match debug.log_failure() {
+            Some(failure) => {
+                let text = "debug log disabled: ";
+                match &failure.path {
+                    // The path is the message's end, where it is shortened best when it
+                    // does not fit, so the reason goes last with it.
+                    Some(path) if failure.reason == debug::LINK => Message::error(text).with_path(
+                        format!("{} {}", tilde_path(path, self.home.as_deref()), debug::LINK),
+                    ),
+                    Some(path) => Message::error(format!("{text}{}: ", failure.reason))
+                        .with_path(tilde_path(path, self.home.as_deref())),
+                    None => Message::error(format!("{text}{}", failure.reason)),
+                }
+            }
+            None if dropped => Message::error(debug::LOG_BEHIND),
+            None => return,
+        };
+        self.show(message);
     }
 
     /// True when it is the engine's turn, nothing stops it, and in Jev vs Jev the step
@@ -1836,8 +1893,8 @@ impl App {
     fn invalidate(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.pending = None;
-        if let Some((_, exchange)) = self.held.take() {
-            self.record_exchange(exchange, true);
+        if let Some((_, held)) = self.held.take() {
+            self.keep_trace(Trace::Held(held), true);
         }
         self.engine_failed = false;
         self.selected = None;
@@ -1971,7 +2028,22 @@ impl App {
 
     fn cycle_glyphs(&mut self) {
         self.glyphs = self.glyphs.next(self.images_available());
-        self.show(Message::info(format!("glyphs: {}", self.glyphs)));
+        let mut text = format!("glyphs: {}", self.glyphs);
+        if self.glyphs == GlyphSet::Image && self.squares_too_small_for_pictures() {
+            // The Image style then looks just like Solid.
+            text.push_str(" (squares too small for pictures)");
+        }
+        self.show(Message::info(text));
+    }
+
+    /// True when the board as last drawn has squares smaller than pictures need
+    /// ([`min_picture_square`] for the picker's protocol).
+    fn squares_too_small_for_pictures(&self) -> bool {
+        let (Some(picker), Some(board)) = (&self.picker, &self.hits.board) else {
+            return false;
+        };
+        let (width, height) = min_picture_square(picker.protocol_type());
+        board.square_w < width || board.square_h < height
     }
 
     fn change_step_delay(&mut self, direction: i8) {
@@ -1989,7 +2061,7 @@ impl App {
     }
 
     fn request_quit(&mut self) {
-        if self.screen == Screen::Playing && self.game.outcome().is_none() {
+        if self.game_in_progress() {
             self.confirm(Question::Quit);
         } else {
             self.quit = true;
@@ -2413,12 +2485,24 @@ impl App {
         self.too_small = is_too_small(frame.area());
         // Lent to the draw, which reads the rest of the app and keeps new pictures in it.
         let mut images = std::mem::take(&mut self.piece_images);
-        let drawn = panels::draw(self, &mut images, frame, now);
+        let mut bodies = std::mem::take(&mut self.exchange_body);
+        let drawn = panels::draw(self, &mut images, &mut bodies, frame, now);
         self.piece_images = images;
+        // Only the exchange on screen keeps its body rendered.
+        if self.exchange_view.is_some() {
+            self.exchange_body = bodies;
+        }
+        // Shown from the next frame on; only the first failure is reported.
+        if let Some(reason) = self.piece_images.take_failure() {
+            self.show(Message::error(format!("pictures unavailable: {reason}")));
+        }
         self.hits = drawn.hits;
         self.move_scroll = drawn.move_scroll;
         if self.exchange_view.is_some() {
             self.exchange_view = drawn.exchange_view;
+            if let Some(view) = self.exchange_view {
+                self.exchange_page = view.page;
+            }
         }
     }
 }
@@ -2557,7 +2641,7 @@ mod tests {
     use crate::engine::EngineConfig;
     use crate::engine::{MoveSource, analyse, recorded_exchange};
     use crate::tui::board::square_rect;
-    use crate::tui::debug::NO_LOG_PATH;
+    use crate::tui::debug::{LOG_BEHIND, LOG_QUEUE, NO_LOG_PATH};
     use crate::tui::graphics;
     use crate::tui::panels::HELP_LINES;
     use crate::tui::test_support::engine::{
@@ -2999,7 +3083,8 @@ mod tests {
     fn alt_key_is_escape_then_the_key_outside_text_fields() {
         // Esc typed quickly before a key arrives as Alt+key.
         let mut h = hvh();
-        h.click_square(sq("e2"));
+        h.moves(&["e4"]);
+        h.click_square(sq("e7"));
         h.alt('f');
         assert_eq!(h.app.selected(), None, "Esc dropped the piece");
         assert!(h.app.flipped(), "then f flipped the board");
@@ -3017,6 +3102,41 @@ mod tests {
         h.alt('1');
         assert_eq!(h.app.mode(), Mode::HumanVsHuman);
         assert_eq!(h.app.screen_name(), "playing");
+    }
+
+    #[test]
+    fn an_alt_chord_whose_escape_opens_a_text_field_drops_its_key() {
+        // Esc closes a promotion picker typed from the command box and puts the move text
+        // back in the box: the key after it must not be typed there.
+        let mut h = hvh();
+        h.command(&format!(":fen {PROMOTION_FEN}"));
+        h.command("e8");
+        assert_eq!(h.app.dialog_name(), Some("promotion"));
+        h.alt('q');
+        assert_eq!(h.app.dialog_name(), None);
+        assert!(h.app.command_has_focus());
+        assert_eq!(h.app.command_text(), "e8");
+        assert!(h.uci().is_empty());
+        assert!(!h.app.should_quit());
+
+        // Esc declines an overwrite typed in the save dialog and gives the path back to
+        // edit: the key after it is dropped too.
+        let dir = TempDir::new("alt-overwrite");
+        let path = dir.join("game.pgn");
+        fs::write(&path, "old").expect("write");
+        let mut h = hvh();
+        h.moves(&["e4"]);
+        h.ctrl('s');
+        h.type_text(&path.display().to_string());
+        h.press(KeyCode::Enter);
+        assert_eq!(h.app.dialog_name(), Some("overwrite"));
+        h.alt('x');
+        assert_eq!(h.app.dialog_name(), Some("save pgn"));
+        assert!(matches!(
+            h.app.dialog(),
+            Some(Dialog::Input { editor, .. }) if editor.text() == path.display().to_string()
+        ));
+        assert_eq!(fs::read_to_string(&path).expect("read"), "old");
     }
 
     #[test]
@@ -3266,6 +3386,7 @@ mod tests {
         );
         h.command(":undo");
         assert_eq!(h.app.status_line(), NOTHING_TO_UNDO);
+        h.command("e4");
         h.command(":quit");
         assert_eq!(h.app.dialog_name(), Some("quit"));
     }
@@ -3327,6 +3448,10 @@ mod tests {
         assert_eq!(h.uci(), ["e2e4"]);
         h.send(paste("5\n"));
         assert_eq!(h.uci(), ["e2e4", "e7e5"]);
+        // A paste of nothing but a line break is an Enter for the text already typed.
+        h.type_text("Nf3");
+        h.send(paste("\r\n"));
+        assert_eq!(h.uci(), ["e2e4", "e7e5", "g1f3"]);
 
         let mut h = Harness::new();
         h.send(paste("e2e4\n"));
@@ -3416,7 +3541,38 @@ mod tests {
         h.command(":glyphs");
         h.command(":glyphs");
         assert_eq!(h.app.glyphs(), GlyphSet::Image);
-        assert_eq!(h.app.status_line(), "glyphs: image");
+        // Half-block pictures need 11×5 squares; 80×24 gives 5×2.
+        assert_eq!(
+            h.app.status_line(),
+            "glyphs: image (squares too small for pictures)"
+        );
+    }
+
+    #[test]
+    fn g_says_when_the_squares_are_too_small_for_pictures() {
+        let image_after_g = |protocol: ProtocolType, (width, height): (u16, u16)| {
+            let picker = graphics::picker_for(protocol, CellSize::DEFAULT);
+            let mut h = Harness::build(FakeEngine::local(), (width, height), Vec::new(), |app| {
+                app.with_picker(Some(picker))
+            });
+            h.char('1');
+            while h.app.glyphs() != GlyphSet::Image {
+                h.char('g');
+            }
+            h.app.status_line()
+        };
+        let too_small = "glyphs: image (squares too small for pictures)";
+        assert_eq!(image_after_g(ProtocolType::Halfblocks, (80, 24)), too_small);
+        assert_eq!(
+            image_after_g(ProtocolType::Halfblocks, (200, 60)),
+            "glyphs: image"
+        );
+        // Kitty, iTerm2 and Sixel pictures need only 5×2 squares.
+        assert_eq!(
+            image_after_g(ProtocolType::Sixel, (80, 24)),
+            "glyphs: image"
+        );
+        assert_eq!(image_after_g(ProtocolType::Kitty, (60, 20)), too_small);
     }
 
     /// A font size and protocol as the picker reports them.
@@ -3610,6 +3766,80 @@ mod tests {
     }
 
     #[test]
+    fn a_picture_that_cannot_be_encoded_shows_the_glyph_and_one_warning() {
+        let mut h = picture_app(ProtocolType::Sixel, CellSize::DEFAULT);
+        h.app.piece_images = PieceImages::with_encoder(|_, _, _| Err("no encoder".to_string()));
+        while h.app.glyphs() != GlyphSet::Image {
+            h.char('g');
+        }
+        h.draw();
+        let king = glyphs::glyph(GlyphSet::Solid, Piece::new(Side::White, PieceKind::King));
+        let screen = h.screen();
+        assert!(
+            screen.contains("pictures unavailable: no encoder"),
+            "the status says why: {screen}"
+        );
+        assert!(screen.contains(king), "the pieces show the Solid glyph");
+
+        // One warning: once another message replaced it, it does not come back, even
+        // when the pictures are dropped (a font change) and every encoding fails again.
+        h.char('g');
+        while h.app.glyphs() != GlyphSet::Image {
+            h.char('g');
+        }
+        h.app.piece_images.clear();
+        assert!(h.app.piece_images().is_empty());
+        h.draw();
+        assert!(
+            !h.app.piece_images().is_empty(),
+            "the pictures were tried again"
+        );
+        h.draw();
+        assert_eq!(
+            h.app.message().map(|message| message.text.as_str()),
+            Some("glyphs: image")
+        );
+        assert!(h.screen().contains(king));
+    }
+
+    #[test]
+    fn q_n_and_m_ask_only_while_a_game_is_in_progress() {
+        // No move played yet: there is nothing to throw away.
+        for key in ['q', 'n', 'm'] {
+            let mut h = hvh();
+            h.char(key);
+            assert_eq!(h.app.dialog_name(), None, "{key}");
+        }
+        let mut h = hvh();
+        h.char('q');
+        assert!(h.app.should_quit());
+        let mut h = hvh();
+        h.char('m');
+        assert_eq!(h.app.screen_name(), "menu");
+
+        // One move played: all three ask.
+        for (key, question) in [('q', "quit"), ('n', "new game"), ('m', "menu")] {
+            let mut h = hvh();
+            h.moves(&["e4"]);
+            h.char(key);
+            assert_eq!(h.app.dialog_name(), Some(question), "{key}");
+        }
+
+        // The game is over: none of them asks, from the overlay or from the board.
+        for dismissed in [false, true] {
+            for key in ['q', 'n', 'm'] {
+                let mut h = hvh();
+                h.moves(&["f3", "e5", "g4", "Qh4#"]);
+                if dismissed {
+                    h.press(KeyCode::Esc);
+                }
+                h.char(key);
+                assert_eq!(h.app.dialog_name(), None, "{key} dismissed={dismissed}");
+            }
+        }
+    }
+
+    #[test]
     fn new_game_and_menu_ask_while_a_game_is_in_progress() {
         let mut h = hvh();
         h.command("e4");
@@ -3664,6 +3894,11 @@ mod tests {
     fn quit_asks_only_while_a_game_is_in_progress() {
         let mut h = hvh();
         h.char('q');
+        assert!(h.app.should_quit(), "no move played yet: quits at once");
+
+        let mut h = hvh();
+        h.moves(&["e4"]);
+        h.char('q');
         assert_eq!(h.app.dialog_name(), Some("quit"));
         h.char('n');
         assert_eq!(h.app.dialog_name(), None);
@@ -3688,6 +3923,7 @@ mod tests {
     #[test]
     fn ctrl_c_works_from_any_focus() {
         let mut h = hvh();
+        h.moves(&["e4"]);
         h.char('/');
         h.ctrl('c');
         assert_eq!(h.app.dialog_name(), Some("quit"));
@@ -3695,6 +3931,7 @@ mod tests {
         assert!(h.app.should_quit());
 
         let mut h = hvh();
+        h.moves(&["e4"]);
         h.char('?');
         h.ctrl('c');
         assert_eq!(h.app.dialog_name(), Some("quit"));
@@ -3705,8 +3942,9 @@ mod tests {
     #[test]
     fn dialogs_are_modal_for_the_mouse() {
         let mut h = hvh();
+        h.moves(&["e4"]);
         h.char('q');
-        h.click_square(sq("e2"));
+        h.click_square(sq("e7"));
         assert_eq!(h.app.selected(), None);
         assert_eq!(h.app.dialog_name(), Some("quit"));
         h.click_hit(Hit::Button(Button::Cancel));
@@ -3856,9 +4094,10 @@ mod tests {
         h.respond(&request);
         assert_eq!(h.uci().len(), 2);
         assert!(!h.app.is_thinking());
+        // The local search's move, as the engine without a Jev key reports it.
         assert_eq!(
             h.app.last_computer().map(|c| c.source.clone()),
-            Some(MoveSource::Jev)
+            Some(MoveSource::Fallback)
         );
     }
 
@@ -4807,18 +5046,20 @@ mod tests {
         h
     }
 
-    /// Ticks until the status line starts with `start`, for up to 10 s.
+    /// Waits (up to 10 s) for the debug-log thread to end at its first error, then ticks
+    /// once and checks that the status line starts with `start`.
     fn wait_for_status(h: &mut Harness, start: &str) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !h.app.status_line().starts_with(start) {
-            assert!(
-                Instant::now() < deadline,
-                "status never said {start:?}: {:?}",
-                h.app.status_line()
-            );
-            std::thread::sleep(Duration::from_millis(5));
-            h.tick();
-        }
+        let debug = h.app.debug.as_ref().expect("debug mode");
+        assert!(
+            debug.wait_for_log_thread(),
+            "the debug-log thread still runs"
+        );
+        h.tick();
+        assert!(
+            h.app.status_line().starts_with(start),
+            "status never said {start:?}: {:?}",
+            h.app.status_line()
+        );
     }
 
     /// The exchanges kept, as (move, stale).
@@ -4831,6 +5072,16 @@ mod tests {
             .collect()
     }
 
+    /// Which kept exchanges are marked held, oldest first.
+    fn held(h: &Harness) -> Vec<bool> {
+        h.app
+            .exchanges()
+            .expect("debug mode")
+            .iter()
+            .map(|record| record.held)
+            .collect()
+    }
+
     #[test]
     fn d_says_when_debug_mode_is_off() {
         let mut h = hvh();
@@ -4840,6 +5091,35 @@ mod tests {
         assert_eq!(h.app.exchange_view(), None);
         assert_eq!(h.app.status_line(), DEBUG_OFF);
         assert_eq!(DEBUG_OFF, "debug mode is off (start with --debug)");
+    }
+
+    #[test]
+    fn d_works_from_the_game_over_overlay() {
+        let mut h = debug_app(
+            FakeEngine::local(),
+            (80, 24),
+            DebugLog::open(Err(NO_LOG_PATH.to_string())),
+        );
+        h.char('1');
+        h.moves(&FOOLS_MATE);
+        assert_eq!(h.app.screen_name(), "game over");
+        h.char('d');
+        assert!(h.app.exchange_view().is_some(), "d opens the exchange view");
+        assert!(h.screen().contains("Jev exchange"));
+        h.press(KeyCode::Esc);
+        assert_eq!(h.app.exchange_view(), None);
+        assert_eq!(
+            h.app.screen_name(),
+            "game over",
+            "Esc goes back to the overlay"
+        );
+
+        // Without debug mode it says so, as on the board.
+        let mut h = hvh();
+        h.moves(&FOOLS_MATE);
+        h.char('d');
+        assert_eq!(h.app.screen_name(), "game over");
+        assert_eq!(h.app.status_line(), DEBUG_OFF);
     }
 
     #[test]
@@ -4945,10 +5225,23 @@ mod tests {
         h.char(' ');
         h.reply_traced("e7e5");
         assert!(h.app.has_held_move());
-        assert!(kept(&h).is_empty(), "not decided yet");
+        assert_eq!(
+            kept(&h),
+            [("e5".to_string(), false)],
+            "kept when it arrives"
+        );
+        assert_eq!(held(&h), [true]);
+        h.char('d');
+        assert!(
+            h.screen().contains("held — not played yet"),
+            "{}",
+            h.screen()
+        );
+        h.press(KeyCode::Esc);
         h.char('u');
         assert_eq!(h.uci(), Vec::<String>::new());
         assert_eq!(kept(&h), [("e5".to_string(), true)], "undo dropped it");
+        assert_eq!(held(&h), [false]);
 
         let mut h = debug_app(
             FakeEngine::jev(),
@@ -4964,6 +5257,32 @@ mod tests {
         h.char(' ');
         assert_eq!(h.uci(), ["e2e4", "e7e5"]);
         assert_eq!(kept(&h), [("e5".to_string(), false)]);
+        assert_eq!(held(&h), [false], "played");
+    }
+
+    #[test]
+    fn quitting_while_an_answer_is_held_still_logs_it() {
+        let dir = TempDir::new("debug-app");
+        let path = dir.join("jev.jsonl");
+        let mut h = debug_app(FakeEngine::jev(), (80, 24), DebugLog::start(path.clone()));
+        h.char('5');
+        h.reply("e2e4");
+        h.at_ms(5_000);
+        h.tick();
+        h.char(' ');
+        h.reply_traced("e7e5");
+        assert!(h.app.has_held_move());
+        // What quitting does once the loop has ended.
+        h.app.close_debug_log(Duration::from_secs(10));
+        let text = fs::read_to_string(&path).expect("logged");
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 1, "{text}");
+        assert_eq!(lines[0]["played"], "e5");
+        assert_eq!(lines[0]["held"], true);
+        assert_eq!(lines[0]["stale"], false);
     }
 
     #[test]
@@ -5055,6 +5374,67 @@ mod tests {
     }
 
     #[test]
+    fn keys_after_switching_exchanges_scroll_in_the_same_batch() {
+        let mut h = debug_game();
+        h.moves(&["e4"]);
+        h.reply_traced("e7e5");
+        h.moves(&["d4"]);
+        h.reply_traced("d7d5");
+        h.char('d');
+        let page = h.app.exchange_view().expect("open").page;
+        assert!(page > 2, "{page}");
+        // Each batch is handled before the next draw, as the run loop does.
+        let batch = |h: &mut Harness, keys: &[KeyCode]| {
+            for &code in keys {
+                let _ = h.app.handle(key(code), h.now);
+            }
+            h.draw();
+            h.app.exchange_view().expect("open")
+        };
+        let view = batch(&mut h, &[KeyCode::Left, KeyCode::End]);
+        assert_eq!(view.shown, Some(1));
+        assert!(view.max_scroll > 0, "{view:?}");
+        assert_eq!(view.scroll, view.max_scroll, "End after ←");
+        let view = batch(&mut h, &[KeyCode::Right, KeyCode::PageDown, KeyCode::Down]);
+        assert_eq!(
+            (view.shown, view.scroll),
+            (Some(2), page),
+            "PgDn and ↓ after →"
+        );
+        // Opening the view keeps the page size too.
+        let view = batch(
+            &mut h,
+            &[KeyCode::Esc, KeyCode::Char('d'), KeyCode::PageDown],
+        );
+        assert_eq!(
+            (view.shown, view.scroll),
+            (Some(2), page - 1),
+            "PgDn after d"
+        );
+    }
+
+    #[test]
+    fn the_view_keeps_only_the_exchange_on_screen_rendered() {
+        let mut h = debug_game();
+        h.moves(&["e4"]);
+        h.reply_traced("e7e5");
+        assert_eq!(
+            h.app.exchange_body.holds(),
+            None,
+            "nothing shown, nothing rendered"
+        );
+        h.char('d');
+        let width = h.app.exchange_body.holds().expect("rendered").1;
+        assert_eq!(h.app.exchange_body.holds(), Some((1, width)));
+        h.press(KeyCode::Esc);
+        assert_eq!(
+            h.app.exchange_body.holds(),
+            None,
+            "dropped once the view closes"
+        );
+    }
+
+    #[test]
     fn a_resize_keeps_the_view_scroll_within_the_body() {
         let mut h = debug_game();
         h.moves(&["e4"]);
@@ -5106,54 +5486,6 @@ mod tests {
     }
 
     #[test]
-    fn the_status_border_says_debug_in_debug_mode() {
-        let top_row = |h: &Harness| h.screen().lines().next().unwrap_or_default().to_string();
-        let mut h = Harness::sized(FakeEngine::jev(), 120, 40);
-        h.char('2');
-        assert!(!top_row(&h).contains("DEBUG"));
-        let mut h = debug_app(
-            FakeEngine::jev(),
-            (120, 40),
-            DebugLog::open(Err(NO_LOG_PATH.to_string())),
-        );
-        h.char('2');
-        let row = top_row(&h);
-        assert!(row.contains("┌ Status ─ DEBUG ─"), "{row}");
-        assert!(row.contains(" You (White) vs Jev ┐"), "{row}");
-    }
-
-    #[test]
-    fn the_mode_title_keeps_the_border_and_debug_moves_to_the_line_when_narrow() {
-        // 80x24: both DEBUG and the mode title would not fit on the border together,
-        // so the mode title (chosen from the full room) keeps the border and DEBUG
-        // starts the first status line instead.
-        let mut h = debug_app(
-            FakeEngine::jev(),
-            (80, 24),
-            DebugLog::open(Err(NO_LOG_PATH.to_string())),
-        );
-        h.char('2');
-        let top_row = h.screen().lines().next().unwrap_or_default().to_string();
-        assert!(!top_row.contains("DEBUG"), "{top_row}");
-        assert!(top_row.contains(" You (White) vs Jev ┐"), "{top_row}");
-        let second_row = h.screen().lines().nth(1).unwrap_or_default().to_string();
-        assert!(second_row.contains("DEBUG White to move"), "{second_row}");
-
-        // 60x20: same precedence, with the shorter mode label.
-        let mut h = debug_app(
-            FakeEngine::jev(),
-            (60, 20),
-            DebugLog::open(Err(NO_LOG_PATH.to_string())),
-        );
-        h.char('2');
-        let top_row = h.screen().lines().next().unwrap_or_default().to_string();
-        assert!(!top_row.contains("DEBUG"), "{top_row}");
-        assert!(top_row.contains(" You (W) vs Jev ┐"), "{top_row}");
-        let second_row = h.screen().lines().nth(1).unwrap_or_default().to_string();
-        assert!(second_row.contains("DEBUG White to move"), "{second_row}");
-    }
-
-    #[test]
     fn each_exchange_becomes_a_log_line() {
         let dir = TempDir::new("debug-app");
         let path = dir.join("jev.jsonl");
@@ -5199,13 +5531,65 @@ mod tests {
         );
         h.moves(&["Nf3"]);
         assert_eq!(h.app.status_line(), "", "a move clears it");
+        // The log thread ended at the failure, so this exchange is only kept.
         h.reply_traced("b8c6");
-        for _ in 0..10 {
-            std::thread::sleep(Duration::from_millis(5));
-            h.tick();
-        }
+        h.tick();
         assert_eq!(h.app.status_line(), "", "reported once");
         assert_eq!(h.app.exchanges().map(History::len), Some(2), "still kept");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_log_that_is_a_link_is_named_in_the_status() {
+        let dir = TempDir::new("debug-app");
+        let target = dir.join("target.jsonl");
+        fs::write(&target, "").unwrap();
+        let link = dir.join("jev.jsonl");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut h = debug_app(FakeEngine::jev(), (200, 40), DebugLog::start(link.clone()));
+        h.char('2');
+        h.moves(&["e4"]);
+        h.reply_traced("e7e5");
+        wait_for_status(&mut h, "debug log disabled: ");
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        assert_eq!(
+            h.app.status_line(),
+            format!(
+                "debug log disabled: {} is a link",
+                tilde_path(&link, home.as_deref())
+            )
+        );
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "",
+            "nothing written through it"
+        );
+    }
+
+    #[test]
+    fn a_log_that_cannot_keep_up_warns_once() {
+        // Nothing takes the records, as when the debug-log thread is stuck writing.
+        let (log, queued, _failures) = DebugLog::stalled(PathBuf::from("jev.jsonl"));
+        let mut h = debug_app(FakeEngine::jev(), (200, 40), log);
+        h.char('2');
+        let request = request(&h.command("e4"));
+        h.press(KeyCode::Esc);
+        // Late answers to the same request are stale, and each is logged.
+        for _ in 0..=LOG_QUEUE + 1 {
+            let computer = traced_jev_move(request.game.position(), "e7e5");
+            h.answer(&request, EngineOutcome::Move(computer));
+        }
+        assert_eq!(h.app.status_line(), LOG_BEHIND);
+        assert!(h.app.message().is_some_and(|m| m.is_error));
+        h.moves(&["Nf3"]);
+        let computer = traced_jev_move(request.game.position(), "e7e5");
+        h.answer(&request, EngineOutcome::Move(computer));
+        assert_eq!(h.app.status_line(), "", "one warning");
+        assert_eq!(
+            queued.try_iter().count(),
+            LOG_QUEUE,
+            "the rest were dropped"
+        );
     }
 
     #[test]
@@ -5221,64 +5605,48 @@ mod tests {
     }
 
     #[test]
-    fn a_log_failure_found_on_the_menu_is_shown_once_a_game_starts() {
-        let dir = TempDir::new("debug-app");
-        // A folder where the file should be: every write fails.
-        let mut h = debug_app(
-            FakeEngine::jev(),
-            (120, 40),
-            DebugLog::start(dir.path().to_path_buf()),
-        );
-        h.char('2');
-        let request = request(&h.command("e4"));
-        h.press(KeyCode::Esc);
-        h.char('m');
-        h.char('y');
-        assert_eq!(h.app.screen_name(), "menu");
-        // The stale reply arrives, and its exchange is queued for the (failing) log,
-        // while the Menu is up.
-        let computer = traced_jev_move(request.game.position(), "e7e5");
-        h.answer(&request, EngineOutcome::Move(computer));
-        // Give the debug-log thread time to fail and report it back, all while still on
-        // the Menu, which never draws a message.
-        for _ in 0..20 {
-            std::thread::sleep(Duration::from_millis(5));
-            h.tick();
-        }
-        assert_eq!(h.app.screen_name(), "menu", "still on the menu");
-        assert!(h.app.message().is_none(), "the menu never shows it");
-        assert_eq!(h.app.status_line(), "");
-        // Starting a new game must not lose the failure found while it was pending.
-        h.char('2');
-        assert_eq!(h.app.screen_name(), "playing");
-        assert!(h.app.message().is_some_and(|m| m.is_error));
-        assert!(
-            h.app
-                .status_line()
-                .starts_with("debug log disabled: it is a folder: "),
-            "{}",
-            h.app.status_line()
-        );
-    }
-
-    #[test]
     fn a_log_failure_found_on_the_menu_waits_for_the_next_game() {
-        let mut h = debug_game();
-        h.moves(&["e4"]);
-        h.char('m');
-        h.char('y');
-        assert_eq!(h.app.screen(), Screen::Menu);
-        // Jev's answer comes on the menu: stale, but kept and logged, and the log fails.
-        h.reply_traced("e7e5");
-        h.tick();
-        assert_eq!(h.app.exchanges().map(History::len), Some(1));
-        assert_eq!(h.app.status_line(), "", "the menu shows no status line");
-        h.char('2');
-        assert_eq!(h.app.screen(), Screen::Playing);
-        assert_eq!(
-            h.app.status_line(),
-            "debug log disabled: no log file (set RCHESS_DEBUG_LOG, XDG_STATE_HOME or HOME)"
-        );
+        let dir = TempDir::new("debug-app");
+        // A log without a file fails at once; a folder where the file should be fails on
+        // the debug-log thread, which reports it back later.
+        let logs = [
+            (
+                DebugLog::open(Err(NO_LOG_PATH.to_string())),
+                format!("debug log disabled: {NO_LOG_PATH}"),
+            ),
+            (
+                DebugLog::start(dir.path().to_path_buf()),
+                "debug log disabled: it is a folder: ".to_string(),
+            ),
+        ];
+        for (log, failure) in logs {
+            let mut h = debug_app(FakeEngine::jev(), (120, 40), log);
+            h.char('2');
+            h.moves(&["e4"]);
+            h.char('m');
+            h.char('y');
+            assert_eq!(h.app.screen(), Screen::Menu);
+            // Jev's answer comes on the menu: stale, but kept and logged, and the log fails.
+            h.reply_traced("e7e5");
+            let debug = h.app.debug.as_ref().expect("debug mode");
+            assert!(
+                debug.wait_for_log_thread(),
+                "the debug-log thread still runs"
+            );
+            h.tick();
+            assert_eq!(h.app.exchanges().map(History::len), Some(1));
+            assert!(h.app.message().is_none(), "the menu never shows it");
+            assert_eq!(h.app.status_line(), "", "the menu shows no status line");
+            // Starting a new game must not lose it.
+            h.char('2');
+            assert_eq!(h.app.screen(), Screen::Playing);
+            assert!(h.app.message().is_some_and(|m| m.is_error));
+            assert!(
+                h.app.status_line().starts_with(&failure),
+                "{}",
+                h.app.status_line()
+            );
+        }
     }
 
     #[test]

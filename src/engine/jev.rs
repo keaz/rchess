@@ -39,6 +39,9 @@ const CONTENT_TYPE_HEADER: &str = "Content-Type";
 const CONTENT_TYPE: &str = "application/json";
 /// What a recorded exchange shows in place of the API key.
 const REDACTED: &str = "<redacted>";
+/// What a recorded exchange shows in place of a response body that is not JSON
+/// and still names the API key once its JSON escapes are decoded.
+const WITHHELD_BODY: &str = "<redacted: the body contained the API key>";
 
 /// One candidate move offered to Jev.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -160,10 +163,12 @@ pub struct JevExchange {
 pub struct JevAttempt {
     /// The HTTP status, or `None` when no response arrived.
     pub status: Option<u16>,
-    /// The response body as text (read under the 1 MiB cap), or `None` when no
-    /// response arrived or its body could not be read. A JSON body in which the key
-    /// had to be redacted after decoding is re-encoded, so it is not byte for byte
-    /// what the server sent.
+    /// The response body as text (read under the 1 MiB cap) with the key redacted,
+    /// or `None` when no response arrived or its body could not be read. A JSON body
+    /// in which the key had to be redacted after decoding is re-encoded, so it is not
+    /// byte for byte what the server sent; a body that is not JSON and names the key
+    /// only through JSON escapes is replaced by
+    /// `<redacted: the body contained the API key>`.
     pub response: Option<String>,
     /// Why the attempt failed, as the `JevError` message; `None` for an answer.
     pub error: Option<String>,
@@ -271,7 +276,7 @@ pub fn retry_delay(error: &JevError, attempt: u32) -> Option<Duration> {
 
 /// `text` with every occurrence of `secret` replaced by `<redacted>`. An empty
 /// secret redacts nothing.
-fn redact(text: &str, secret: &str) -> String {
+pub fn redact(text: &str, secret: &str) -> String {
     if secret.is_empty() {
         text.to_string()
     } else {
@@ -279,12 +284,14 @@ fn redact(text: &str, secret: &str) -> String {
     }
 }
 
-/// A response body with the key redacted, both in the raw text and, when the body is
-/// JSON, in the text a parser decodes from it: a server can echo the key with `\u`
-/// escapes that the raw text does not match. When decoding shows the key, the body
-/// is re-encoded from the redacted JSON, so no later parse can bring it back. The
-/// raw text also loses the key with `/` written as `\/`, JSON's other way to write
-/// it, in case a reader decodes part of a body that is not JSON as a whole.
+/// A response body as it is recorded: the key redacted, both in the raw text and,
+/// when the body is JSON, in the text a parser decodes from it: a server can echo the
+/// key with `\u` escapes that the raw text does not match. When decoding shows the
+/// key, the body is re-encoded from the redacted JSON, so no later parse can bring it
+/// back. The raw text also loses the key with `/` written as `\/`, JSON's other way
+/// to write it. A body that is not JSON as a whole but still names the key once its
+/// JSON escapes are decoded (a reader could decode part of it) is withheld whole.
+/// Only the record is redacted: the answer is parsed from the body as received.
 fn redact_body(text: &str, secret: &str) -> String {
     let text = redact(text, secret);
     let text = if secret.contains('/') {
@@ -293,6 +300,9 @@ fn redact_body(text: &str, secret: &str) -> String {
         text
     };
     let Ok(json) = serde_json::from_str::<Value>(&text) else {
+        if !secret.is_empty() && decode_json_escapes(&text).contains(secret) {
+            return WITHHELD_BODY.to_string();
+        }
         return text;
     };
     let redacted = redact_value(&json, secret);
@@ -300,6 +310,69 @@ fn redact_body(text: &str, secret: &str) -> String {
         text
     } else {
         redacted.to_string()
+    }
+}
+
+/// `text` with the escapes of a JSON string (`\uXXXX`, surrogate pairs included,
+/// `\/`, `\"`, `\\`, `\b`, `\f`, `\n`, `\r`, `\t`) decoded, read left to right as
+/// a JSON parser would. A backslash that starts no valid escape stays as it is.
+fn decode_json_escapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find('\\') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        match json_escape(rest) {
+            Some((c, used)) => {
+                out.push(c);
+                rest = &rest[used..];
+            }
+            None => {
+                out.push('\\');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The character the JSON escape at the start of `text` stands for and the bytes it
+/// takes, or `None` when `text` does not start with a valid escape.
+fn json_escape(text: &str) -> Option<(char, usize)> {
+    let simple = match text.as_bytes().get(1)? {
+        b'u' => {
+            let code = hex4(&text[2..])?;
+            if !(0xD800..=0xDBFF).contains(&code) {
+                return char::from_u32(code).map(|c| (c, 6));
+            }
+            let low = text[6..].strip_prefix("\\u").and_then(hex4)?;
+            if !(0xDC00..=0xDFFF).contains(&low) {
+                return None;
+            }
+            let code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+            return char::from_u32(code).map(|c| (c, 12));
+        }
+        b'/' => '/',
+        b'"' => '"',
+        b'\\' => '\\',
+        b'b' => '\u{8}',
+        b'f' => '\u{c}',
+        b'n' => '\n',
+        b'r' => '\r',
+        b't' => '\t',
+        _ => return None,
+    };
+    Some((simple, 2))
+}
+
+/// The value of the four hex digits `text` starts with.
+fn hex4(text: &str) -> Option<u32> {
+    let digits = text.get(..4)?;
+    if digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        u32::from_str_radix(digits, 16).ok()
+    } else {
+        None
     }
 }
 
@@ -325,7 +398,9 @@ fn bearer(key: &str) -> String {
     format!("Bearer {key}")
 }
 
-/// `error` with [`redact`] applied to its text.
+/// `error` with [`redact`] applied to its text. Transport and request errors carry
+/// text from the HTTP library, which can quote the URL or server bytes: after the
+/// key is redacted it goes through [`printable`] like the HTTP error snippet.
 fn redact_error(error: JevError, secret: &str) -> JevError {
     match error {
         JevError::Http {
@@ -337,16 +412,21 @@ fn redact_error(error: JevError, secret: &str) -> JevError {
             message: redact(&message, secret),
             retry_after,
         },
-        JevError::Transport(text) => JevError::Transport(redact(&text, secret)),
+        JevError::Transport(text) => {
+            JevError::Transport(printable(&redact(&text, secret), ERROR_SNIPPET_CHARS))
+        }
         JevError::InvalidResponse(text) => JevError::InvalidResponse(redact(&text, secret)),
-        JevError::Request(text) => JevError::Request(redact(&text, secret)),
+        JevError::Request(text) => {
+            JevError::Request(printable(&redact(&text, secret), ERROR_SNIPPET_CHARS))
+        }
         JevError::Timeout => JevError::Timeout,
     }
 }
 
 /// What one attempt produced: the answer or error, plus the status and the
-/// redacted response body when they arrived.
-struct Attempt {
+/// redacted response body when they arrived. [`JevClient::post`] turns it into the
+/// public [`JevAttempt`] record.
+struct RawAttempt {
     result: Result<ChoiceAnswer, JevError>,
     status: Option<u16>,
     response: Option<String>,
@@ -435,7 +515,7 @@ impl JevClient {
         let mut attempt = 1;
         loop {
             let started = Instant::now();
-            let Attempt {
+            let RawAttempt {
                 result,
                 status,
                 response,
@@ -461,9 +541,10 @@ impl JevClient {
         }
     }
 
-    /// One HTTP attempt. The response body is redacted ([`redact_body`]) before it is
-    /// parsed or cut into an error snippet, so no error can carry part of the key.
-    fn post_once(&self, body: &Value) -> Attempt {
+    /// One HTTP attempt. An answer is parsed from the body as received; the recorded
+    /// body and an error snippet come from the redacted body ([`redact_body`]), so no
+    /// error can carry part of the key, and every error is redacted too.
+    fn post_once(&self, body: &Value) -> RawAttempt {
         let sent = self
             .agent
             .post(&self.url)
@@ -475,7 +556,7 @@ impl JevClient {
         let mut response = match sent {
             Ok(response) => response,
             Err(error) => {
-                return Attempt {
+                return RawAttempt {
                     result: Err(redact_error(request_error(error), &self.api_key)),
                     status: None,
                     response: None,
@@ -493,11 +574,17 @@ impl JevClient {
             .body_mut()
             .with_config()
             .limit(MAX_BODY_BYTES)
-            .read_to_string()
-            .map(|text| redact_body(&text, &self.api_key));
+            .read_to_string();
         let (result, response) = match text {
-            Ok(text) if status == 200 => (parse_answer(&text), Some(text)),
-            Ok(text) => (Err(http_error(status, &text, retry_after)), Some(text)),
+            Ok(text) => {
+                let recorded = redact_body(&text, &self.api_key);
+                let result = if status == 200 {
+                    parse_answer(&text)
+                } else {
+                    Err(http_error(status, &recorded, retry_after))
+                };
+                (result, Some(recorded))
+            }
             // Keep the status and Retry-After even when the body cannot be read.
             Err(_) if status != 200 => (
                 Err(JevError::Http {
@@ -509,7 +596,7 @@ impl JevClient {
             ),
             Err(error) => (Err(request_error(error)), None),
         };
-        Attempt {
+        RawAttempt {
             result: result.map_err(|error| redact_error(error, &self.api_key)),
             status: Some(status),
             response,
@@ -1052,12 +1139,9 @@ pub(crate) mod tests {
 
     #[test]
     fn traced_exchange_records_a_failed_connection_without_a_status() {
-        // Nothing listens on the port once the listener is dropped.
-        let port = {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.local_addr().unwrap().port()
-        };
-        let client = client_for_port(port, "test-key");
+        // Port 1 (tcpmux) is privileged and never listened on here, so the connection
+        // is refused; a freed ephemeral port could be reused by a parallel test.
+        let client = client_for_port(1, "test-key");
         let mut trace = None;
         let error = client.choose_traced(&request(), &mut trace).unwrap_err();
         assert!(matches!(error, JevError::Transport(_)), "{error:?}");
@@ -1194,11 +1278,115 @@ pub(crate) mod tests {
 
         let mut trace = None;
         let answer = client.choose_traced(&request(), &mut trace).unwrap();
-        assert_eq!(answer.model, "<redacted>");
+        // The answer is parsed as received; only the record is redacted.
+        assert_eq!(answer.model, SENTINEL_KEY);
         let text = trace.unwrap().attempts[0].response.clone().unwrap();
         let decoded: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(decoded["model"], "<redacted>");
         assert_eq!(decoded["answers"]["move"]["choice"], "O-O");
+    }
+
+    #[test]
+    fn a_body_that_is_not_json_but_decodes_to_the_key_is_withheld() {
+        // `\u` escapes (and `\/`) in text that is not JSON as a whole: a reader that
+        // decodes part of it would get the key back, so the whole body is withheld.
+        let key = "sentinel/key-7Qx9";
+        let unicode = json_escaped(key);
+        let mixed = format!("sentinel\\/key{}7Qx9", json_escaped("-"));
+        let (client, _requests) = serve_with_key(
+            vec![
+                response(
+                    "401 Unauthorized",
+                    "text/plain",
+                    &format!("no such key: \"{unicode}\" ("),
+                ),
+                response(
+                    "502 Bad Gateway",
+                    "text/html",
+                    &format!("<p>key {mixed}</p>"),
+                ),
+                response("502 Bad Gateway", "text/html", "<p>busy</p>"),
+                response("502 Bad Gateway", "text/html", "<p>busy</p>"),
+            ],
+            key,
+        );
+        let withheld = "<redacted: the body contained the API key>";
+
+        let mut trace = None;
+        let error = client.choose_traced(&request(), &mut trace).unwrap_err();
+        assert_eq!(
+            trace.unwrap().attempts[0].response.as_deref(),
+            Some(withheld)
+        );
+        assert_eq!(error.to_string(), format!("HTTP 401: {withheld}"));
+
+        let mut trace = None;
+        let error = client.choose_traced(&request(), &mut trace).unwrap_err();
+        let attempts = trace.unwrap().attempts;
+        assert_eq!(attempts[0].response.as_deref(), Some(withheld));
+        assert_eq!(
+            attempts[0].error.as_deref(),
+            Some(format!("HTTP 502: {withheld}").as_str())
+        );
+        assert_eq!(attempts[1].response.as_deref(), Some("<p>busy</p>"));
+        assert_eq!(error.to_string(), "HTTP 502: <p>busy</p>");
+    }
+
+    #[test]
+    fn the_answer_is_parsed_as_received_and_only_the_record_is_redacted() {
+        // A key that also occurs in a valid answer must not change what is parsed.
+        let key = "O-O";
+        let ok = response("200 OK", "application/json", ANSWER);
+        let (client, _requests) = serve_with_key(vec![ok.clone(), ok], key);
+        let untraced = client.choose(&request()).unwrap();
+        assert_eq!(untraced.choice, "O-O");
+        assert_eq!(
+            untraced.probabilities,
+            vec![("O-O".to_string(), 0.75), ("Nxe5".to_string(), 0.25)]
+        );
+
+        let mut trace = None;
+        let traced = client.choose_traced(&request(), &mut trace).unwrap();
+        assert_eq!(traced, untraced, "tracing does not change the answer");
+        let recorded = trace.unwrap().attempts[0].response.clone().unwrap();
+        assert_eq!(recorded, ANSWER.replace("O-O", "<redacted>"));
+    }
+
+    #[test]
+    fn error_text_is_redacted_then_made_printable() {
+        let key = "sentinel-key-7Qx9";
+        let transport = JevError::Transport(format!("reset\r\n\x1b[2J by {key}"));
+        assert_eq!(
+            redact_error(transport, key),
+            JevError::Transport("reset   [2J by <redacted>".to_string())
+        );
+        // The key straddles the 200-character cut: it is redacted before the cut.
+        let long = format!("{}{key}", "x".repeat(195));
+        assert_eq!(
+            redact_error(JevError::Request(long), key),
+            JevError::Request(format!("{}<reda", "x".repeat(195)))
+        );
+        let request = JevError::Request("bad uri: http://x\u{7}/\n".to_string());
+        assert_eq!(
+            redact_error(request, key).to_string(),
+            "request failed: bad uri: http://x / "
+        );
+    }
+
+    #[test]
+    fn decodes_json_escapes_as_a_parser_would() {
+        assert_eq!(
+            decode_json_escapes(r#"a\u0062c \/ \" \\ \t \ud83d\ude00"#),
+            "abc / \" \\ \t \u{1f600}"
+        );
+        // An escaped backslash does not start another escape.
+        assert_eq!(decode_json_escapes(r"\\u0041"), r"\u0041");
+        // Invalid or cut-short escapes stay as they are.
+        for text in [r"\x", r"\u00", r"\uzzzz", r"\ud83d", "end\\"] {
+            assert_eq!(decode_json_escapes(text), text);
+        }
+        // A lone high surrogate stays; the escape after it is still decoded.
+        assert_eq!(decode_json_escapes(r"\ud83d\u0041"), r"\ud83dA");
     }
 
     #[test]

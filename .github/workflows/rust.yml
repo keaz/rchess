@@ -5,18 +5,39 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-
-    runs-on: ubuntu-latest
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest ]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
+    # Pinned, so a new lint in a newer clippy cannot turn CI red without a code change.
+    # Bumping it is deliberate: move to the new version and fix what it finds.
+    - uses: dtolnay/rust-toolchain@1.98.1
+      with:
+        components: rustfmt, clippy
+    - uses: Swatinem/rust-cache@v2
+    # No step uses a secret or sets JEV_API_KEY or TYPESAFE_API_KEY, and each command
+    # runs with both unset, so nothing can call the Jev API. The pty smoke test
+    # (tests/pty_smoke.py) is a local check, not run here.
+    - name: Format
+      run: env -u JEV_API_KEY -u TYPESAFE_API_KEY cargo fmt --check
+    - name: Clippy
+      run: env -u JEV_API_KEY -u TYPESAFE_API_KEY cargo clippy --all-targets -- -D warnings
     - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      run: env -u JEV_API_KEY -u TYPESAFE_API_KEY cargo build
+    - name: Test
+      run: env -u JEV_API_KEY -u TYPESAFE_API_KEY cargo test

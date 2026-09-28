@@ -26,8 +26,9 @@
 //!
 //! The exchange view takes the whole screen instead of the playing screen (nothing of the
 //! board is drawn under it, so no piece picture is lost under it), with dialogs still on
-//! top. Its body text comes ready-made with the exchange ([`Exchange::body`]); a frame only
-//! wraps the rows it shows.
+//! top. Its body text is rendered and cut into rows for the exchange on screen only, and
+//! kept for the next frame until the exchange or the width changes ([`BodyCache`]); a
+//! frame only builds the rows it shows.
 //!
 //! The snapshot tests at the bottom of this file render every screen; their files in
 //! `src/tui/snapshots/` (`chess__tui__panels__tests__*.snap`) show the exact output at
@@ -54,7 +55,7 @@ use super::app::{
     is_too_small, move_rows, outcome_text,
 };
 use super::board::{BoardGeometry, BoardView, CellSize, PieceImages, layout_board};
-use super::debug::{Exchange, ExchangeView, LineKind, NO_EXCHANGES, Record};
+use super::debug::{BodyCache, BodyRows, ExchangeView, LineKind, NO_EXCHANGES, Record};
 use super::glyphs::{self, ELLIPSIS, GlyphSet, Palette, char_width};
 use super::input::LineEditor;
 use crate::core::{Color as Side, Game, Piece, PieceKind, Position as ChessPosition};
@@ -131,9 +132,16 @@ pub struct Drawn {
 }
 
 /// Draws `app` into `frame` and returns the click targets and the clamped move-list
-/// scroll. `images` keeps the board's piece pictures between frames (the Image style).
-/// `now` is used for the thinking spinner only.
-pub fn draw(app: &App, images: &mut PieceImages, frame: &mut Frame, now: Instant) -> Drawn {
+/// scroll. `images` keeps the board's piece pictures between frames (the Image style),
+/// and `bodies` the exchange view's body text for the exchange on screen. `now` is used
+/// for the thinking spinner only.
+pub fn draw(
+    app: &App,
+    images: &mut PieceImages,
+    bodies: &mut BodyCache,
+    frame: &mut Frame,
+    now: Instant,
+) -> Drawn {
     let mut drawn = Drawn {
         hits: HitMap::default(),
         move_scroll: app.move_scroll(),
@@ -146,7 +154,9 @@ pub fn draw(app: &App, images: &mut PieceImages, frame: &mut Frame, now: Instant
     }
     let overlays = overlays(app, area);
     match (app.exchange_view(), app.screen()) {
-        (Some(view), _) => drawn.exchange_view = Some(exchange_screen(frame, area, app, view)),
+        (Some(view), _) => {
+            drawn.exchange_view = Some(exchange_screen(frame, area, app, view, bodies));
+        }
         (None, Screen::Menu) => menu(frame, area, app, &mut drawn.hits),
         (None, Screen::Playing) => {
             playing(frame, area, app, images, &overlays, now, &mut drawn);
@@ -225,8 +235,9 @@ fn menu(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap) {
     let notes_top = about_area.bottom().saturating_add(1);
     let notes_height = keys.y.saturating_sub(notes_top.saturating_add(1));
     let notes_area = Rect::new(inner.x, notes_top, inner.width, notes_height).intersection(inner);
+    let (notes, more) = fit_notes(notes, notes_area.width, notes_area.height);
     let mut top = notes_area.y;
-    for note in notes {
+    for note in notes.into_iter().chain(more) {
         let rows = note.rows(notes_area.width);
         let rect = Rect::new(notes_area.x, top, notes_area.width, rows).intersection(notes_area);
         note.render(frame, rect);
@@ -296,8 +307,56 @@ impl Note {
     }
 }
 
+/// The first of `notes` that fit in `rows` rows of `width` cells, and when some do not, a
+/// last note in their place saying how many warnings are not shown ("+2 more warnings").
+/// When no warning is among those that do not fit, there is no count ("+0 more
+/// warnings" would say nothing) and all of `notes` are returned, to be cut off where
+/// the rows end.
+fn fit_notes(mut notes: Vec<Note>, width: u16, rows: u16) -> (Vec<Note>, Option<Note>) {
+    let needed = notes
+        .iter()
+        .map(|note| note.rows(width))
+        .fold(0u16, u16::saturating_add);
+    if needed <= rows || rows == 0 {
+        return (notes, None);
+    }
+    // One row for the count.
+    let room = rows - 1;
+    let mut used = 0u16;
+    let shown = notes
+        .iter()
+        .take_while(|note| {
+            used = used.saturating_add(note.rows(width));
+            used <= room
+        })
+        .count();
+    let hidden = notes[shown..]
+        .iter()
+        .filter(|note| note.marker == WARNING_MARKER)
+        .count();
+    if hidden == 0 {
+        // Only notes that are not warnings would go; a count could name none of them,
+        // so they stay and are cut off at the bottom instead.
+        return (notes, None);
+    }
+    notes.truncate(shown);
+    let text = match hidden {
+        1 => "+1 more warning".to_string(),
+        n => format!("+{n} more warnings"),
+    };
+    let more = Note {
+        marker: "",
+        text,
+        style: Style::new().yellow(),
+    };
+    (notes, Some(more))
+}
+
+/// What a warning note starts with on the menu.
+const WARNING_MARKER: &str = "! ";
+
 /// The engine status (green when Jev plays, yellow for the local search alone) and one
-/// `! ` note per warning.
+/// [`WARNING_MARKER`] note per warning.
 fn menu_notes(app: &App) -> Vec<Note> {
     let mut notes = vec![Note {
         marker: "",
@@ -309,7 +368,7 @@ fn menu_notes(app: &App) -> Vec<Note> {
         },
     }];
     notes.extend(app.warnings().iter().map(|warning| Note {
-        marker: "! ",
+        marker: WARNING_MARKER,
         text: warning.clone(),
         style: Style::new().yellow(),
     }));
@@ -650,56 +709,101 @@ fn status_lines(
 /// path loses folders from the middle of its folder part first (`~/…/chess/game.pgn`, then
 /// `~/…/game.pgn`, then `…/game.pgn`), so its start and file name stay; only when even that
 /// does not fit is the end cut, marked with [`ELLIPSIS`]. Without a path, [`fit_rows`].
+///
+/// Linear in the length of the message for a given panel: the shortened forms share the
+/// wrap of their start, and only those whose characters could fit at all are wrapped.
 fn fit_message(text: &str, path: Option<&str>, width: u16, rows: u16) -> String {
     let Some(path) = path else {
         return fit_rows(text, width, rows);
     };
-    let fits = |candidate: &String| wrapped_height(candidate, width) <= rows;
     let full = format!("{text}{path}");
-    if fits(&full) {
+    if wrapped_height(&full, width) <= rows {
         return full;
     }
-    let shorter: Vec<String> = elided_paths(path)
-        .into_iter()
-        .map(|short| format!("{text}{short}"))
-        .collect();
-    match shorter.iter().find(|candidate| fits(candidate)) {
-        Some(fitting) => fitting.clone(),
-        None => cut_to_fit(shorter.last().unwrap_or(&full), width, rows),
+    let Some(parts) = PathParts::new(path) else {
+        return cut_to_fit(&full, width, rows);
+    };
+    let limit = usize::from(rows);
+    // Every non-blank cell takes a cell of some row, so a form with more cannot fit.
+    let room = usize::from(width.max(1)) * limit;
+    let separator = solid_width("/");
+    // `{text}{head}/…`, then `/{folder}` for each kept folder, then `/{name}`.
+    let start = format!("{text}{}/{ELLIPSIS}", parts.head);
+    let fixed = solid_width(&start) + separator + solid_width(parts.name);
+    let mut wrapped_start = Wrapper::new(width);
+    wrapped_start.push_str(&start);
+    let mut kept_width = vec![0; parts.folders.len()];
+    for kept in 1..parts.folders.len() {
+        let folder = parts.folders[parts.folders.len() - kept];
+        kept_width[kept] = kept_width[kept - 1] + separator + solid_width(folder);
+    }
+    for kept in (0..parts.folders.len()).rev() {
+        if fixed + kept_width[kept] > room {
+            continue;
+        }
+        let tail = parts.tail(kept);
+        let mut wrapped = wrapped_start;
+        wrapped.push_str(&tail);
+        if wrapped.rows() <= limit {
+            return format!("{start}{tail}");
+        }
+    }
+    let shortest = format!("{text}{ELLIPSIS}/{}", parts.name);
+    if wrapped_height(&shortest, width) <= rows {
+        return shortest;
+    }
+    cut_to_fit(&shortest, width, rows)
+}
+
+/// A path split the way [`fit_message`] shortens it: its first folder (`~`, `/tmp`,
+/// `games`), the folders after it, and the file name.
+struct PathParts<'a> {
+    head: String,
+    folders: Vec<&'a str>,
+    name: &'a str,
+}
+
+impl<'a> PathParts<'a> {
+    /// `None` for a path without a folder.
+    fn new(path: &'a str) -> Option<PathParts<'a>> {
+        let (folders, name) = path.rsplit_once('/')?;
+        let mut folders = folders.split('/');
+        let first = folders.next().unwrap_or_default();
+        let mut folders: Vec<&str> = folders.collect();
+        // An absolute path's first folder keeps its leading slash: `/tmp`, not ``.
+        let head = if first.is_empty() && !folders.is_empty() {
+            format!("/{}", folders.remove(0))
+        } else {
+            first.to_string()
+        };
+        Some(PathParts {
+            head,
+            folders,
+            name,
+        })
+    }
+
+    /// The end of a shortened form that keeps the last `kept` folders:
+    /// `/{folder}` for each, then `/{name}`.
+    fn tail(&self, kept: usize) -> String {
+        let mut tail = String::new();
+        for folder in &self.folders[self.folders.len() - kept..] {
+            tail.push('/');
+            tail.push_str(folder);
+        }
+        tail.push('/');
+        tail.push_str(self.name);
+        tail
     }
 }
 
-/// Shorter forms of `path`, longest first: the folders after its first one (`~`, `/tmp`,
-/// `games`) are replaced by `…` from the left, a folder at a time, down to none; then the
-/// first one goes too. The file name is always kept.
-fn elided_paths(path: &str) -> Vec<String> {
-    let Some((folders, name)) = path.rsplit_once('/') else {
-        return Vec::new();
-    };
-    let mut parts: Vec<&str> = folders.split('/').collect();
-    // An absolute path's first folder keeps its leading slash: `/tmp`, not ``.
-    let head = if parts.first() == Some(&"") && parts.len() > 1 {
-        parts.remove(0);
-        format!("/{}", parts.remove(0))
-    } else {
-        parts.remove(0).to_string()
-    };
-    let mut shorter: Vec<String> = (0..parts.len())
-        .rev()
-        .map(|kept| {
-            let tail = &parts[parts.len() - kept..];
-            let mut short = format!("{head}/{ELLIPSIS}");
-            for part in tail {
-                short.push('/');
-                short.push_str(part);
-            }
-            short.push('/');
-            short.push_str(name);
-            short
-        })
-        .collect();
-    shorter.push(format!("{ELLIPSIS}/{name}"));
-    shorter
+/// Cells of `text` outside its whitespace: at least this many cells of any rows it
+/// wraps into are taken.
+fn solid_width(text: &str) -> usize {
+    text.chars()
+        .filter(|c| !c.is_whitespace())
+        .map(char_width)
+        .sum()
 }
 
 /// The Jev panel's text, laid out for one width: lines that always show (what was played
@@ -824,30 +928,43 @@ fn pack(
 }
 
 /// `text` if it wraps into `rows` rows of `width` cells, else its longest start that does
-/// with [`ELLIPSIS`] appended, cut between words when any such cut fits.
+/// with [`ELLIPSIS`] appended, cut between words when any such cut fits. Linear in the
+/// length of `text`: every cut is measured in one pass ([`Wrapper`]).
 fn fit_rows(text: &str, width: u16, rows: u16) -> String {
-    let fits = |cut: &String| wrapped_height(cut, width) <= rows;
     if wrapped_height(text, width) <= rows {
         return text.to_string();
     }
-    let cut_at = |end: usize| format!("{}{ELLIPSIS}", text[..end].trim_end());
-    text.char_indices()
-        .rev()
-        .filter(|&(_, c)| c.is_whitespace())
-        .map(|(end, _)| cut_at(end))
-        .find(fits)
-        .unwrap_or_else(|| cut_to_fit(text, width, rows))
+    let limit = usize::from(rows);
+    let mut wrapper = Wrapper::new(width);
+    let mut best = None;
+    for (end, c) in text.char_indices() {
+        if c.is_whitespace() && wrapper.rows_with_ellipsis() <= limit {
+            best = Some(end);
+        }
+        wrapper.push(c);
+    }
+    match best {
+        Some(end) => format!("{}{ELLIPSIS}", text[..end].trim_end()),
+        None => cut_to_fit(text, width, rows),
+    }
 }
 
 /// The longest start of `text` that wraps into `rows` rows of `width` cells with
-/// [`ELLIPSIS`] appended, cut between any two characters.
+/// [`ELLIPSIS`] appended, cut between any two characters. Linear in the length of `text`.
 fn cut_to_fit(text: &str, width: u16, rows: u16) -> String {
-    let cut_at = |end: usize| format!("{}{ELLIPSIS}", text[..end].trim_end());
-    text.char_indices()
-        .rev()
-        .map(|(end, _)| cut_at(end))
-        .find(|cut| wrapped_height(cut, width) <= rows)
-        .unwrap_or_else(|| ELLIPSIS.to_string())
+    let limit = usize::from(rows);
+    let mut wrapper = Wrapper::new(width);
+    let mut best = None;
+    for (end, c) in text.char_indices() {
+        if wrapper.rows_with_ellipsis() <= limit {
+            best = Some(end);
+        }
+        wrapper.push(c);
+    }
+    match best {
+        Some(end) => format!("{}{ELLIPSIS}", text[..end].trim_end()),
+        None => ELLIPSIS.to_string(),
+    }
 }
 
 /// Narrowest column for White's moves: `e4` or `Nf3` and at least two spaces, as in the
@@ -1015,8 +1132,15 @@ fn piece_span(piece: Piece, glyph_set: GlyphSet, palette: &Palette) -> Span<'sta
 /// The Jev exchange view on the whole of `area` (spec 9.4): the exchange `view` shows,
 /// with a header saying which one it is and how it went, then its body, wrapped and
 /// scrolled; or [`NO_EXCHANGES`]. Returns `view` with its scroll clamped and its page size
-/// and scroll limit for this size.
-fn exchange_screen(frame: &mut Frame, area: Rect, app: &App, view: ExchangeView) -> ExchangeView {
+/// and scroll limit for this size. `bodies` keeps the body text rendered and cut into rows
+/// for the next frame.
+fn exchange_screen(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    view: ExchangeView,
+    bodies: &mut BodyCache,
+) -> ExchangeView {
     let block = Block::bordered()
         .title(Line::from(" Jev exchange ").bold())
         .title_bottom(Line::from(EXCHANGE_KEYS).dim())
@@ -1050,10 +1174,10 @@ fn exchange_screen(frame: &mut Frame, area: Rect, app: &App, view: ExchangeView)
         height: inner.height - body_top,
         ..inner
     };
-    let exchange = &record.exchange;
     let width = usize::from(body_area.width.max(1));
     let page = usize::from(body_area.height);
-    let total: usize = exchange.body().iter().map(|line| line.rows(width)).sum();
+    let body = bodies.rows(record, width);
+    let total = body.len();
     let max_scroll = total.saturating_sub(page);
     let scroll = view.scroll.min(max_scroll);
     let block = if total > page {
@@ -1070,10 +1194,7 @@ fn exchange_screen(frame: &mut Frame, area: Rect, app: &App, view: ExchangeView)
             ..inner
         },
     );
-    frame.render_widget(
-        Paragraph::new(body_rows(exchange, width, scroll, page)),
-        body_area,
-    );
+    frame.render_widget(Paragraph::new(body_rows(&body, scroll, page)), body_area);
     ExchangeView {
         scroll,
         page,
@@ -1084,7 +1205,8 @@ fn exchange_screen(frame: &mut Frame, area: Rect, app: &App, view: ExchangeView)
 
 /// The exchange view's header for `record`, the `index`th of `count` (from 0), as items
 /// for [`pack`]: `exchange N of M`, `move <fullmove>`, the move, how it was chosen, the
-/// last status, the attempts and the latency, and `stale — not played` when it was not.
+/// last status, the attempts and the latency, and `stale — not played` when it was not
+/// (`held — not played yet` while Jev vs Jev is paused with it).
 fn exchange_header(record: &Record, index: usize, count: usize) -> Vec<Vec<Span<'static>>> {
     let exchange = &record.exchange;
     let attempts = match exchange.attempts() {
@@ -1102,41 +1224,26 @@ fn exchange_header(record: &Record, index: usize, count: usize) -> Vec<Vec<Span<
     ];
     if record.stale {
         items.push(vec![Span::raw("stale — not played").yellow()]);
+    } else if record.held {
+        items.push(vec![Span::raw("held — not played yet").yellow()]);
     }
     items
 }
 
-/// The rows of `exchange`'s body wrapped at `width` cells, from row `scroll`, at most
-/// `page` of them. Only the lines on screen are wrapped.
-fn body_rows(exchange: &Exchange, width: usize, scroll: usize, page: usize) -> Vec<Line<'static>> {
-    let mut rows = Vec::new();
-    let mut top = 0;
-    for line in exchange.body() {
-        if rows.len() == page {
-            break;
-        }
-        let height = line.rows(width);
-        if top + height <= scroll {
-            top += height;
-            continue;
-        }
-        let style = match line.kind {
-            LineKind::Heading => Style::new().bold(),
-            LineKind::Error => Style::new().red(),
-            LineKind::Text => Style::new(),
-        };
-        let skip = scroll.saturating_sub(top);
-        let room = page - rows.len();
-        rows.extend(
-            line.wrapped(width)
-                .into_iter()
-                .skip(skip)
-                .take(room)
-                .map(|row| Line::styled(row, style)),
-        );
-        top += height;
-    }
-    rows
+/// The rows of an exchange's `body` from row `scroll`, at most `page` of them.
+fn body_rows(body: &BodyRows, scroll: usize, page: usize) -> Vec<Line<'static>> {
+    let end = scroll.saturating_add(page).min(body.len());
+    (scroll.min(end)..end)
+        .filter_map(|index| body.get(index))
+        .map(|(kind, text)| {
+            let style = match kind {
+                LineKind::Heading => Style::new().bold(),
+                LineKind::Error => Style::new().red(),
+                LineKind::Text => Style::new(),
+            };
+            Line::styled(text.to_string(), style)
+        })
+        .collect()
 }
 
 // ----- overlays -----
@@ -1493,35 +1600,126 @@ fn last_row(area: Rect) -> Rect {
 }
 
 /// Rows `text` takes when word-wrapped to `width` cells: greedy, like ratatui's word
-/// wrapper, with words longer than a row split between characters.
+/// wrapper, with words longer than a row split between characters. Widths are
+/// [`char_width`]'s.
 fn wrapped_height(text: &str, width: u16) -> u16 {
-    let width = usize::from(width.max(1));
-    let mut rows = 1usize;
-    let mut used = 0usize;
-    for word in text.split_whitespace() {
-        let w = Span::raw(word).width();
-        if used > 0 && used + 1 + w <= width {
-            used += 1 + w;
-            continue;
+    let mut wrapper = Wrapper::new(width);
+    wrapper.push_str(text);
+    u16::try_from(wrapper.rows()).unwrap_or(u16::MAX)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Characters fed to every [`Wrapper`] on this thread: the work of the fitting
+    /// functions, which a test bounds to keep them linear.
+    static WRAPPED_CHARS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The word wrap of [`wrapped_height`], fed a character at a time, so that the rows of
+/// every start of a text (with or without [`ELLIPSIS`] after it) are known in one pass.
+///
+/// The last word is kept apart until the next one starts: a start that ends in
+/// whitespace is cut back to that word, and an ellipsis joins it.
+#[derive(Clone, Copy, Debug)]
+struct Wrapper {
+    /// Cells per row (at least 1).
+    width: usize,
+    /// Rows taken by the words before `last`.
+    rows: usize,
+    /// Cells used on the last of those rows.
+    used: usize,
+    /// The last word so far.
+    last: Option<Word>,
+    /// Whether the last character pushed belongs to `last`.
+    in_word: bool,
+}
+
+/// A word as [`Wrapper`] places it: its width, and how it splits between characters when
+/// it is wider than a row.
+#[derive(Clone, Copy, Debug, Default)]
+struct Word {
+    width: usize,
+    /// Rows after the first that the word takes when split, starting a row.
+    split_rows: usize,
+    /// Cells used on the last of those rows.
+    split_used: usize,
+}
+
+impl Word {
+    /// Adds a character `cells` wide, in rows of `row` cells.
+    fn push(&mut self, cells: usize, row: usize) {
+        self.width += cells;
+        if self.split_used > 0 && self.split_used + cells > row {
+            self.split_rows += 1;
+            self.split_used = 0;
         }
-        if used > 0 {
-            rows += 1;
-            used = 0;
-        }
-        if w <= width {
-            used = w;
-            continue;
-        }
-        for c in word.chars() {
-            let cw = char_width(c);
-            if used > 0 && used + cw > width {
-                rows += 1;
-                used = 0;
-            }
-            used += cw;
+        self.split_used += cells;
+    }
+}
+
+impl Wrapper {
+    fn new(width: u16) -> Wrapper {
+        Wrapper {
+            width: usize::from(width.max(1)),
+            rows: 1,
+            used: 0,
+            last: None,
+            in_word: false,
         }
     }
-    u16::try_from(rows).unwrap_or(u16::MAX)
+
+    fn push(&mut self, c: char) {
+        #[cfg(test)]
+        WRAPPED_CHARS.with(|count| count.set(count.get() + 1));
+        if c.is_whitespace() {
+            self.in_word = false;
+            return;
+        }
+        if !self.in_word {
+            if let Some(word) = self.last.take() {
+                (self.rows, self.used) = self.place(word);
+            }
+            self.in_word = true;
+        }
+        let width = self.width;
+        self.last
+            .get_or_insert_with(Word::default)
+            .push(char_width(c), width);
+    }
+
+    fn push_str(&mut self, text: &str) {
+        for c in text.chars() {
+            self.push(c);
+        }
+    }
+
+    /// Rows, and cells used on the last row, once `word` follows the words before `last`.
+    fn place(&self, word: Word) -> (usize, usize) {
+        if self.used > 0 && self.used + 1 + word.width <= self.width {
+            return (self.rows, self.used + 1 + word.width);
+        }
+        let rows = self.rows + usize::from(self.used > 0);
+        if word.width <= self.width {
+            (rows, word.width)
+        } else {
+            (rows + word.split_rows, word.split_used)
+        }
+    }
+
+    /// Rows of the text pushed so far.
+    fn rows(&self) -> usize {
+        self.last.map_or(self.rows, |word| self.place(word).0)
+    }
+
+    /// Rows of the text pushed so far with its trailing whitespace dropped and
+    /// [`ELLIPSIS`] appended.
+    fn rows_with_ellipsis(&self) -> usize {
+        let mut word = self.last.unwrap_or_default();
+        for c in ELLIPSIS.chars() {
+            word.push(char_width(c), self.width);
+        }
+        self.place(word).0
+    }
 }
 
 /// The piece's English name.
@@ -1538,6 +1736,7 @@ const fn piece_name(kind: PieceKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::HashSet;
     use std::time::Duration;
 
@@ -1551,7 +1750,7 @@ mod tests {
     use super::*;
     use crate::core::{START_FEN, Square};
     use crate::tui::board::{image_area, square_at, square_rect};
-    use crate::tui::debug::{DebugLog, NO_LOG_PATH};
+    use crate::tui::debug::{BodyCache, DebugLog, NO_LOG_PATH};
     use crate::tui::event::AppEvent;
     use crate::tui::glyphs::{ImageSupport, initial_glyphs};
     use crate::tui::graphics::picker_for;
@@ -1868,7 +2067,10 @@ mod tests {
                 }
             }
         }
-        // And clicks land: a move by mouse on the largest board, flipped.
+    }
+
+    #[test]
+    fn a_click_and_a_drag_move_pieces_on_the_largest_board_flipped() {
         let mut h = with_font((300, 100), (10, 20), '1');
         h.char('f');
         h.click_square(sq("e2"));
@@ -2012,6 +2214,11 @@ mod tests {
                     });
                     h.char(key);
                     let case = format!("{width}x{height} jev={jev} {key}");
+                    // Without debug mode nothing says DEBUG.
+                    for row in 0..2 {
+                        let plain_row = status_row(&plain, row);
+                        assert!(!plain_row.contains("DEBUG"), "{case}: {plain_row}");
+                    }
                     let top = status_title(&h);
                     let first = status_row(&h, 1);
                     // The same mode title as without debug mode, which always has one.
@@ -2087,6 +2294,108 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn menu_warnings_that_do_not_fit_are_counted() {
+        let warnings: Vec<String> = (1..=6).map(|n| format!("warning {n}")).collect();
+        let screen = |height: u16| {
+            let h = Harness::build(FakeEngine::local(), (60, height), warnings.clone(), |app| {
+                app
+            });
+            h.screen()
+        };
+        // All six fit at 60×24.
+        let tall = screen(24);
+        assert!(tall.contains("! warning 6"), "{tall}");
+        assert!(!tall.contains("more warning"), "{tall}");
+        // At 60×20 the notes get four rows: the status, two warnings and the count.
+        let short = screen(20);
+        assert!(short.contains("! warning 2"), "{short}");
+        assert!(!short.contains("! warning 3"), "{short}");
+        assert!(short.contains("+4 more warnings"), "{short}");
+        // One row more shows one more warning.
+        let taller = screen(21);
+        assert!(taller.contains("! warning 3"), "{taller}");
+        assert!(taller.contains("+3 more warnings"), "{taller}");
+    }
+
+    #[test]
+    fn a_warning_too_long_for_the_rows_left_is_counted_too() {
+        // At 60x20 the notes get four rows: the status, a short warning, and no room for
+        // a warning three rows long, so the count takes its place.
+        let warnings = vec!["short".to_string(), "long ".repeat(25)];
+        let h = Harness::build(FakeEngine::local(), (60, 20), warnings, |app| app);
+        let screen = h.screen();
+        assert!(screen.contains("! short"), "{screen}");
+        assert!(!screen.contains("! long"), "{screen}");
+        assert!(screen.contains("+1 more warning "), "{screen}");
+    }
+
+    #[test]
+    fn notes_that_hide_no_warning_get_no_count() {
+        let note = |marker: &'static str, text: &str| Note {
+            marker,
+            text: text.to_string(),
+            style: Style::new(),
+        };
+        // Only the engine status, two rows long in one row: nothing a count could name.
+        let status = "engine status ".repeat(4);
+        let (notes, more) = fit_notes(vec![note("", &status)], 20, 1);
+        assert!(more.is_none(), "{:?}", more.map(|more| more.text));
+        assert_eq!(notes.len(), 1);
+        // With a warning among the hidden notes the count is still there.
+        let (_, more) = fit_notes(vec![note("", &status), note(WARNING_MARKER, "w")], 20, 1);
+        assert_eq!(
+            more.map(|more| more.text).as_deref(),
+            Some("+1 more warning")
+        );
+    }
+
+    /// The characters [`Wrapper`] is fed on this thread while `fit` runs: the work of the
+    /// fitting functions, which wrap their text and every cut they try through it.
+    fn wrapped_chars<T>(fit: impl FnOnce() -> T) -> (T, usize) {
+        let before = WRAPPED_CHARS.with(Cell::get);
+        let result = fit();
+        (result, WRAPPED_CHARS.with(Cell::get) - before)
+    }
+
+    #[test]
+    fn long_messages_are_fitted_in_linear_time() {
+        // A pasted path of 20 000 characters (the error echoes it) used to take seconds a
+        // frame: every cut was wrapped again from the start. Each fit now wraps the message
+        // a few times at most, however long it is (plus a few forms that fit the panel):
+        // once to see whether it fits, once to find a cut, and once more to cut between
+        // characters when there is no word to cut at.
+        for n in [2_000, 20_000] {
+            let name = "x".repeat(n);
+            let words = "word ".repeat(n / 5);
+            let folders = "d/".repeat(n / 4);
+            let panel = 30 * 2;
+            // At most `times` passes over `len` characters, plus the forms that fit.
+            let linear = |len: usize, times: usize| times * len + panel * panel;
+
+            let (cut, work) = wrapped_chars(|| fit_rows(&name, 30, 2));
+            assert_eq!(cut.chars().count(), 60);
+            assert!(work <= linear(n, 3), "{n}: {work}");
+
+            let (cut, work) = wrapped_chars(|| fit_rows(&words, 30, 2));
+            assert!(cut.ends_with("word…"));
+            assert!(work <= linear(words.len(), 2), "{n}: {work}");
+
+            let path = format!("/{folders}game.pgn");
+            let (deep, work) = wrapped_chars(|| fit_message("saved ", Some(&path), 30, 2));
+            assert_eq!(deep, format!("saved /d/…/{}game.pgn", "d/".repeat(8)));
+            assert!(work <= linear(path.len(), 2), "{n}: {work}");
+
+            let path = format!("~/{name}");
+            let (long, work) = wrapped_chars(|| fit_message("saved ", Some(&path), 30, 2));
+            assert!(
+                long.starts_with("saved …/xxx") && long.ends_with('…'),
+                "{long}"
+            );
+            assert!(work <= linear(path.len(), 3), "{n}: {work}");
         }
     }
 
@@ -2250,6 +2559,8 @@ mod tests {
         assert_eq!(h.app.hit_map(), &playing, "help records nothing");
         h.press(KeyCode::Esc);
 
+        // A move first, so that q asks.
+        h.moves(&["f3"]);
         h.char('q');
         for button in [Button::Confirm, Button::Cancel] {
             let rect = h
@@ -2279,7 +2590,7 @@ mod tests {
         }
         h.press(KeyCode::Esc);
 
-        h.moves(&["f3", "e5", "g4", "Qh4#"]);
+        h.moves(&["e5", "g4", "Qh4#"]);
         for button in GAME_OVER_BUTTONS {
             let rect = h
                 .app
@@ -2310,6 +2621,8 @@ mod tests {
     fn the_terminal_cursor_shows_only_while_typing() {
         let mut h = jev(80, 24);
         h.char('1');
+        // A move first, so that Ctrl+C asks below.
+        h.moves(&["e4"]);
         assert!(!h.terminal.backend().cursor_visible());
         h.char('/');
         h.type_text("e4");
@@ -2588,6 +2901,15 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_menu_with_more_warnings_than_fit() {
+        let warnings = (1..=6)
+            .map(|n| format!("warning {n}: something at start-up was not as expected"))
+            .collect();
+        let h = Harness::build(FakeEngine::local(), (60, 20), warnings, |app| app);
+        insta::assert_snapshot!("menu_warnings_60x20", h.terminal.backend());
+    }
+
+    #[test]
     fn snapshot_playing_start() {
         let mut h = jev(80, 24);
         h.char('1');
@@ -2691,6 +3013,8 @@ mod tests {
     fn snapshot_quit_confirmation() {
         let mut h = jev(80, 24);
         h.char('1');
+        // q asks only once a move has been played.
+        h.moves(&["e4"]);
         h.char('q');
         insta::assert_snapshot!("quit_80x24", h.terminal.backend());
     }
@@ -2784,13 +3108,20 @@ mod tests {
             .exchanges()
             .and_then(|history| history.last())
             .unwrap();
-        let exchange = &record.exchange;
-        let all = body_rows(exchange, 20, 0, usize::MAX);
-        let total: usize = exchange.body().iter().map(|line| line.rows(20)).sum();
+        let mut cache = BodyCache::default();
+        let body = cache.rows(record, 20);
+        let all = body_rows(&body, 0, usize::MAX);
+        let total: usize = record
+            .exchange
+            .body()
+            .iter()
+            .map(|line| line.wrapped(20).len())
+            .sum();
         assert_eq!(all.len(), total);
+        assert_eq!(body.len(), total);
         assert!(all.iter().all(|row| row.width() <= 20));
         for (scroll, page) in [(0, 5), (7, 10), (total - 3, 10), (total, 4)] {
-            let rows = body_rows(exchange, 20, scroll, page);
+            let rows = body_rows(&body, scroll, page);
             let expected: Vec<Line> = all.iter().skip(scroll).take(page).cloned().collect();
             assert_eq!(rows, expected, "scroll {scroll}, page {page}");
         }

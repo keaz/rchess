@@ -62,15 +62,22 @@ pub const FILLERS: [&str; 7] = [
 /// Ends text cut short: a long Jev note, or echoed input (see [`shorten`]).
 pub const ELLIPSIS: &str = "…";
 
-/// Characters of echoed user input that [`shorten`] keeps.
-pub const ECHO_MAX_CHARS: usize = 24;
+/// Cells of echoed user input that [`shorten`] keeps.
+pub const ECHO_MAX_WIDTH: usize = 24;
 
 /// Environment variable that selects the starting glyph set.
 pub const GLYPHS_ENV: &str = "RCHESS_GLYPHS";
 
-/// Environment variable that turns piece images off: `off` skips the graphics
-/// query and leaves [`GlyphSet::Image`] out of the cycle.
+/// Environment variable that turns piece images off: `off`, `0`, `false` or `no`
+/// ([`IMAGES_OFF`]) skips the graphics query and leaves [`GlyphSet::Image`] out of the
+/// cycle. `on`, `1`, `true` and `yes` ([`IMAGES_ON`]) leave them on, as unset does.
 pub const IMAGES_ENV: &str = "RCHESS_IMAGES";
+
+/// The `RCHESS_IMAGES` values that turn images off, in any case.
+pub const IMAGES_OFF: [&str; 4] = ["off", "0", "false", "no"];
+
+/// The `RCHESS_IMAGES` values that leave images on, in any case.
+pub const IMAGES_ON: [&str; 4] = ["on", "1", "true", "yes"];
 
 /// How pieces are drawn. `g` cycles through the sets in [`GlyphSet::next`]
 /// order.
@@ -339,7 +346,7 @@ pub fn detect_truecolor(get: impl Fn(&str) -> Option<String>) -> bool {
 /// (see [`initial_glyphs`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImageSupport {
-    /// Images are off (`NO_COLOR` or `RCHESS_IMAGES=off`, or a text set was
+    /// Images are off (`NO_COLOR` or `RCHESS_IMAGES` off, or a text set was
     /// named, see [`images_wanted`]): the graphics query was skipped and
     /// [`GlyphSet::Image`] is not offered.
     Off,
@@ -357,7 +364,8 @@ pub enum ImageSupport {
 /// apart only by colour), else Image when `images` found a graphics protocol,
 /// else Solid. An unknown value adds a warning and falls through to the next
 /// source; so does `image` when `images` is [`ImageSupport::Off`]. An empty
-/// `RCHESS_GLYPHS` counts as unset.
+/// `RCHESS_GLYPHS` counts as unset. A `RCHESS_IMAGES` value that is neither empty nor
+/// one of [`IMAGES_OFF`] or [`IMAGES_ON`] is named in a warning too.
 pub fn initial_glyphs(
     cli: Option<&str>,
     get: impl Fn(&str) -> Option<String>,
@@ -399,14 +407,15 @@ pub fn initial_glyphs(
     });
 
     // Name the switch that turned images off, if one did.
+    let images_value = get(IMAGES_ENV).map(|value| value.trim().to_string());
     let off_because = if no_color(&get) {
-        " (NO_COLOR is set)"
-    } else if images_off(&get) {
-        " (RCHESS_IMAGES=off)"
+        " (NO_COLOR is set)".to_string()
+    } else if let Some(value) = images_value.as_deref().filter(|value| is_off(value)) {
+        format!(" ({IMAGES_ENV}={value})")
     } else {
-        ""
+        String::new()
     };
-    let warnings = refused
+    let mut warnings: Vec<String> = refused
         .into_iter()
         .map(|(source, why)| match why {
             Refused::Unknown(value) => format!(
@@ -419,12 +428,21 @@ pub fn initial_glyphs(
             }
         })
         .collect();
+    if let Some(value) =
+        images_value.filter(|value| !value.is_empty() && !is_off(value) && !is_on(value))
+    {
+        warnings.push(format!(
+            "{IMAGES_ENV}: unknown value {:?} (on, 1, true, yes, off, 0, false or no); \
+             images stay on",
+            shorten(&value)
+        ));
+    }
     (set, warnings)
 }
 
 /// Whether start-up asks the terminal about graphics (spec 9.3), which also puts
 /// [`GlyphSet::Image`] in the cycle. Not when `NO_COLOR` is set, not with
-/// `RCHESS_IMAGES=off` ([`images_off`]), and not when the first valid set named by
+/// `RCHESS_IMAGES` off ([`images_off`]), and not when the first valid set named by
 /// `cli` (`--glyphs`) or `RCHESS_GLYPHS` is a text set, as [`initial_glyphs`] would
 /// choose it.
 ///
@@ -439,12 +457,23 @@ pub fn images_wanted(cli: Option<&str>, get: impl Fn(&str) -> Option<String>) ->
     named.is_none_or(|set| set == GlyphSet::Image)
 }
 
-/// True when `RCHESS_IMAGES` is `off` (any case, surrounding whitespace ignored).
-/// Any other value leaves images on.
+/// True when `RCHESS_IMAGES` is one of [`IMAGES_OFF`] (any case, surrounding whitespace
+/// ignored). Any other value leaves images on ([`initial_glyphs`] warns about one that is
+/// not in [`IMAGES_ON`] either).
 ///
 /// `get` reads an environment variable; pass `|k| std::env::var(k).ok()`.
 pub fn images_off(get: impl Fn(&str) -> Option<String>) -> bool {
-    get(IMAGES_ENV).is_some_and(|value| value.trim().eq_ignore_ascii_case("off"))
+    get(IMAGES_ENV).is_some_and(|value| is_off(value.trim()))
+}
+
+/// True for a trimmed `RCHESS_IMAGES` value that turns images off.
+fn is_off(value: &str) -> bool {
+    IMAGES_OFF.iter().any(|off| value.eq_ignore_ascii_case(off))
+}
+
+/// True for a trimmed `RCHESS_IMAGES` value that says images are on.
+fn is_on(value: &str) -> bool {
+    IMAGES_ON.iter().any(|on| value.eq_ignore_ascii_case(on))
 }
 
 /// True when `NO_COLOR` is set and non-empty (<https://no-color.org/>): the terminal
@@ -457,21 +486,39 @@ pub fn no_color(get: impl Fn(&str) -> Option<String>) -> bool {
 }
 
 /// Cells `c` takes on screen by ratatui's measure: 1 for most characters, 2 for
-/// wide ones such as `日`, 0 for combining marks and variation selectors.
+/// wide ones such as `日`, 0 for combining marks, variation selectors and control
+/// characters (ratatui's buffer drops those).
 pub fn char_width(c: char) -> usize {
+    if c.is_control() {
+        return 0;
+    }
     let mut buf = [0u8; 4];
     Span::raw(&*c.encode_utf8(&mut buf)).width()
 }
 
-/// User input to echo in a message: `text` itself when it has at most
-/// [`ECHO_MAX_CHARS`] characters, else its first [`ECHO_MAX_CHARS`] and
+/// User input to echo in a message: `text` itself when it is at most
+/// [`ECHO_MAX_WIDTH`] cells wide, else its longest start that is, followed by
 /// [`ELLIPSIS`]. Command-line arguments, commands and move text all go through it,
 /// so a pasted FEN or a stray paragraph never floods a one-line message.
+///
+/// Widths are [`char_width`]'s, except that a control character counts as the
+/// escape a message prints for it (`\u{1b}` is 6 cells), since echoed input is
+/// shown with `{:?}` where it may hold one. The cut is always made before a
+/// character that takes cells, so a base character keeps its combining marks.
 pub fn shorten(text: &str) -> String {
-    match text.char_indices().nth(ECHO_MAX_CHARS) {
-        Some((end, _)) => format!("{}{ELLIPSIS}", &text[..end]),
-        None => text.to_string(),
+    let mut used = 0;
+    for (end, c) in text.char_indices() {
+        let width = if c.is_control() {
+            c.escape_debug().count()
+        } else {
+            char_width(c)
+        };
+        if width > 0 && used + width > ECHO_MAX_WIDTH {
+            return format!("{}{ELLIPSIS}", &text[..end]);
+        }
+        used += width;
     }
+    text.to_string()
 }
 
 #[cfg(test)]
@@ -639,6 +686,46 @@ mod tests {
             assert_eq!(char_width(c), width, "{c:?}");
             assert_eq!(char_width(c), Span::raw(c.to_string()).width(), "{c:?}");
         }
+    }
+
+    #[test]
+    fn control_characters_take_no_cells() {
+        // ratatui's buffer drops them, so they must not count towards a width.
+        for c in ['\0', '\t', '\n', '\u{1b}', '\u{7f}', '\u{9b}'] {
+            assert_eq!(char_width(c), 0, "{c:?}");
+            let mut buf = Buffer::empty(Rect::new(0, 0, 3, 1));
+            buf.set_string(0, 0, format!("a{c}b"), Style::new());
+            assert_eq!(buf[(1, 0)].symbol(), "b", "{c:?} took a cell");
+        }
+    }
+
+    #[test]
+    fn shorten_cuts_by_cells_and_keeps_combining_marks() {
+        // Wide characters count two cells each.
+        assert_eq!(shorten(&"日".repeat(12)), "日".repeat(12));
+        assert_eq!(shorten(&"日".repeat(13)), format!("{}…", "日".repeat(12)));
+        assert_eq!(
+            shorten(&format!("x{}", "日".repeat(12))),
+            format!("x{}…", "日".repeat(11))
+        );
+        // A combining mark stays with its base character and takes no cell.
+        let accented = "e\u{301}";
+        assert_eq!(shorten(&accented.repeat(24)), accented.repeat(24));
+        assert_eq!(
+            shorten(&accented.repeat(30)),
+            format!("{}…", accented.repeat(24))
+        );
+        let marks = format!("{}\u{301}\u{302}", "x".repeat(24));
+        assert_eq!(shorten(&marks), marks);
+        assert_eq!(shorten(&format!("{marks}y")), format!("{marks}…"));
+        // A control character counts as the escape a message prints for it.
+        assert_eq!(
+            shorten(&"\u{1b}".repeat(10)),
+            format!("{}…", "\u{1b}".repeat(4))
+        );
+        assert_eq!(shorten(&"\n".repeat(20)), format!("{}…", "\n".repeat(12)));
+        let echoed = format!("{:?}", shorten(&"\u{1b}[2J".repeat(10)));
+        assert!(echoed.chars().count() <= 24 + 3, "{echoed}");
     }
 
     #[test]
@@ -986,19 +1073,58 @@ mod tests {
         assert!(!images_wanted(None, env(&[("NO_COLOR", "1")])));
         assert!(!images_wanted(Some("image"), env(&[("NO_COLOR", "1")])));
         assert!(images_wanted(None, env(&[("NO_COLOR", "")])));
-        for off in ["off", "OFF", " Off\n"] {
+        for off in ["off", "OFF", " Off\n", "0", "false", "FALSE", "no", "No"] {
             let pairs = [(IMAGES_ENV, off)];
             let get = env(&pairs);
             assert!(images_off(&get), "{off:?}");
             assert!(!images_wanted(Some("image"), get), "{off:?}");
         }
-        for on in ["", "on", "1", "offline"] {
+        for on in ["", "on", "1", "true", "Yes", "offline", "nope", "00"] {
             let pairs = [(IMAGES_ENV, on)];
             let get = env(&pairs);
             assert!(!images_off(&get), "{on:?}");
             assert!(images_wanted(None, get), "{on:?}");
         }
         assert!(!images_off(env(&[])));
+    }
+
+    #[test]
+    fn an_unrecognised_rchess_images_value_is_named_in_a_warning() {
+        for value in ["offline", "2", "enabled", "y"] {
+            let (set, warnings) = initial_glyphs(None, env(&[(IMAGES_ENV, value)]), OFF);
+            assert_eq!(set, GlyphSet::Solid);
+            assert_eq!(
+                warnings,
+                [format!(
+                    "RCHESS_IMAGES: unknown value {value:?} (on, 1, true, yes, off, 0, false \
+                     or no); images stay on"
+                )],
+                "{value:?}"
+            );
+        }
+        // Off or on, in any case: nothing to warn about.
+        for quiet in [
+            "", "  ", "off", "0", "False", "NO", "on", "1", "TRUE", "yes", " On\n",
+        ] {
+            let (_, warnings) = initial_glyphs(None, env(&[(IMAGES_ENV, quiet)]), OFF);
+            assert!(warnings.is_empty(), "{quiet:?}: {warnings:?}");
+        }
+        // The value is echoed safely.
+        let (_, warnings) = initial_glyphs(None, env(&[(IMAGES_ENV, "\u{1b}[2J")]), OFF);
+        assert!(warnings[0].contains(r#""\u{1b}[2J""#), "{}", warnings[0]);
+    }
+
+    #[test]
+    fn the_images_off_reason_names_the_value_given() {
+        let (_, warnings) = initial_glyphs(
+            Some("image"),
+            env(&[(IMAGES_ENV, "false")]),
+            ImageSupport::Off,
+        );
+        assert_eq!(
+            warnings,
+            ["--glyphs: images are off (RCHESS_IMAGES=false); using solid"]
+        );
     }
 
     #[test]

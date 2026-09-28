@@ -4,14 +4,15 @@ Read this first. Follow the protocol in section 8 of
 `docs/superpowers/specs/2026-09-26-rchess-redesign-design.md`.
 
 ## Current
-Sub-project: cleanup (not started) | Plan: to be written from spec section 7 step 5
-Branch: main (feat/tui-polish merged locally at f18dd32; feat/tui at 575c3f6; not pushed — main is ahead of origin/main)
-Last completed task: tui-polish sub-project merged (all 8 tasks, final review fixed and re-reviewed)
-Next task: the user's manual test of tui-polish in a real terminal (below) if not yet done; then plan the cleanup sub-project (spec section 7 step 5)
-State: green (except 3 pre-existing old-code test failures)
+Sub-project: cleanup (spec section 10) | Plan: docs/superpowers/plans/2026-09-28-cleanup.md
+Branch: chore/cleanup (all 7 tasks done). main has feat/tui-polish merged locally at f18dd32, not pushed.
+Last completed task: 7 (CI and docs), then the final fix wave
+Next task: push `chore/cleanup` (and `main`) and open a PR from `chore/cleanup` to main, so the new workflow runs on the PR (Linux and macOS); merge only when it is green. Pushing `main` alone first would run the workflow on the legacy code of main, not on this branch.
+State: green (`cargo test` fully green, fmt and clippy `-D warnings` clean, pty smoke green)
 
 ## Verify before continuing
-env -u JEV_API_KEY -u TYPESAFE_API_KEY INSTA_UPDATE=no cargo test --lib tui:: && env -u JEV_API_KEY -u TYPESAFE_API_KEY cargo test --lib engine::
+env -u JEV_API_KEY -u TYPESAFE_API_KEY INSTA_UPDATE=no cargo test
+cargo fmt --check && cargo clippy --all-targets -- -D warnings
 cargo build && env -u JEV_API_KEY -u TYPESAFE_API_KEY python3 tests/pty_smoke.py --no-build
 
 ## Manual test (tui-polish, by the user; spec 9.6)
@@ -34,8 +35,8 @@ Run `cargo run` in a real terminal (Ghostty, Kitty, WezTerm or Alacritty) and ch
   set), or "Local search" wording everywhere without it;
 - `g` cycles the glyph sets; `u` undoes;
 - `:savepgn ~/test` writes `~/test.pgn` and the status line says `saved ~/test.pgn`;
-- `q` asks before quitting, and the shell is normal afterwards (mouse and paste modes off, cursor
-  visible);
+- once a move is played `q` asks before quitting (before that it quits at once), and the shell is
+  normal afterwards (mouse and paste modes off, cursor visible);
 - optional: `NO_COLOR=1 cargo run` marks a picked-up piece reversed and capture targets as `( )`.
 
 ## Core API caveats (read before building on core)
@@ -45,8 +46,6 @@ Run `cargo run` in a real terminal (Ghostty, Kitty, WezTerm or Alacritty) and ch
 - The en passant square (and so the Zobrist hash) is set whenever an enemy pawn attacks it, even when that capture is illegal because of a pin; a threefold repetition involving such a position can be missed. Rare; documented only.
 - `from_fen` rejects positions beyond the promotion material budget; `MoveList` capacity (321) is derived from that budget.
 - `pub mod core` shadows the built-in `core` crate at the crate root: write `::core::` in `src/lib.rs`.
-- CI (`cargo test --verbose`) stops at the 3 known old-code failures, so `core_properties` and the bench are not exercised in CI until the cleanup sub-project (consider `--no-fail-fast`).
-- `CLAUDE.md` still says "3 of 58" failing tests; now 3 of 496 lib tests (493 pass, 3 ignored) plus 2 property tests. Its Commands section names the TUI (`cargo run`, `tests/pty_smoke.py`), but its Architecture section still describes only the legacy crate-root code. Update in cleanup.
 
 ### Engine caveats (read before building the TUI on engine)
 - Give the worker a `Game` clone, not a `Position`: `analyse` needs the move history for repetition detection and `describe` sends the recent moves.
@@ -85,7 +84,7 @@ Run `cargo run` in a real terminal (Ghostty, Kitty, WezTerm or Alacritty) and ch
 - TUI integration: send `game.clone()` (the whole `Game`) to a long-lived worker thread that owns the ComputerPlayer<JevClient> (ComputerPlayer::from_config(EngineConfig::from_env())), or share the player through `Arc` (it is `Sync`, not `Clone`); worst-case `choose_move` latency is about 19 s (3 attempts × 5 s timeout + backoff + search), so tag each request with a generation counter and discard stale results; show EngineConfig.warnings, ComputerMove.note, source (its `Display` label), top and model.
 - The ignored live Jev round-trip test (`engine::jev::tests::live_choice_round_trip`) passed once during Task 7, with the user's key.
 - Test counts after the final fix wave: `cargo test --lib engine::` 87 passed, 2 ignored; `cargo test --lib core::` 51 passed, 1 ignored; `core_properties` 2 passed; whole lib 193 passed, 3 failed (old code), 3 ignored.
-- Engine follow-up (2026-09-27): SEE judges the first capturer by the pins of the position as it stands and the recaptures by the pins after the first capture (pins changed by later captures are still not modelled); `new_attack`'s "defended" check is pin-aware. The Jev endpoint is fixed, not configurable (user decision): `jev::JEV_ENDPOINT` = `https://api.typesafe.ai/v1/systemone`, the TypeSafe quickstart URL, with `Authorization: Bearer <key>` and `Content-Type: application/json`; an offline test pins that wire format. Test counts: `cargo test --lib engine::` 93 passed, 2 ignored; whole lib 199 passed, 3 failed (old code), 3 ignored.
+- Engine follow-up (2026-09-27): SEE judges the first capturer by the pins of the position as it stands and the recaptures by the pins after the first capture (pins changed by later captures are still not modelled); `new_attack`'s "defended" check is pin-aware. The Jev endpoint is fixed, not configurable (user decision): `chess::engine::JEV_ENDPOINT` = `https://api.typesafe.ai/v1/systemone`, the TypeSafe quickstart URL, with `Authorization: Bearer <key>` and `Content-Type: application/json`; an offline test pins that wire format. Test counts: `cargo test --lib engine::` 93 passed, 2 ignored; whole lib 199 passed, 3 failed (old code), 3 ignored.
 - Follow-up review fixes (2026-09-27): in SEE a king captures only onto a square no enemy piece attacks, pinned or not (a pinned piece still guards against a king), so `capture_gain(d5)` in `4k3/8/4b3/3n4/2K5/8/8/4R3 b` and `see(d1d4)` in `3rk3/8/8/4b3/3r4/2K5/8/3RQ3 w` are now 0; `JEV_ENDPOINT` is re-exported as `engine::JEV_ENDPOINT` (no engine rustdoc warnings); the wire-format test compares body keys as a set and the endpoint test checks host and path. Test counts: `cargo test --lib engine::` 96 passed, 2 ignored; whole lib 202 passed, 3 failed (old code), 3 ignored.
 - Final-review fix wave: a mate on the 100th half-move now outranks the fifty-move rule; SEE ignores pinned pieces off their pin line; annotation facts corrected ("exposed to capture" wording, no such fact for the capturing piece, a king only attacks undefended pieces); base-URL variable validated (since removed by the engine follow-up); transport errors classified (new `JevError::Request`), 1 MiB body cap and offline TcpListener tests; notes stripped of control characters; public docs, `ComputerPlayer` Debug and `MoveSource` Display; harness `jev pick` column and answered-only latency.
 - TUI task 4: implemented as specified in the brief, no deviations. `INSTA_UPDATE=no cargo test --lib tui::` reports 104 passed (brief said 103); the extra test is from task 3's fix round 1, which added a test after the brief text was written.
@@ -94,7 +93,7 @@ Run `cargo run` in a real terminal (Ghostty, Kitty, WezTerm or Alacritty) and ch
 - TUI task 3 fix round 1: `movetext.rs`'s `loose_match` no longer short-circuits on the first loose-SAN or piece-spelling match; it now always also computes the promotion-without-piece candidates (renamed `missing_promotion` to `promotion_candidates`, returning candidates rather than a `Result`) and merges them in, so a pawn promotion typed without its piece (`bxc8`) that also matches another piece's move on the same square (`Bxc8`) is reported `MoveTextError::Ambiguous` (`Bxc8`, `bxc8=?`, the latter collapsing all four promotion pieces via new helper `promotion_family_labels`) instead of silently playing the other piece's move. Deviation from the plan's code (the brief's `loose_match`/`missing_promotion` are restructured), by fix-round ruling to close a verified review finding.
 - TUI final-review fix wave (2026-09-27): A1 command box above the game-over overlay; A2 NO_COLOR board marks; A3 status messages and save errors fitted with `…`, paths shown with `~` and shortened in the folder part; B1 a computer move clears only turn notes; B2 Save dialog unquotes paths; B3 promotion picker Esc gives typed text back; B4 watchdog turns raw mode off before its writes; B5 stdin checked before setup; B6 move list columns; B7 pty smoke test uses cargo's target dir and checks stdin; B8/B9 run-loop tests. Test counts: `INSTA_UPDATE=no cargo test --lib tui::` 291 passed; whole lib 493 passed, 3 failed (old code), 3 ignored; `core_properties` 2 passed. Snapshots changed only by B6 (move rows of game_over_80x24, jev_reply_80x24, jev_vetoed_80x24, mid_game_80x24). Follow-up: the Status message budget counts wrapped rows (a game-over line that wraps no longer cuts a save message to `saved`), and the NO_COLOR capture/check marks survive the keyboard cursor; `tui::` 293 passed.
 - Deliberate deviations from spec 6 wording on feat/tui (no code change planned):
-  - 6.2/6.4: while only "Terminal too small" is shown, all input is ignored except Ctrl+C, which quits at once without the confirmation (it could not be seen) (`src/tui/app.rs:1036`).
+  - 6.2/6.4: while only "Terminal too small" is shown, all input is ignored except Ctrl+C, which quits at once without the confirmation (it could not be seen) (`App::handle` in `src/tui/app.rs`).
   - 6.4: the focus stack also places the game-over overlay: dialog > command box > game-over overlay > board. When the computer's move ends the game while the command box is focused, keys keep going to the box (Esc leaves it); when the person's own move or command ends the game, the box is left so the overlay gets the next keys (A1).
   - 6.4: extra keys beyond the spec's list: `m` (menu) on the board; `n`/`s`/`m`/`u`/`q`, arrows and Tab on the game-over overlay; Ctrl+S also from the overlay; `:resign` asks first, and undo withdraws a resignation.
   - 6.4: a bare `:fen`, `:savefen` or `:savepgn` opens its dialog instead of printing a usage message; declining an overwrite gives the typed path back where it was typed; cancelling the promotion picker gives back a move typed without its piece (B3).
@@ -114,100 +113,50 @@ Run `cargo run` in a real terminal (Ghostty, Kitty, WezTerm or Alacritty) and ch
 - tui-polish final fix wave (2026-09-28): spec 9.3 changed: Kitty pictures now follow a font zoom like Sixel and iTerm2 (a resize measures the font; a new size rebuilds the picker and the pictures). Kitty and Ghostty size a placeholder picture from its pixel size and the current cell size, so the old ruling ("Kitty placeholders scale with the cells") left pieces cropped or shrunk after a zoom until restart.
 - tui-polish final fix wave (2026-09-28): the dev-profile picture-crate list (task 5 fix round 1) missed `quantette`, the colour quantiser icy_sixel 0.5 runs for every Sixel picture (measured by the reviewers: 1.2-4.4 s per Sixel board rebuild in dev, about 0.1-0.2 s with it optimised), and named `base64`, which the picture encoders do not use. `Cargo.toml` now also optimises `quantette`, `base64-simd` and `vsimd` (what ratatui-image's Kitty and iTerm2 encoders call) and drops `base64`; `dev_builds_optimise_the_picture_encoding_crates` checks the corrected list.
 - TUI task 6 fix round 1: closed six verified findings (2 and 4 name the same gap) against spec 9.4. panels.rs: `status_panel` now sizes the mode-title room without DEBUG's contribution, so the mode title always keeps the Status border, and only adds ` DEBUG ` there when both titles still fit; when they do not, `status_lines` (which gained a `debug_first: bool` parameter) starts the turn line with a `DEBUG ` span instead of dropping the mode title. debug.rs: `open_log` now also tightens an already-existing log file's mode to 0600 with `set_permissions` (`OpenOptionsExt::mode` only takes effect when the open call actually creates the file, so a pre-existing looser-mode file used to keep leaking Jev bodies); `log_path` expands a leading `~/` in `RCHESS_DEBUG_LOG` to `HOME` via a new private `expand_tilde` helper (the same rule as `files::resolve_path`), returning `None` (the existing generic "no log file" message) when `HOME` is unset. `log_path`'s `Option<PathBuf>` return type is kept unchanged on purpose: Task 8's own patch later changes it to `Result<PathBuf, String>` and its diff hunks assume the pre-Task-8 signature, so reporting the specific "cannot expand ~" reason (rather than the generic no-log message) is left to that task, which is expected to need reconciling with this fix round's edits around `log_path`/`open_log`/`DebugLog::open`. app.rs: a debug log failure found while the Menu is up is now kept in a new `pending_log_failure: Option<Message>` field (the Menu screen never draws `message`, and `start()` clears `message` for the new game) and shown once the screen becomes `Playing` or `GameOver`, instead of being silently dropped by the next game start. Deviation from the plan's code and from task 6's own patch, by fix-round ruling to close verified review findings.
+- Test counts in older notes and log entries ("3 failed (old code)", "only the 3 known old-code failures") include the legacy tests that cleanup task 1 deleted with the legacy code; since then `cargo test` has no failures.
+- cleanup rulings (spec 10, amended 2026-09-28): every start-up graphics query ends with a device-attributes request after the status request (for WezTerm and Konsole it is the only one); its answer is read and dropped after the status report, or reaches crossterm last as an event when the answers are late, so a late answer never leaves crossterm's read waiting for a key. A terminal that does not answer it adds up to 200 ms to start-up, and keys typed during the 200 ms drain or before that answer are lost.
+- cleanup rulings: a non-JSON Jev body still has the key replaced in place when it appears plainly or as `\/`; the whole body is withheld (`<redacted: the body contained the API key>`) only when the key survives that replacement, e.g. `\u`-escaped.
+- cleanup rulings: non-UTF-8 `RCHESS_GLYPHS`, `RCHESS_IMAGES` and `NO_COLOR` always give a menu warning; `RCHESS_DEBUG_LOG`, `XDG_STATE_HOME` and `HOME` only in debug mode, the only mode that reads them. `RCHESS_IMAGES` takes `on`, `1`, `true` and `yes` as on without a warning.
+- cleanup rulings: saving without overwrite hard-links the temp file into place and falls back to check-then-rename only when the file system reports hard links as `Unsupported` or, as Linux does for FAT, `PermissionDenied` (EPERM).
+- cleanup rulings: the debug log is opened with `O_NOFOLLOW` (rustix's `fs` feature, the only dependency change of the sub-project), so a symbolic link planted after the link check is refused ("is a link") without its target being opened or created; `ELOOP` maps to that refusal.
+- cleanup rulings: a reply held while Jev vs Jev is paused is logged on arrival, so its log line's `stale` is its state then (`held: true`); whether it was later played or dropped changes only the in-memory history.
+- cleanup rulings: CI pins the Rust toolchain exactly (1.98.1); bumping it is a deliberate change that fixes whatever the new clippy finds.
+- cleanup task 7: CI (`.github/workflows/rust.yml`) runs fmt, clippy `-D warnings` on all targets, `cargo test`, `cargo build` and `tests/pty_smoke.py --no-build` on ubuntu-latest with the Rust toolchain pinned to 1.98 (`dtolnay/rust-toolchain@1.98`; bump it deliberately, so a new clippy lint cannot turn CI red without a code change), each command under `env -u JEV_API_KEY -u TYPESAFE_API_KEY` and with no secret. The pty smoke test's timing bounds each sit below a fixed wait the bug they catch would fall into (the query's 1 s deadline, the 1 s stuck-UI grace); the signal and hangup checks during the graphics query are now timed from when the query was seen, waits for something that must happen got seconds, and the busy-hangup scenario uses a 250x800 window plus 20 resizes so its frames overflow a Linux pty buffer too, and on Linux checks through `/proc/<pid>/syscall` that the UI really is blocked in a write before the hangup. The split-answer and signal-with-answers scenarios skip their timing checks with a NOTE when the harness itself saw the query or acted too late for them to mean anything. There is no setting to scale the bounds. (Superseded by the final fix wave: CI no longer runs the pty smoke test, see below.)
+- cleanup final fix wave: CI is a matrix of ubuntu-latest and macos-latest running `cargo fmt --check`, clippy `-D warnings` on all targets, `cargo build` and `cargo test`, with the toolchain pinned to `dtolnay/rust-toolchain@1.98.1` and a `workflow_dispatch` trigger; the pty smoke test is a local check only (CLAUDE.md, Commands). The user has built and run the branch on Ubuntu without errors. A UI that fails with an error on a terminal that closed without SIGHUP now ends by SIGHUP when stdin looks closed (`signal_after_error` in src/tui/mod.rs), instead of exiting with status 1 when the "hangup" thread's next look comes just after the 100 ms signal grace. The menu never shows "+0 more warnings": when no warning is among the notes that do not fit, there is no count.
 
 ## Known open issues
-- Engine minor: annotate's "undefended" qualifier (annotate.rs, capture branch) counts a king as a recapturer even when the recapture would be illegal, e.g. `8/8/8/2k5/3n4/5B2/3QK3/8 w - - 0 1` Qxd4 reads "wins material in the exchange" instead of "undefended". SEE values are correct.
-- Engine minor: `ComputerMove.model` and Transport/Request error text skip the control-character sanitiser.
-- Docs nit: the spec (5.2) and older Notes lines name the endpoint `jev::JEV_ENDPOINT`; the public path is `chess::engine::JEV_ENDPOINT`.
-- Historical engine plan text still uses the old "undefended against capture" wording and mentions `JEV_BASE_URL`.
-
-### TUI (deferred minors from reviews)
-- src/tui/glyphs.rs:323 `char_width` returns 1 for control characters, which ratatui's buffer drops (0 cells).
-- src/tui/glyphs.rs:332 `shorten` cuts by char count, so 24 wide or escaped characters can still flood a message, and the cut can split a grapheme cluster.
-- src/tui/glyphs.rs:258 the recommended env accessor `std::env::var(k).ok()` treats a non-UTF-8 `NO_COLOR` or `RCHESS_GLYPHS` as unset, with no warning (crossterm does the same for `NO_COLOR`).
-- src/tui/glyphs.rs:278 the CLI and `RCHESS_GLYPHS` branches of `initial_glyphs` repeat the same parse-or-reject shape.
-- src/tui/test_support/mod.rs:87 the doc of `char_events` says "as the terminal reports them", but every character is sent with no modifiers.
-- src/tui/board.rs:182 the label column and row only get a symbol; their style is never reset, unlike square cells.
-- src/tui/board.rs:874 full-board rendering is covered by the 120×40 snapshot.
-- src/tui/panels.rs:564 `fit_message` and `cut_to_fit` are quadratic in the message length and run every frame, so a very long pasted save path makes the UI lag while its error is shown.
-- src/tui/input.rs:69 `insert_str` deletes tabs outright, so a pasted `:fen\t<FEN>` joins words and FEN fields.
-- src/tui/input.rs:69 if the box already holds text, a paste made only of line breaks does not submit it.
-- src/tui/input.rs:158 `is_ignored` misses some invisible format characters (U+061C, U+00AD, U+180E, U+034F, U+FFF9-U+FFFB).
-- src/tui/movetext.rs:92 the `kind_of` closure is defined identically in `loose_match` and `long_algebraic`.
-- src/tui/files.rs:129 the no-overwrite check and the rename are two steps, so a file created between them is silently replaced.
-- src/tui/files.rs:127 overwriting a symlink replaces the link with a regular file and leaves its target unchanged.
-- src/tui/files.rs:234 the PGN `Date` tag uses the UTC date, not the local date.
-- src/tui/files.rs:152 `write_file` does two blocking fsyncs (file, then folder) on the UI thread.
-- src/tui/files.rs:184 only the NotFound and IsADirectory branches of `describe` are tested.
-- src/tui/files.rs:300 the `(None, None)` arm in `pgn_export`'s roster loop is dead code duplicating `Game::to_pgn`.
-- src/tui/terminal.rs:298 `leave_once` clears ACTIVE before the restore runs, so a second concurrent caller returns at once and the process can exit mid-restore.
-- src/tui/terminal.rs:161 `leave` stops at the first failed step inside each compound restore call.
-- src/tui/terminal.rs:403 the panic-hook test replaces the process-global hook while other tests run, and leaves the probe hook installed if an early assertion fails.
-- src/tui/terminal.rs:316 a comment in the panic hook says an engine panic reaches the UI as a failed reply; it becomes a local-search move.
-- src/tui/terminal.rs:241 if the terminal closes and no SIGHUP ever reaches chess (a supervisor that ignores SIGHUP, zsh `trap '' HUP`), the UI thread spins at 100% CPU in crossterm's read loop.
-- src/tui/worker.rs:388 `engine_survives_a_panic_and_keeps_answering` uses two engines, so it does not show the same engine keeps answering.
-- src/tui/worker.rs:411 `reply_to_a_closed_channel_is_dropped_quietly` returns before the send it means to test has run.
-- src/tui/test_support/engine.rs:112 `FakeEngine::local()` still reports every move as a Jev move with top three, confidence and model.
-- src/tui/app.rs:1059 an Alt+key chord outside a text field is split into Esc plus the key; if that Esc opens or reveals a text field, the key is typed into it.
-- src/tui/app.rs:1742 `q` asks for confirmation on a board with no moves; `n` and `m` do not.
-- src/tui/mod.rs:328 every event in a batch is hit-tested against the hit map from the draw before the batch, even after an earlier event changed the layout.
-- src/tui/mod.rs:96 `--help` into a closed pipe (`chess --help | true`) prints `chess: Broken pipe (os error 32)` and exits 1.
-- src/tui/mod.rs:287 `--version` and `-V` are unknown arguments (a menu warning).
-- src/tui/mod.rs:341 no test covers `perform`'s branch for a failed engine-thread spawn (the synthetic `EngineOutcome::Failed` reply).
-- src/tui/mod.rs:386 the test module's `fn play(glyphs, warnings) -> Cli` helper shadows the outer `fn play(app, quit, fault)`.
-- src/tui/panels.rs:202 menu warnings that do not fit are dropped without notice at 60×20.
-- src/tui/terminal.rs:161 no cargo test checks the bytes `leave()` writes (tests/pty_smoke.py covers them).
-
-### tui-polish (known limits)
-- src/tui/graphics.rs: iTerm2 gets the Sixel protocol when it answers the sixel probe (the iTerm2 environment hint only decides when no probe answers).
-- src/tui/graphics.rs: on terminals that answer more than 1 s late, keys typed while a font measurement waits are lost, and a stale font can stay until the next resize; a late start-up answer from WezTerm or Konsole (no device-attributes probe) can hold crossterm's read until the next input.
-- src/tui/graphics.rs: a quit signal during the start-up query leaves the terminal's answers in the tty input queue for the shell.
-- src/tui/terminal.rs: Kitty pictures are deleted at exit with one delete-by-id command for every picture built in the session (each square-size or font change builds new ones), so a long session with many resizes writes that many commands on exit.
-- src/tui/board.rs: pictures are composited and encoded on the UI thread on the first Image frame and after every square-size or font change (about 0.1-0.2 s for a Sixel board at 300x100 with the dev-profile overrides, similar in release); a crate added to the encoding path later needs its own `[profile.dev.package]` override or debug builds stall again.
+Limits kept on purpose (spec 10.7):
+- src/tui/files.rs: the PGN `Date` tag is the UTC date, not the local date (a local date needs a timezone dependency).
+- Saving (`files::write_file`, two fsyncs) and picture encoding (`board::PieceImages`) run on the UI thread: about 0.1-0.2 s for a Sixel board at 300x100, with the dev-profile overrides and in release. A crate added to the encoding path needs its own `[profile.dev.package]` override, or debug builds stall again.
 - src/tui/board.rs: half-block pictures are written in 24-bit colour even on the 256-colour palette (ratatui-image behaviour).
-- src/tui/app.rs: quitting while a Jev answer is held (watch mode paused) drops that exchange from the history and the log.
-- src/tui/debug.rs: non-UTF-8 values of RCHESS_DEBUG_LOG, XDG_STATE_HOME or HOME are skipped without a warning, and a relative HOME is accepted.
-- src/tui/glyphs.rs: RCHESS_IMAGES turns images off only for the value `off`; other values are ignored without a warning.
-- src/tui/panels.rs: menu warnings that do not fit at 60x20 are dropped without notice (pre-existing).
+- src/tui/graphics.rs: on a terminal that answers more than 1 s late, keys typed while the start-up query or a font measurement waits (and during the 200 ms drain after a query that gave up, or before the trailing device-attributes answer) are lost, and a stale font size can stay until the next resize. Kitty measures the font on every resize too, so this applies to it as well.
+- No CI job builds for a non-unix target; the non-unix graphics path (the query skipped without a warning) is checked by reading only.
+- Historical plan documents are not rewritten: the engine plan still uses the old "undefended against capture" wording and mentions `JEV_BASE_URL`.
 
-### tui-polish (deferred minors from reviews)
-Copied from the git-ignored SDD ledger (.superpowers/sdd/2026-09-27-tui-polish/progress.md); line numbers are current as of the final fix wave.
-- src/engine/jev.rs:497 the response body is redacted before it is parsed, so the untraced path changes too, and a key that is a substring of a valid answer corrupts the parse.
-- src/engine/jev.rs:288 a key echoed with `\u` escapes inside a body that is not valid JSON is not redacted (`\/` is handled).
-- src/engine/jev.rs:1057 `traced_exchange_records_a_failed_connection_without_a_status` binds port 0, drops the listener and assumes nothing listens there; a parallel test's `serve()` could get the same port.
-- src/engine/jev.rs:349 the private `struct Attempt` is named almost like the public `JevAttempt` it feeds.
-- src/tui/panels.rs:1846 `every_square_is_hit_at_every_size` also checks a click-to-move and a drag-to-move at one fixed size, which its name does not promise.
-- src/tui/graphics.rs:486 if the 1 s deadline falls partway through the kitty answer, its unread tail reaches crossterm as key presses; `LateAnswers` only drops a run that starts with Alt+`_` then `G`.
-- src/tui/graphics.rs:462 with neither a cell-size answer nor a window pixel size, `interpret` downgrades a detected Kitty or Sixel answer to half-blocks; spec 9.3 says the picker is built for the detected protocol at 10x20.
-- src/tui/board.rs:275 clearing the picture cache leaves the dropped Kitty pictures in the terminal's image store until exit (they are deleted by id then).
-- src/tui/board.rs:317 an error from `new_protocol` (and from `Kitty::new`, line 333) is cached as `None` for good and never logged.
-- src/tui/debug.rs:221 `BodyLine::rows` rewraps a line holding a wide or zero-width character on every frame, allocating the whole line each time.
-- src/tui/debug.rs:698 when `close` times out mid-write, the process can exit in the middle of a record, and the next session appends after half a line.
-- tests/pty_smoke.py:939 `scenario_query_hangup` never checks the "at once" timing its docstring promises; any exit by SIGHUP within 5 s passes.
-- tests/pty_smoke.py:939 `scenario_query_hangup` duplicates the hangup-detection loop of `scenario_hangup` (line 620) instead of sharing a helper.
-
-### tui-polish (minors from the final whole-branch review, 2026-09-28; triaged as can wait)
-- src/tui/graphics.rs:192 A late start-up answer that reaches crossterm in more than one read freezes the UI until the next key. A split right after its ESC turns the answer into key presses that start a game.
-- src/tui/graphics.rs:233 Every start-up on a non-unix build shows the menu warning 'graphics query: unsupported; images use half-blocks', although no query was attempted and the user cannot fix it.
-- src/tui/debug.rs:144 Each exchange keeps a pre-rendered copy of every response body: pretty-printed JSON, one heap-allocated BodyLine per line. That makes the history's real limit 30-150x larger than the 1 MiB cap x 3 attempts x 50 it appears to have.
-- src/tui/debug.rs:630 The record channel to the debug-log thread is unbounded. While that thread is blocked, every exchange of the session stays in memory, not just the 50 in History, and no failure is ever reported.
-- src/tui/debug.rs:748 open_log follows a symlink (or hard link) at the log path. It appends JSON to the link's target and changes the target's mode to 0600, while the link itself is left in place.
-- src/tui/app.rs:1639 An answer held while Jev vs Jev is paused keeps its exchange out of the history, the view and the log until play resumes. If the person quits while paused, the exchange is never logged. When the exchange is recorded later, its log `time` is when it was released, not when the reply arrived.
-- src/tui/debug.rs:457 ←/→ (and `d`, through `ExchangeView::open`) reset `page` and `max_scroll` to 0 until the next draw. End, PgDn and ↓ that arrive in the same input batch after them do nothing.
-- src/tui/app.rs:1303 `d` on the game-over overlay does nothing and shows no message. To see the exchange behind Jev's game-ending move, the person must first press Esc (see the board), then `d`.
-- src/tui/app.rs:1970 On a terminal without a graphics protocol (half-blocks), `g` still offers `image`, but at ordinary window sizes it looks exactly like Solid while the status says "glyphs: image". Half-block pictures need 11×5 squares, which takes a window of about 123×46 cells or more with a 10×20 font.
-- src/tui/glyphs.rs:446 `RCHESS_IMAGES` treats only `off` as off. Values like `0`, `false` or `no` silently leave images on and still send the graphics query, unlike `RCHESS_DEBUG`, where `0` means off. No menu warning names the unrecognised value, as happens for `RCHESS_GLYPHS`.
-- docs/handoff/HANDOFF.md:14 Several HANDOFF sections are out of date or weaker than on main: the verify command, the manual smoke checklist, one test count, and the line references in older deferred minors.
-- src/tui/graphics.rs:462 Two deliberate departures from spec 9 are not written down in the spec or the HANDOFF deviation list.
-- src/tui/app.rs:5206 `a_log_failure_found_on_the_menu_is_shown_once_a_game_starts` waits a fixed 20 x 5 ms for the debug-log thread to fail, so it depends on timing.
-- src/tui/app.rs:5108 The Task 8 three-way merge left duplicated tests, one redundant field, and an inlined guard with no test. There is no dead code.
-- The Task 7 ledger minor (no Sixel-answering pty scenario) is resolved: tests/pty_smoke.py has scenario_query_sixel_zoom.
-- Kitty now also measures the font on each resize (spec 9.3), so the slow-terminal limits of the font measurement apply to Kitty too.
+### Follow-ups (not spec limits)
+Minor findings from the final review, deferred; none blocks the merge.
+- src/engine/player.rs:124: `redacted()` redacts the key but does not apply `printable()` (src/engine/jev.rs:241), so the "Jev unavailable" note built from another chooser's error (line 191) could carry control characters or run long.
+- src/tui/graphics.rs:319: the tail of a Kitty answer split by the query deadline that arrives more than 200 ms (`DRAIN_TIME`) late is not drained and can reach the event loop.
+- src/tui/terminal.rs:679: macOS reports POLLNVAL on a stdin redirected from `/dev/tty` (`< /dev/tty`), which `look` takes as a closed terminal, so the "hangup" thread ends such a session.
+- src/tui/graphics.rs:340: the drain (200 ms) plus the device-attributes read (up to another 200 ms) after a late query can delay a quit by about 450 ms.
+- src/tui/glyphs.rs:508: `shorten` may cut inside a ZWJ emoji sequence (it keeps combining marks, not zero-width joiners).
+- src/tui/debug.rs:907: the newline check on an existing debug log re-opens the log by name (`ends_with_newline`) instead of reading through the opened, link-checked file.
+- src/tui/debug.rs:917: a FIFO at the debug log path blocks the `debug-log` thread in `open` until a reader appears (quitting still ends after `LOG_GRACE`).
+- src/tui/terminal.rs:1384 the test `a_closed_terminal_is_reported_once` uses the unix-only `HANGUP_LOOK` without `#[cfg(unix)]`, so the tests would not compile for a non-unix target (no CI job builds one; gate the test or drop the cfg on the constant).
 
 ## Open questions for user
 - None.
 
 ## Log (newest first)
+- 2026-09-28 cleanup final fix wave: CI matrix on Linux and macOS with an exact toolchain pin and a manual trigger (pty smoke local only), an error on a closed terminal ends by SIGHUP, no "+0 more warnings", HANDOFF follow-ups, CLAUDE.md fixes, stronger fallback and picture-cache tests
+- 2026-09-28 cleanup task 7 done: CI workflow (fmt, clippy -D warnings, test, build, pty smoke), CLAUDE.md rewritten for core/engine/tui, HANDOFF open issues cut to the spec 10.7 limits, pty smoke timing margins for CI; cleanup complete, awaiting the user's review and merge
+- 2026-09-28 cleanup task 6 done: Test quality and the pty hangup helper
+- 2026-09-28 cleanup task 5 done: Saving and the debug log
+- 2026-09-28 cleanup task 4 done: Input, board and panels
+- 2026-09-28 cleanup task 3 done: Terminal and graphics fixes
+- 2026-09-28 cleanup task 2 done: Engine fixes: king recaptures, record-only redaction, sanitised text
+- 2026-09-28 cleanup task 1 done: Remove the legacy code and dependencies
+- 2026-09-28 cleanup plan written: 7 tasks as git patches from a prototype reviewed for correctness and plan readiness, history rebuilt so each task's tests fail first; spec section 10 amended with the review rulings
 - 2026-09-28 feat/tui-polish merged into main locally (f18dd32); merged result verified: tui:: 451, engine:: 112, whole crate only the 3 known old-code failures, pty smoke green
 - 2026-09-28 tui-polish complete: tasks 1-8 applied and reviewed, final five-lens review fixed (Kitty font zoom, dev-profile Sixel crates, handoff minors) and re-reviewed; awaiting the user's manual test and merge
 - 2026-09-28 tui-polish final fix wave: Kitty pictures follow a font zoom (spec 9.3 corrected); dev profile optimises `quantette`, `base64-simd` and `vsimd`; deferred review minors copied into this file

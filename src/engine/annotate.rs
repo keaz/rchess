@@ -10,7 +10,7 @@ use crate::core::{
 
 use super::eval::piece_value;
 use super::search::{MATE_BOUND, ScoredMove};
-use super::see::{capture_gain, capturers, exchange_value, see, winnable_pieces};
+use super::see::{can_capture, capture_gain, capturers, exchange_value, see, winnable_pieces};
 
 /// The engine's verdict on a move relative to the best move found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -108,7 +108,8 @@ fn effect(pos: &Position, mv: Move, score: i32) -> String {
             .piece_at(mv.to())
             .expect("capture target holds a piece")
             .kind;
-        let recapture = capturers(&child, mv.to(), child.occupied(), !us).any();
+        // A king that would step into check cannot take back.
+        let recapture = can_capture(&child, mv.to(), !us);
         let exchange = see(pos, mv);
         let qualifier = if !recapture {
             "undefended"
@@ -358,6 +359,24 @@ mod tests {
         assert_eq!(
             find(&pos, &list, "f3e5").effect,
             "captures the pawn on e5, undefended"
+        );
+    }
+
+    #[test]
+    fn a_king_that_cannot_legally_recapture_does_not_defend() {
+        // Only the king on c5 attacks d4 after Qxd4+, and Kxd4 would step into the
+        // bishop on f6: the knight was undefended.
+        let (pos, list) = annotations("8/8/5B2/2k5/3n4/8/8/3QK3 w - - 0 1");
+        assert_eq!(
+            find(&pos, &list, "d1d4").effect,
+            "captures the knight on d4, undefended; gives check"
+        );
+        // Without the bishop the king takes back, so the queen is lost for a knight.
+        let (pos, list) = annotations("8/8/8/2k5/3n4/8/8/3QK3 w - - 0 1");
+        assert!(
+            find(&pos, &list, "d1d4")
+                .effect
+                .starts_with("captures the knight on d4, loses material in the exchange"),
         );
     }
 

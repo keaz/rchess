@@ -24,6 +24,7 @@ pub mod terminal;
 mod test_support;
 pub mod worker;
 
+use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
@@ -33,7 +34,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ratatui::backend::Backend;
-use ratatui::crossterm::event::Event;
+use ratatui::crossterm::event::{Event, KeyEventKind, MouseEventKind};
 
 use crate::core::Game;
 use crate::engine::{ComputerMove, ComputerPlayer, EngineConfig};
@@ -53,6 +54,14 @@ const TICK: Duration = Duration::from_millis(50);
 /// arrives, and the process should then end by that signal rather than by the error.
 const SIGNAL_GRACE: Duration = Duration::from_millis(100);
 
+/// The number of SIGHUP, with which a UI that failed on a closed terminal ends.
+#[cfg(unix)]
+const HANGUP: i32 = signal_hook::consts::SIGHUP;
+/// SIGHUP's number on POSIX systems; unused in practice here, as stdin never looks
+/// closed ([`terminal::stdin_looks_closed`]).
+#[cfg(not(unix))]
+const HANGUP: i32 = 1;
+
 /// How long quitting waits for the debug log to write the exchanges still queued.
 const LOG_GRACE: Duration = Duration::from_millis(500);
 
@@ -71,6 +80,7 @@ const USAGE: &str = concat!(
     "  --debug            debug mode: keep every Jev request and answer, show them\n",
     "                     with `d` during a game and append them to the debug log\n",
     "  -h, --help         show this help and exit\n",
+    "  -V, --version      show the version and exit\n",
     "\n",
     "Environment:\n",
     "  JEV_API_KEY        key for the Jev computer player (TYPESAFE_API_KEY also\n",
@@ -79,7 +89,8 @@ const USAGE: &str = concat!(
     "  JEV_MAX_OPTIONS    moves offered to Jev per turn, 1-255 (default 40)\n",
     "  JEV_FILTER_LOSING  keep losing moves off Jev's shortlist (default true)\n",
     "  RCHESS_GLYPHS      glyph set when --glyphs is not given\n",
-    "  RCHESS_IMAGES      off: no piece pictures, and no graphics query at start\n",
+    "  RCHESS_IMAGES      off, 0, false or no: no piece pictures, and no graphics\n",
+    "                     query at start\n",
     "  RCHESS_DEBUG       debug mode as with --debug, unless empty or 0\n",
     "  RCHESS_DEBUG_LOG   the debug log file; the default is\n",
     "                     $XDG_STATE_HOME/rchess/jev-debug.jsonl, else\n",
@@ -91,13 +102,28 @@ const USAGE: &str = concat!(
     "In the game press ? for help. Moves can be typed after / (e4, Nf3, e2e4).\n",
 );
 
+/// The `--version` text.
+const VERSION: &str = concat!(env!("CARGO_PKG_NAME"), " ", env!("CARGO_PKG_VERSION"), "\n");
+
+/// Writes `text` to `out`. A reader that has gone away (a closed pipe, as in
+/// `chess --help | true`) is not an error: nobody is left to read it, as with other
+/// command-line tools.
+fn print_quietly(out: &mut impl Write, text: &str) -> io::Result<()> {
+    match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        result => result,
+    }
+}
+
 /// Runs the terminal UI until the user quits or SIGINT, SIGTERM or SIGHUP
 /// arrives. `args` are the command-line arguments without the program name.
 ///
-/// `--help` prints the usage and returns without touching the terminal.
-/// Unknown arguments and a missing or invalid `--glyphs` value do not stop the
-/// program: they are listed as warnings on the menu, like invalid engine
-/// settings, and so is a graphics query that failed. The computer player comes
+/// `--help` prints the usage and `--version` the version (`chess 0.1.0`), and both
+/// return without touching the terminal; when stdout is a pipe that is already
+/// closed (`chess --help | true`), they return quietly. Unknown arguments and a
+/// missing or invalid `--glyphs` value do not stop the program: they are listed
+/// as warnings on the menu, like invalid engine settings, and so is a graphics
+/// query that failed. The computer player comes
 /// from `EngineConfig::from_env()`; with no `JEV_API_KEY` it plays by local
 /// search and never uses the network. In debug mode (`--debug` or `RCHESS_DEBUG`)
 /// it records its exchanges with Jev (`EngineConfig::trace`).
@@ -110,16 +136,19 @@ const USAGE: &str = concat!(
 /// a panic on the thread named "main"). The terminal is restored on every exit:
 /// normal return, error return, panic, or signal. After a signal it does not
 /// return: once the terminal is restored, the process ends by that signal
-/// ([`terminal::exit_by_signal`]), so the shell sees it was interrupted.
+/// ([`terminal::exit_by_signal`]), so the shell sees it was interrupted. An error on a
+/// terminal that closed without sending SIGHUP (stdin looks closed) ends the same way,
+/// by SIGHUP.
 ///
 /// # Errors
 ///
 /// When stdin or stdout is not a terminal, when signal handlers cannot be installed, or
-/// when the terminal cannot be set up, read or drawn. Writing the `--help` text
-/// can fail too.
+/// when the terminal cannot be set up, read or drawn. Writing the `--help` or
+/// `--version` text can fail too (not for a closed pipe).
 pub fn run(args: impl IntoIterator<Item = String>) -> io::Result<()> {
-    let options = match parse_args(args) {
-        Cli::Help => return io::stdout().lock().write_all(USAGE.as_bytes()),
+    let mut options = match parse_args(args) {
+        Cli::Help => return print_quietly(&mut io::stdout().lock(), USAGE),
+        Cli::Version => return print_quietly(&mut io::stdout().lock(), VERSION),
         Cli::Play(options) => options,
     };
     // Before touching the terminal: without a terminal on stdin the key reader fails only
@@ -129,9 +158,13 @@ pub fn run(args: impl IntoIterator<Item = String>) -> io::Result<()> {
     }
 
     let env = |name: &str| std::env::var(name).ok();
+    let debug = debug::enabled(options.debug, env);
+    options
+        .warnings
+        .extend(env_warnings(debug, |name| std::env::var_os(name)));
     let images = glyphs::images_wanted(options.glyphs.as_deref(), env);
     let fault = injected_fault(env("RCHESS_FAULT").as_deref());
-    let config = engine_config(EngineConfig::from_env(), debug::enabled(options.debug, env));
+    let config = engine_config(EngineConfig::from_env(), debug);
     let mut engine: Arc<dyn Engine> = Arc::new(ComputerPlayer::from_config(config));
     if fault == Some(Fault::EnginePanic) {
         engine = Arc::new(PanickingEngine(engine));
@@ -144,7 +177,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> io::Result<()> {
         build_app(options, engine, graphics, env)
     });
     let signal = if result.is_err() {
-        signal_after(&quit, SIGNAL_GRACE)
+        signal_after_error(&quit, SIGNAL_GRACE, terminal::stdin_looks_closed)
     } else {
         quit.load(Ordering::SeqCst)
     };
@@ -153,6 +186,29 @@ pub fn run(args: impl IntoIterator<Item = String>) -> io::Result<()> {
         terminal::exit_by_signal(signal);
     }
     result
+}
+
+/// Menu warnings for the variables whose value is not valid UTF-8, which are read as
+/// unset: `RCHESS_GLYPHS`, `RCHESS_IMAGES` and `NO_COLOR` (crossterm reads it the same
+/// way, so colours stay on), and in debug mode the three that give the debug log's path
+/// (`RCHESS_DEBUG_LOG`, `XDG_STATE_HOME`, `HOME`; saving still takes `HOME` as it is).
+///
+/// `get_os` reads an environment variable; pass `|k| std::env::var_os(k)`.
+fn env_warnings(debug: bool, get_os: impl Fn(&str) -> Option<OsString>) -> Vec<String> {
+    let mut checked = [glyphs::GLYPHS_ENV, glyphs::IMAGES_ENV, "NO_COLOR"]
+        .map(|name| (name, "ignored"))
+        .to_vec();
+    if debug {
+        checked.extend(
+            [debug::DEBUG_LOG_ENV, "XDG_STATE_HOME", "HOME"]
+                .map(|name| (name, "the debug log does not use it")),
+        );
+    }
+    checked
+        .into_iter()
+        .filter(|(name, _)| get_os(name).is_some_and(|value| value.to_str().is_none()))
+        .map(|(name, effect)| format!("{name} is not valid UTF-8; {effect}"))
+        .collect()
 }
 
 /// `config` with the exchange recording debug mode needs (`trace`) on when `debug` is.
@@ -223,6 +279,8 @@ fn play(
     // long.
     let mut screen = ManuallyDrop::new(screen);
     let _guard = terminal::Guard;
+    // A terminal that closes without sending SIGHUP still ends the program by it.
+    terminal::watch_hangup()?;
     // A terminal that does not know a probe may have printed it, and the first draw
     // writes only the cells that are not blank. (`Terminal::clear` would also ask
     // for the cursor position, another answer to wait for.)
@@ -235,9 +293,13 @@ fn play(
         quit,
         |app| {
             // Kitty keeps pictures after the program ends unless they are deleted: the
-            // board builds each with an id from `terminal::next_kitty_id`, which
-            // `terminal::leave` deletes.
+            // board builds each with an id from `terminal::next_kitty_id`. Those dropped
+            // by a font change (between frames) are deleted before the next frame, those
+            // dropped by a new square size (found while drawing) right after it;
+            // `terminal::leave` deletes the rest.
+            terminal::delete_dropped_kitty_pictures(&mut io::stdout())?;
             screen.draw(|frame| app.render(frame, Instant::now()))?;
+            terminal::delete_dropped_kitty_pictures(&mut io::stdout())?;
             Ok(())
         },
         |replies| {
@@ -276,6 +338,23 @@ fn signal_after(quit: &AtomicI32, grace: Duration) -> i32 {
             return signal;
         }
         thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// The signal a UI that failed should end by: the quit signal that arrives within
+/// `grace` ([`signal_after`]), else SIGHUP when stdin is closed (`stdin_closed`, asked
+/// only then), else 0 (return the error). A terminal can close without its SIGHUP
+/// reaching the program; the "hangup" thread would raise one within its next look at
+/// stdin, which can come just after `grace`, so a failure on a closed terminal is taken
+/// as that hangup here rather than ending with status 1.
+fn signal_after_error(
+    quit: &AtomicI32,
+    grace: Duration,
+    stdin_closed: impl FnOnce() -> bool,
+) -> i32 {
+    match signal_after(quit, grace) {
+        0 if stdin_closed() => HANGUP,
+        signal => signal,
     }
 }
 
@@ -349,8 +428,12 @@ impl Engine for PanickingEngine {
 /// What the command line asks for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Cli {
-    /// `-h` or `--help` appeared anywhere: print the usage and exit.
+    /// `-h` or `--help` appeared (before any `-V` or `--version`): print the usage
+    /// and exit.
     Help,
+    /// `-V` or `--version` appeared (before any `-h` or `--help`): print the version
+    /// and exit.
+    Version,
     /// Start the UI.
     Play(Options),
 }
@@ -367,8 +450,9 @@ struct Options {
     warnings: Vec<String>,
 }
 
-/// Reads `--glyphs <set>`, `--glyphs=<set>`, `--debug`, `-h` and `--help`. The last
-/// `--glyphs` wins. A `--glyphs` followed by nothing or by another option has no
+/// Reads `--glyphs <set>`, `--glyphs=<set>`, `--debug`, `-h`, `--help`, `-V` and
+/// `--version`. The last `--glyphs` wins; the first of help and version wins over
+/// everything. A `--glyphs` followed by nothing or by another option has no
 /// value; that and any other argument become warnings rather than errors.
 fn parse_args(args: impl IntoIterator<Item = String>) -> Cli {
     let mut options = Options::default();
@@ -376,6 +460,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Cli {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => return Cli::Help,
+            "-V" | "--version" => return Cli::Version,
             "--debug" => options.debug = true,
             "--glyphs" => match args.next_if(|value| !value.starts_with('-')) {
                 Some(value) => options.glyphs = Some(value),
@@ -405,13 +490,19 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Cli {
 /// and runs once however many resizes asked: `measure_font` asks the terminal
 /// ([`FontMeter::measure`] in production, up to [`graphics::QUERY_TIMEOUT`] when it
 /// does not answer) and its result goes to
-/// [`App::font_measured`] before the next draw.
+/// [`App::font_measured`] before the next draw. A draw inside the batch (below) that
+/// finds a measurement asked for runs it first, so that no picture is encoded for the
+/// old font.
 ///
 /// Drawing comes before each batch so that mouse events are hit-tested against
-/// what is on screen. Every batch ends with a `Tick`, so the screen is redrawn at
-/// least once per batch (the spinner and the Jev vs Jev delay depend on it);
-/// ratatui writes only the cells that changed. Once the app quits, the rest of
-/// the batch is dropped.
+/// what is on screen. An event that reads what the last draw found ([`reads_layout`]:
+/// the mouse's hit map, and for keys and pastes too whether the terminal was too small
+/// and where the board was) and follows, in the same batch, an event that may have
+/// changed the screen or its layout ([`changes_layout`]) waits for another draw, so it
+/// is handled against the new one; ticks and engine replies need no draw. Every batch
+/// ends with a `Tick`, so the screen is redrawn at least once per batch (the spinner
+/// and the Jev vs Jev delay depend on it); ratatui writes only the cells that changed.
+/// Once the app quits, the rest of the batch is dropped.
 ///
 /// `draw`, `next_batch` and `measure_font` are the terminal in production and a
 /// `TestBackend` with scripted batches and font sizes in tests. Engine replies
@@ -434,7 +525,20 @@ fn run_loop(
         let batch = next_batch(&replies)?;
         let now = Instant::now();
         let mut measure = false;
+        let mut stale = false;
         for event in batch {
+            if stale && reads_layout(&event) {
+                if measure {
+                    // The draw would encode pictures for the old font: measure first. A
+                    // later resize in the batch asks again.
+                    measure = false;
+                    let measured = measure_font(app);
+                    app.font_measured(measured);
+                }
+                draw(app)?;
+                stale = false;
+            }
+            stale |= changes_layout(&event);
             for action in app.handle(event, now) {
                 match action {
                     Action::RequestEngine(request) => {
@@ -455,10 +559,50 @@ fn run_loop(
     Ok(())
 }
 
+/// Whether handling `event` reads what the last draw found: the hit map (every mouse
+/// event), or whether the terminal was too small and where the board was (a key press
+/// or a paste, which the app ignores while the terminal is too small).
+fn reads_layout(event: &AppEvent) -> bool {
+    match event {
+        AppEvent::Term(Event::Key(key)) => key.kind == KeyEventKind::Press,
+        AppEvent::Term(Event::Mouse(_) | Event::Paste(_)) => true,
+        AppEvent::Term(_) | AppEvent::Engine(_) | AppEvent::Tick => false,
+    }
+}
+
+/// Whether `event` may change what is on screen and where: a key press, a click or
+/// release, a paste, a resize or an engine reply may; a tick, a wheel turn (which
+/// scrolls a list in place) and a drag or move of the pointer do not.
+fn changes_layout(event: &AppEvent) -> bool {
+    match event {
+        AppEvent::Term(Event::Key(key)) => key.kind == KeyEventKind::Press,
+        AppEvent::Term(Event::Mouse(mouse)) => {
+            matches!(mouse.kind, MouseEventKind::Down(_) | MouseEventKind::Up(_))
+        }
+        AppEvent::Term(Event::Paste(_) | Event::Resize(..)) | AppEvent::Engine(_) => true,
+        AppEvent::Term(_) | AppEvent::Tick => false,
+    }
+}
+
 /// Runs `request` on an engine thread, whose reply arrives on `replies`.
 fn request_engine(request: EngineRequest, engine: &Arc<dyn Engine>, replies: &Sender<EngineReply>) {
+    request_engine_with(request, engine, replies, worker::spawn_request);
+}
+
+/// [`request_engine`] with the thread started by `spawn` ([`worker::spawn_request`] in
+/// production). The thread is detached: its handle is dropped.
+fn request_engine_with(
+    request: EngineRequest,
+    engine: &Arc<dyn Engine>,
+    replies: &Sender<EngineReply>,
+    spawn: impl FnOnce(
+        Arc<dyn Engine>,
+        EngineRequest,
+        Sender<EngineReply>,
+    ) -> io::Result<thread::JoinHandle<()>>,
+) {
     let (generation, hash) = (request.generation, request.hash);
-    if let Err(error) = worker::spawn_request(Arc::clone(engine), request, replies.clone()) {
+    if let Err(error) = spawn(Arc::clone(engine), request, replies.clone()) {
         // No thread means no reply. Answer for it, so the app stops
         // waiting: it shows the failure and lets the person retry.
         let failed = EngineReply {
@@ -474,6 +618,7 @@ fn request_engine(request: EngineRequest, engine: &Arc<dyn Engine>, replies: &Se
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::VecDeque;
     use std::convert::Infallible;
 
@@ -500,7 +645,8 @@ mod tests {
         list.iter().map(|arg| (*arg).to_string()).collect()
     }
 
-    fn play(glyphs: Option<&str>, warnings: &[&str]) -> Cli {
+    /// What `parse_args` returns for starting the UI with `glyphs` and `warnings`.
+    fn cli_play(glyphs: Option<&str>, warnings: &[&str]) -> Cli {
         Cli::Play(Options {
             glyphs: glyphs.map(str::to_string),
             warnings: warnings.iter().map(|w| (*w).to_string()).collect(),
@@ -512,7 +658,7 @@ mod tests {
 
     #[test]
     fn no_arguments_start_with_defaults() {
-        assert_eq!(parse_args(args(&[])), play(None, &[]));
+        assert_eq!(parse_args(args(&[])), cli_play(None, &[]));
     }
 
     #[test]
@@ -532,15 +678,15 @@ mod tests {
     fn glyphs_takes_a_separate_or_attached_value_and_the_last_wins() {
         assert_eq!(
             parse_args(args(&["--glyphs", "ascii"])),
-            play(Some("ascii"), &[])
+            cli_play(Some("ascii"), &[])
         );
         assert_eq!(
             parse_args(args(&["--glyphs=outline"])),
-            play(Some("outline"), &[])
+            cli_play(Some("outline"), &[])
         );
         assert_eq!(
             parse_args(args(&["--glyphs", "ascii", "--glyphs=solid"])),
-            play(Some("solid"), &[])
+            cli_play(Some("solid"), &[])
         );
     }
 
@@ -549,7 +695,7 @@ mod tests {
         // `glyphs::initial_glyphs` validates the value and words the warning.
         assert_eq!(
             parse_args(args(&["--glyphs", "fancy"])),
-            play(Some("fancy"), &[])
+            cli_play(Some("fancy"), &[])
         );
         let Cli::Play(options) = parse_args(args(&["--glyphs", "fancy"])) else {
             panic!("expected Play");
@@ -564,7 +710,7 @@ mod tests {
     fn the_image_style_can_be_asked_for() {
         assert_eq!(
             parse_args(args(&["--glyphs", "image"])),
-            play(Some("image"), &[])
+            cli_play(Some("image"), &[])
         );
     }
 
@@ -572,7 +718,7 @@ mod tests {
     fn debug_mode_can_be_asked_for() {
         let debug = |list: &[&str]| match parse_args(args(list)) {
             Cli::Play(options) => options,
-            Cli::Help => panic!("expected Play"),
+            other => panic!("expected Play, got {other:?}"),
         };
         assert!(!debug(&[]).debug);
         assert_eq!(
@@ -614,10 +760,10 @@ mod tests {
     #[test]
     fn a_missing_glyphs_value_is_a_warning() {
         let missing = "--glyphs needs a value: image, solid, outline or ascii";
-        assert_eq!(parse_args(args(&["--glyphs"])), play(None, &[missing]));
+        assert_eq!(parse_args(args(&["--glyphs"])), cli_play(None, &[missing]));
         assert_eq!(
             parse_args(args(&["--glyphs", "--glyphs=ascii"])),
-            play(Some("ascii"), &[missing])
+            cli_play(Some("ascii"), &[missing])
         );
     }
 
@@ -625,7 +771,7 @@ mod tests {
     fn unknown_arguments_are_warnings_in_order() {
         assert_eq!(
             parse_args(args(&["ascii", "--glyph", ""])),
-            play(
+            cli_play(
                 None,
                 &[
                     r#"ignored unknown argument "ascii" (see --help)"#,
@@ -660,6 +806,8 @@ mod tests {
             "--glyphs",
             "--debug",
             "--help",
+            "--version",
+            "-V",
             "JEV_API_KEY",
             "TYPESAFE_API_KEY",
             "JEV_MODEL",
@@ -674,6 +822,10 @@ mod tests {
         ] {
             assert!(USAGE.contains(name), "{name}");
         }
+        assert!(
+            USAGE.contains("off, 0, false or no"),
+            "RCHESS_IMAGES values"
+        );
         assert!(USAGE.contains("Usage: chess "));
         assert!(USAGE.contains("[--glyphs image|solid|outline|ascii] [--debug]"));
         assert!(USAGE.lines().all(|line| line.chars().count() <= 80));
@@ -695,9 +847,53 @@ mod tests {
 
     // ----- start-up -----
 
+    #[cfg(unix)]
+    #[test]
+    fn variables_that_are_not_utf_8_are_named_in_warnings() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let bad = || OsString::from_vec(b"/home/\xffana".to_vec());
+        let all_bad = |_: &str| Some(bad());
+        assert_eq!(
+            env_warnings(true, all_bad),
+            [
+                "RCHESS_GLYPHS is not valid UTF-8; ignored",
+                "RCHESS_IMAGES is not valid UTF-8; ignored",
+                "NO_COLOR is not valid UTF-8; ignored",
+                "RCHESS_DEBUG_LOG is not valid UTF-8; the debug log does not use it",
+                "XDG_STATE_HOME is not valid UTF-8; the debug log does not use it",
+                "HOME is not valid UTF-8; the debug log does not use it",
+            ]
+        );
+        assert_eq!(
+            env_warnings(false, all_bad),
+            [
+                "RCHESS_GLYPHS is not valid UTF-8; ignored",
+                "RCHESS_IMAGES is not valid UTF-8; ignored",
+                "NO_COLOR is not valid UTF-8; ignored",
+            ],
+            "the log's variables only matter in debug mode"
+        );
+        let fine = |name: &str| (name != "RCHESS_IMAGES").then(|| OsString::from("/home/ana"));
+        assert!(env_warnings(true, fine).is_empty());
+        assert!(env_warnings(true, |_| None).is_empty());
+        let only_home = |name: &str| (name == "HOME").then(bad);
+        assert_eq!(
+            env_warnings(true, only_home),
+            ["HOME is not valid UTF-8; the debug log does not use it"]
+        );
+        // NO_COLOR read as unset leaves the colours on, so it is named too.
+        let only_no_color = |name: &str| (name == "NO_COLOR").then(bad);
+        assert_eq!(
+            env_warnings(false, only_no_color),
+            ["NO_COLOR is not valid UTF-8; ignored"]
+        );
+    }
+
     fn options(glyphs: Option<&str>, warnings: &[&str]) -> Options {
-        let Cli::Play(options) = play(glyphs, warnings) else {
-            unreachable!("play() builds Cli::Play");
+        let Cli::Play(options) = cli_play(glyphs, warnings) else {
+            unreachable!("cli_play() builds Cli::Play");
         };
         options
     }
@@ -941,6 +1137,31 @@ mod tests {
     }
 
     #[test]
+    fn a_draw_inside_a_batch_measures_the_font_first() {
+        // A key after a resize waits for a redraw (it may read the new layout), and that
+        // draw must not encode pictures for the old font: the measurement the resize
+        // asked for comes before it.
+        let mut app = picture_game(ProtocolType::Sixel);
+        let run = drive_with_font(
+            &mut app,
+            &AtomicI32::new(0),
+            vec![
+                Step::Events(vec![
+                    AppEvent::Term(Event::Resize(100, 30)),
+                    key(KeyCode::Char('f')),
+                ]),
+                Step::Signal,
+            ],
+            Some(CellSize::new(8, 16)),
+        );
+        run.result.expect("loop ends cleanly");
+        assert_eq!(run.draws, 3, "before each batch, and before the key");
+        assert_eq!(run.measured_after, [1], "before the draw for the key");
+        assert_eq!(app.cell_size(), CellSize::new(8, 16));
+        assert!(app.flipped(), "the key was handled");
+    }
+
+    #[test]
     fn kitty_pictures_follow_a_font_zoom() {
         // Kitty and Ghostty size a placeholder picture from its pixel size and the
         // current cell size, so a picture made for the old font would be cropped or
@@ -1135,7 +1356,9 @@ mod tests {
 
         run.result.expect("loop ends cleanly");
         assert_eq!(run.unused_steps, 0);
-        assert_eq!(run.draws, 5, "one draw before every batch");
+        // One draw before every batch, and one before each key that follows another key
+        // in its batch (`e`, `4` and Enter after `/`).
+        assert_eq!(run.draws, 8);
         assert!(app.should_quit());
         assert_eq!(app.mode(), Mode::HumanVsHuman);
         assert_eq!(uci_moves(app.game()), ["e2e4"]);
@@ -1174,6 +1397,95 @@ mod tests {
         run.result.expect("loop ends cleanly");
         assert_eq!(app.screen(), Screen::Playing);
         assert_eq!(app.mode(), Mode::HumanVsHuman);
+    }
+
+    #[test]
+    fn a_click_after_a_key_in_the_same_batch_hits_the_new_layout() {
+        // `1` leaves the menu for the board; clicks that came in with it must be
+        // hit-tested against the board, not against the menu drawn before the batch.
+        let mut probe = new_app();
+        let _ = probe.handle(key(KeyCode::Char('1')), Instant::now());
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        terminal
+            .draw(|frame| probe.render(frame, Instant::now()))
+            .expect("probe draw");
+        let board = probe.hit_map().board.expect("the board is drawn at 80x24");
+        let middle = |square: &str| {
+            let rect = board::square_rect(&board, square.parse().expect("square"));
+            (rect.x + rect.width / 2, rect.y + rect.height / 2)
+        };
+        let (e2, e4) = (middle("e2"), middle("e4"));
+        let click = |(x, y): (u16, u16)| {
+            [
+                mouse(MouseEventKind::Down(MouseButton::Left), x, y),
+                mouse(MouseEventKind::Up(MouseButton::Left), x, y),
+            ]
+        };
+        let mut batch = chars("1");
+        batch.extend(click(e2));
+        batch.extend(click(e4));
+
+        let mut app = new_app();
+        let run = drive(
+            &mut app,
+            &AtomicI32::new(0),
+            vec![Step::Events(batch), Step::Signal],
+        );
+        run.result.expect("loop ends cleanly");
+        assert_eq!(app.mode(), Mode::HumanVsHuman);
+        assert_eq!(uci_moves(app.game()), ["e2e4"]);
+        // The draw before the batch, one before each mouse event (the key changed the
+        // screen, and each press or release may), and the one before the next batch.
+        assert_eq!(run.draws, 6);
+    }
+
+    #[test]
+    fn a_key_after_a_resize_in_the_same_batch_sees_the_new_size() {
+        // The terminal is too small at the first draw, then grows; the resize and the key
+        // come in one batch. The key must be handled as the new size allows, not ignored
+        // as the draw before the batch left it.
+        let mut app = new_app();
+        let mut terminal = Terminal::new(TestBackend::new(50, 15)).expect("test terminal");
+        let mut draws = 0;
+        let mut batches = VecDeque::from([
+            vec![
+                AppEvent::Term(Event::Resize(80, 24)),
+                key(KeyCode::Char('1')),
+            ],
+            vec![
+                AppEvent::Term(Event::Resize(50, 15)),
+                key(KeyCode::Char('f')),
+            ],
+        ]);
+        let result = run_loop(
+            &mut app,
+            &AtomicI32::new(0),
+            |app| {
+                draws += 1;
+                if draws == 2 {
+                    terminal.backend_mut().resize(80, 24);
+                } else if draws == 4 {
+                    terminal.backend_mut().resize(50, 15);
+                }
+                terminal
+                    .draw(|frame| app.render(frame, Instant::now()))
+                    .map(drop)
+                    .map_err(|never: Infallible| match never {})
+            },
+            |_| match batches.pop_front() {
+                Some(batch) => Ok(batch),
+                None => Err(io::Error::other("script ended")),
+            },
+            |_| None,
+        );
+        assert_eq!(
+            result.expect_err("script ended").to_string(),
+            "script ended"
+        );
+        assert_eq!(app.screen(), Screen::Playing, "1 started a game at 80x24");
+        assert!(!app.flipped(), "f was ignored at 50x15");
+        // Before each batch, and before each key after its resize.
+        assert_eq!(draws, 5);
     }
 
     #[test]
@@ -1321,6 +1633,34 @@ mod tests {
     }
 
     #[test]
+    fn an_error_exit_with_stdin_closed_ends_as_a_hangup() {
+        // A terminal closed without SIGHUP: the write fails, no signal comes, and
+        // stdin is closed, so the program ends by SIGHUP rather than with status 1.
+        let looked = Cell::new(0);
+        let closed = || {
+            looked.set(looked.get() + 1);
+            true
+        };
+        let quit = AtomicI32::new(0);
+        assert_eq!(
+            signal_after_error(&quit, Duration::from_millis(10), closed),
+            HANGUP
+        );
+        assert_eq!(looked.get(), 1);
+        // With stdin open the error is returned as it is.
+        assert_eq!(
+            signal_after_error(&quit, Duration::from_millis(10), || false),
+            0
+        );
+        // A signal that arrived is kept, and stdin is not looked at.
+        let quit = AtomicI32::new(SIGNAL);
+        assert_eq!(
+            signal_after_error(&quit, Duration::from_secs(10), || panic!("not asked")),
+            SIGNAL
+        );
+    }
+
+    #[test]
     fn faults_are_injected_only_by_name_and_only_in_debug_builds() {
         let expect = |fault| cfg!(debug_assertions).then_some(fault);
         assert_eq!(
@@ -1354,6 +1694,39 @@ mod tests {
             panic!("expected the fallback move, got {:?}", reply.outcome);
         };
         assert_eq!(computer.note.as_deref(), Some(worker::ENGINE_ERROR_NOTE));
+    }
+
+    #[test]
+    fn an_engine_thread_that_cannot_start_is_answered_with_a_failure() {
+        // Human vs the computer as Black: the computer is asked to move at once.
+        let mut app = new_app();
+        let actions = app.handle(key(KeyCode::Char('3')), Instant::now());
+        let Some(Action::RequestEngine(request)) = actions.into_iter().next() else {
+            panic!("the computer is asked to move");
+        };
+        let (generation, hash) = (request.generation, request.hash);
+        let (tx, rx) = mpsc::channel();
+        request_engine_with(request, app.engine(), &tx, |_, _, _| {
+            Err(io::Error::other("out of threads"))
+        });
+        let reply = rx.try_recv().expect("answered at once, without a thread");
+        assert!(worker::is_current(&reply, generation, hash));
+        assert_eq!(
+            reply.outcome,
+            EngineOutcome::Failed("cannot start the engine thread: out of threads".to_string())
+        );
+        assert_eq!(reply.exchange, None);
+        // The app stops waiting, says so, and space asks again.
+        assert_eq!(app.in_flight(), 1);
+        let _ = app.handle(AppEvent::Engine(reply), Instant::now());
+        assert_eq!(app.in_flight(), 0);
+        assert!(!app.is_thinking());
+        assert_eq!(app.status_line(), app::ENGINE_FAILED);
+        let retry = app.handle(key(KeyCode::Char(' ')), Instant::now());
+        assert!(
+            matches!(retry.as_slice(), [Action::RequestEngine(_)]),
+            "{retry:?}"
+        );
     }
 
     #[test]
@@ -1433,18 +1806,27 @@ mod tests {
         });
         let mut app = App::new(engine, GlyphSet::Solid, true, Vec::new()).with_home(None);
         let quit = AtomicI32::new(0);
+        // Human vs Jev as White: after e4 the engine is asked, and never answers. With a
+        // move played, `q` asks first, and `y` quits.
+        let mut command = vec![key(KeyCode::Char('/'))];
+        command.extend(chars("e4"));
+        command.push(key(KeyCode::Enter));
         let started = Instant::now();
         let run = drive(
             &mut app,
             &quit,
             vec![
-                Step::Events(chars("3")),
+                Step::Events(chars("2")),
+                Step::Events(command),
+                Step::Events(vec![key(KeyCode::Esc)]),
                 Step::Events(chars("q")),
                 Step::Events(chars("y")),
             ],
         );
         let took = started.elapsed();
         run.result.expect("loop ends cleanly");
+        assert_eq!(run.unused_steps, 0, "y answered the confirmation");
+        assert_eq!(uci_moves(app.game()), ["e2e4"]);
         assert!(app.should_quit());
         assert!(app.is_thinking(), "the engine never answered");
         assert_eq!(app.in_flight(), 1);

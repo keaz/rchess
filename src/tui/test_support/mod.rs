@@ -102,7 +102,8 @@ pub(crate) fn paste_event(text: &str) -> Event {
     Event::Paste(text.to_string())
 }
 
-/// One key press per character of `text`, as the terminal reports them.
+/// One key press without modifiers per character of `text`. A terminal would report an
+/// upper-case letter with Shift; the app treats both the same.
 pub(crate) fn char_events(text: &str) -> Vec<Event> {
     text.chars().map(|c| key_event(KeyCode::Char(c))).collect()
 }
