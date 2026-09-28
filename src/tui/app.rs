@@ -3781,12 +3781,19 @@ mod tests {
         );
         assert!(screen.contains(king), "the pieces show the Solid glyph");
 
-        // One warning: once another message replaced it, it does not come back.
+        // One warning: once another message replaced it, it does not come back, even
+        // when the pictures are dropped (a font change) and every encoding fails again.
         h.char('g');
         while h.app.glyphs() != GlyphSet::Image {
             h.char('g');
         }
+        h.app.piece_images.clear();
+        assert!(h.app.piece_images().is_empty());
         h.draw();
+        assert!(
+            !h.app.piece_images().is_empty(),
+            "the pictures were tried again"
+        );
         h.draw();
         assert_eq!(
             h.app.message().map(|message| message.text.as_str()),

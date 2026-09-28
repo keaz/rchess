@@ -634,22 +634,27 @@ mod tests {
 
     #[test]
     fn without_hard_links_a_new_file_is_renamed_into_place() {
-        let dir = TempDir::new("no-links");
-        let target = dir.join("game.pgn");
-        let unsupported = |_: &Path, _: &Path| Err(io::Error::from(ErrorKind::Unsupported));
-        assert_eq!(
-            write_file_with(&target, "one\n", false, unsupported),
-            Ok(())
-        );
-        assert_eq!(fs::read_to_string(&target).unwrap(), "one\n");
-        assert_eq!(dir.entries(), ["game.pgn"]);
-        // The check before the rename still refuses an existing file.
-        assert_eq!(
-            write_file_with(&target, "two\n", false, unsupported),
-            Err(SaveError::Exists)
-        );
-        assert_eq!(fs::read_to_string(&target).unwrap(), "one\n");
-        assert_eq!(dir.entries(), ["game.pgn"]);
+        // Unsupported, and PermissionDenied: Linux's EPERM for FAT and the like.
+        for kind in [ErrorKind::Unsupported, ErrorKind::PermissionDenied] {
+            let dir = TempDir::new("no-links");
+            let target = dir.join("game.pgn");
+            let no_links = |_: &Path, _: &Path| Err(io::Error::from(kind));
+            assert_eq!(
+                write_file_with(&target, "one\n", false, no_links),
+                Ok(()),
+                "{kind:?}"
+            );
+            assert_eq!(fs::read_to_string(&target).unwrap(), "one\n", "{kind:?}");
+            assert_eq!(dir.entries(), ["game.pgn"], "{kind:?}");
+            // The check before the rename still refuses an existing file.
+            assert_eq!(
+                write_file_with(&target, "two\n", false, no_links),
+                Err(SaveError::Exists),
+                "{kind:?}"
+            );
+            assert_eq!(fs::read_to_string(&target).unwrap(), "one\n", "{kind:?}");
+            assert_eq!(dir.entries(), ["game.pgn"], "{kind:?}");
+        }
     }
 
     #[test]
