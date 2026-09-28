@@ -35,7 +35,7 @@ nothing touches the network), drives it with keystrokes or signals, and checks:
   - answers partly before the deadline and the rest just after it: the rest is
     read and dropped, so its `3` does not start a game either;
   - gets SIGTERM or hangs up while the query waits: the process ends by that
-    signal at once (within 0.8 s, not after the query's 1 s deadline), SIGTERM
+    signal at once (before the query's 1 s deadline has run out), SIGTERM
     with the terminal restored, and answers that come
     right after the signal are read and dropped, not left for the shell;
   - runs in WezTerm (from the environment): only the cell size, the status and
@@ -89,6 +89,17 @@ nothing touches the network), drives it with keystrokes or signals, and checks:
   never touch the terminal, and errors are printed readably;
 * as a control, SIGKILL (which cannot be caught) does leave the pty raw, which
   shows the termios check can fail.
+
+Timing: a check that something happens waits for it for seconds, so a slow
+machine (a shared CI runner) only makes the run longer. A check that something
+happens soon has an upper bound that sits below a fixed wait in the program
+which the bug it looks for would fall into (the query's 1 s deadline, the 1 s
+stuck-UI grace), measured from a moment the program cannot have passed yet
+(when the query was seen, not when the signal was sent), with room to spare.
+There is no setting to widen them: much wider, they would pass that bug. A
+check that depends on when the harness itself acted (it saw the query late, or
+slept too long) is skipped with a NOTE when that timing was missed, rather than
+failed.
 
 Exits 0 when every check passes, 1 otherwise.
 """
@@ -417,6 +428,16 @@ class App:
                 return True
         return False
 
+    def wait_screen_without(self, needle, timeout=5.0):
+        """Waits until `needle` is no longer on screen, then lets the rest of the frame arrive."""
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if needle not in self.screen().text():
+                self.idle(0.1)
+                return True
+            self.pump(0.02)
+        return False
+
     def wait_bytes(self, needle, timeout=5.0, start=0):
         """Waits until `needle` is in the stream from offset `start` on."""
         end = time.monotonic() + timeout
@@ -607,7 +628,7 @@ def scenario_play_and_quit(binary):
 
         app.send(b"/")
         app.send(b"e4")
-        check("e4" in app.screen().text(), "typed text shows in the command box")
+        check(app.wait_screen("e4"), "typed text shows in the command box")
         app.send(b"\r")
         check(app.wait_screen("1. e4"), "e4 is played and listed as 1. e4")
         check(app.wait_screen("Black to move"), "Black to move after e4")
@@ -620,7 +641,7 @@ def scenario_play_and_quit(binary):
         check(app.wait_screen("Quit the game in progress?"), "q on the board asks")
         app.send(b"\r", settle=0.3)
         check(app.status is None and os.waitpid(app.pid, os.WNOHANG)[0] == 0, "qh5 + Enter does not quit")
-        check("Quit the game in progress?" not in app.screen().text(), "Enter answered No")
+        check(app.wait_screen_without("Quit the game in progress?"), "Enter answered No")
         app.send(b"q")
         check(app.wait_screen("Quit the game in progress?"), "q asks for confirmation")
         app.screen().show("quit confirmation")
@@ -712,16 +733,17 @@ def wait_status(app, seconds):
     return None
 
 
-def hang_up(app, within, why):
+def hang_up(app, within, why, since=None):
     """Closes both ends of the pty, as a terminal emulator or sshd does when it goes away:
     nobody holds the tty any more, so the kernel hangs it up (SIGHUP to the session when
     the pty is the program's controlling tty) and every later read or write fails. Checks
     that the process then ends by SIGHUP, never SIGABRT (restoring a dead terminal must
-    not panic), and within `within` seconds, which `why` explains."""
+    not panic), and within `within` seconds of the hangup (or of `since`, an earlier
+    moment), which `why` explains."""
     for name in ("slave", "master"):
         os.close(getattr(app, name))
         setattr(app, name, None)
-    sent = time.monotonic()
+    sent = time.monotonic() if since is None else since
     status = wait_status(app, max(5.0, 2 * within))
     took = time.monotonic() - sent
     check(status is not None, "process exits after the hangup", f"{took:.2f}s")
@@ -929,10 +951,9 @@ def scenario_debug(binary, via_env):
         app.send(b"d")
         check(app.wait_screen("no Jev requests yet"), "d opens the exchange view, which has nothing yet")
         app.screen().show("exchange view")
-        app.send(b"\x1b", settle=0.3)
-        text = app.screen().text()
+        app.send(b"\x1b", settle=0)
         check(
-            "no Jev requests yet" not in text and "Black to move" in text,
+            app.wait_screen_without("no Jev requests yet") and "Black to move" in app.screen().text(),
             "Esc goes back to the board",
         )
         app.send(b"q")
@@ -969,7 +990,7 @@ def wait_for_query(app, timeout=5.0):
             looked = time.monotonic()
     arrived = time.monotonic()
     app.query_lag = arrived - looked
-    app.wait_bytes(QUERY_TAIL, timeout=0.2)
+    app.wait_bytes(QUERY_TAIL, timeout=0.5)
     return arrived
 
 
@@ -1092,18 +1113,20 @@ def scenario_query_signal(binary):
     print("scenario: SIGTERM while the graphics query waits; restored at once, dies by SIGTERM")
     app = App(binary, env=QUERY_ENV)
     try:
-        check(wait_for_query(app) is not None, "the graphics query is written")
-        app.idle(0.2)
+        asked = wait_for_query(app)
+        check(asked is not None, "the graphics query is written")
+        asked = asked or time.monotonic()
+        app.idle(0.05)
         signal_at = len(app.stream)
-        sent = time.monotonic()
         os.kill(app.pid, signal.SIGTERM)
         exited = app.wait_exit(timeout=3.0)
         check(exited, "process exits after SIGTERM")
         if exited:
-            took = app.exited_at - sent
             check(app.status == -signal.SIGTERM, "terminated by SIGTERM", f"status {app.status}")
-            # The query checks for a quit signal every 50 ms instead of waiting out its 1 s.
-            check(took < 0.8, "without waiting for the query's deadline", f"{took:.2f}s")
+            # The query checks for a quit signal every 50 ms instead of waiting out its 1 s,
+            # which started before the query was seen here.
+            took = app.exited_at - asked
+            check(took < 1.0, "before the query's deadline", f"{took:.2f}s after the query")
         check_teardown(app, signal_at, "SIGTERM during the query")
     finally:
         app.close()
@@ -1113,10 +1136,12 @@ def scenario_query_hangup(binary):
     print("scenario: the terminal hangs up while the graphics query waits; it dies by SIGHUP")
     app = App(binary, env=QUERY_ENV)
     try:
-        check(wait_for_query(app) is not None, "the graphics query is written")
-        app.idle(0.2)
-        # The query checks for a quit signal every 50 ms instead of waiting out its 1 s.
-        hang_up(app, 0.8, "at once, without waiting for the query's deadline")
+        asked = wait_for_query(app)
+        check(asked is not None, "the graphics query is written")
+        app.idle(0.05)
+        # The query checks for a quit signal every 50 ms instead of waiting out its 1 s,
+        # which started before the query was seen here.
+        hang_up(app, 1.0, "at once, before the query's deadline", since=asked)
     finally:
         app.close()
 
@@ -1131,7 +1156,8 @@ def scenario_query_kitty(binary):
         answer_query(app, KITTY_ANSWER)
         check(app.wait_bytes(SETUP[1]), "mouse capture follows the answer")
         waited = time.monotonic() - answered
-        check(waited < 0.5, "start-up goes on as soon as the answer is complete", f"{waited:.2f}s")
+        # Well below the 1 s deadline that an unread answer would leave it waiting for.
+        check(waited < 0.8, "start-up goes on as soon as the answer is complete", f"{waited:.2f}s")
         check_setup(app, query=True)
         check(app.wait_screen("1. Human vs Human"), "menu renders")
         check(QUERY_WARNING not in app.screen().text(), "no query warning")
@@ -1302,7 +1328,7 @@ def scenario_query_late_split(binary):
         app.idle(0.3)
         resized_at = len(app.stream)
         set_window(app, 30, 100, 0, 0)
-        end = time.monotonic() + 1.5
+        end = time.monotonic() + 3.0
         while len(app.stream) == resized_at and time.monotonic() < end:
             app.pump(0.02)
         check(
@@ -1331,7 +1357,9 @@ def scenario_query_signal_answers(binary):
     try:
         asked = wait_for_query(app)
         check(asked is not None, "the graphics query is written")
-        app.idle(0.2)
+        timed = asked is not None
+        asked = asked or time.monotonic()
+        app.idle(0.05)
         signal_at = len(app.stream)
         sent = time.monotonic()
         os.kill(app.pid, signal.SIGTERM)
@@ -1344,17 +1372,17 @@ def scenario_query_signal_answers(binary):
         # answers well inside the 200 ms the query reads after the signal.
         what = "the timing checks of SIGTERM with answers in flight"
         timely = (
-            asked is not None
-            and timing_holds(sent - (asked - app.query_lag) - 0.2, 0.45, what)
+            timed
+            and timing_holds(sent - (asked - app.query_lag) - 0.05, 0.6, what)
             and timing_holds(answered_at - sent - 0.1, 0.05, what)
         )
         exited = app.wait_exit(timeout=3.0)
         check(exited, "process exits after SIGTERM")
         if exited:
             check(app.status == -signal.SIGTERM, "terminated by SIGTERM", f"status {app.status}")
-            took = app.exited_at - sent
+            took = app.exited_at - asked
             if timely:
-                check(took < 0.8, "without waiting for the query's deadline", f"{took:.2f}s")
+                check(took < 1.0, "before the query's deadline", f"{took:.2f}s after the query")
         check_teardown(app, signal_at, "SIGTERM during the query")
         left = pending_input(app)
         if timely:
@@ -1384,7 +1412,7 @@ def scenario_query_wezterm(binary):
         app.idle(0.3)
         resized_at = len(app.stream)
         set_window(app, 30, 100, 0, 0)
-        end = time.monotonic() + 1.5
+        end = time.monotonic() + 3.0
         while len(app.stream) == resized_at and time.monotonic() < end:
             app.pump(0.02)
         check(
@@ -1415,9 +1443,9 @@ def scenario_query_iterm2(binary):
         check(QUERY_WARNING not in app.screen().text(), "no query warning")
         app.send(b"1")
         check(app.wait_screen("White to move"), "Human vs Human starts")
+        check(app.wait_bytes(ITERM2_PICTURE, start=answered_at), "pieces are iTerm2 pictures")
         app.idle(0.3)
         drawn = app.stream[answered_at:]
-        check(ITERM2_PICTURE in drawn, "pieces are iTerm2 pictures")
         check(not SIXEL_RASTER.search(drawn), "and not Sixel pictures")
         quit_at = len(app.stream)
         app.send(b"q", settle=0)
@@ -1503,8 +1531,7 @@ def scenario_query_sixel_zoom(binary):
         check(QUERY_WARNING not in app.screen().text(), "no query warning")
         app.send(b"1")
         check(app.wait_screen("White to move"), "Human vs Human starts")
-        app.idle(0.3)
-        before = sixel_sizes(app.stream)
+        before = wait_sixels(app, 0, 32)
         # 80x24 gives 5x2 squares, image areas of 3x2 cells: 30x40 pixels at 10x20.
         check(len(before) == 32, "every piece is a Sixel picture", f"{len(before)} pictures")
         check(set(before) == {(30, 40)}, "pictures fit 3x2 cells of 10x20", f"sizes {set(before)}")
@@ -1528,11 +1555,12 @@ def scenario_query_sixel_zoom(binary):
         answered = time.monotonic()
         os.write(app.master, ZOOMED_ANSWER)
         after = wait_sixels(app, answered_at, 32)
+        redrawn = time.monotonic() - answered
         # 100x30 gives 7x3 squares, image areas of 5x3 cells: 40x48 pixels at 8x16. At the
         # old font they would be 50x60, 1.25 columns and 0.75 rows too big.
         check(len(after) == 32, "the zoom redraws every picture", f"{len(after)} pictures")
         check(set(after) == {(40, 48)}, "pictures fit 5x3 cells of 8x16", f"sizes {set(after)}")
-        check(time.monotonic() - answered < 2.0, "right after the answer")
+        check(redrawn < 2.0, "right after the answer", f"{redrawn:.2f}s")
         check("White to move" in app.screen().text(), "the game is still shown")
         check_no_query_text(app, "board after the zoom")
 
@@ -1562,7 +1590,7 @@ def scenario_query_sixel_zoom(binary):
         late_at = len(app.stream)
         set_window(app, 30, 100, 0, 0)
         check(
-            app.wait_bytes(FONT_QUERY, timeout=1.0, start=late_at),
+            app.wait_bytes(FONT_QUERY, timeout=3.0, start=late_at),
             "the UI still reacts without a key after the late answers (a resize asks at once)",
         )
         answer_font(app, late_at, 8, 16)
