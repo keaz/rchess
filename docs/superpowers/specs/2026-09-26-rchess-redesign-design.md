@@ -903,12 +903,12 @@ except where this section changes them.
 
 ### 10.8 CI
 
-`.github/workflows/rust.yml` (push and pull request on `main`, Ubuntu): `cargo fmt --check`,
-`cargo clippy --all-targets -- -D warnings`, `cargo test`, then `cargo build` and
-`python3 tests/pty_smoke.py --no-build`, all with `JEV_API_KEY` and `TYPESAFE_API_KEY` unset. The Rust
-toolchain is pinned in the workflow (bumped deliberately), so a new clippy lint cannot turn CI red
-without a code change. Timing
-checks in the smoke test get margins that hold on a shared runner.
+`.github/workflows/rust.yml` (push and pull request on `main`, plus manual runs): a matrix over
+`ubuntu-latest` and `macos-latest`, each running `cargo fmt --check`,
+`cargo clippy --all-targets -- -D warnings`, `cargo build` and `cargo test`, with `JEV_API_KEY` and
+`TYPESAFE_API_KEY` unset. The Rust toolchain is pinned in the workflow (bumped deliberately), so a new
+clippy lint cannot turn CI red without a code change. The pty smoke test stays a local check (the
+user has built and run the branch on Ubuntu); no OS-specific packages are planned.
 
 ### 10.9 Done criteria
 
