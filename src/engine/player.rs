@@ -10,11 +10,15 @@ use crate::core::{Game, Move};
 use super::annotate::{Annotation, Bucket, annotate};
 use super::config::{EngineConfig, MAX_CHOICE_OPTIONS};
 use super::describe::describe;
-use super::jev::{ChoiceOption, ChoiceRequest, JevClient, JevExchange, MoveChooser, printable};
+use super::jev::{
+    ChoiceOption, ChoiceRequest, JevClient, JevExchange, MoveChooser, printable, redact,
+};
 use super::search::{MATE, analyse};
 
 /// Longest part of an unknown option key echoed back in a note.
 const NOTE_KEY_CHARS: usize = 40;
+/// Longest model ID shown; a real one reads like `jev-1.13.0`.
+const MODEL_CHARS: usize = 40;
 const QUESTION: &str = "You play `side_to_move`. Which move should we play?";
 const GUIDANCE: &str = "Each option says what the move does and the engine's assessment: \
 winning, good, neutral, bad or losing. Prefer winning and good moves. Among similar moves, \
@@ -65,13 +69,14 @@ pub struct ComputerMove {
     pub top: Vec<(String, f32)>,
     /// Jev's confidence in its choice, when Jev answered.
     pub confidence: Option<f32>,
-    /// Versioned model ID that answered.
+    /// Versioned model ID that answered, with the API key redacted and control
+    /// characters replaced, at most 40 characters.
     pub model: Option<String>,
     /// Time for the whole `choose_move` call.
     pub latency: Duration,
     /// Input tokens billed, when Jev answered.
     pub input_tokens: Option<u32>,
-    /// Why a fallback or veto happened.
+    /// Why a fallback or veto happened. It never contains the API key.
     pub note: Option<String>,
     /// The HTTP exchange with Jev, when [`EngineConfig::trace`] is on and Jev was
     /// asked (a Jev or vetoed move, or a fallback after Jev failed or answered
@@ -112,6 +117,12 @@ impl<C: MoveChooser> ComputerPlayer<C> {
     /// The configuration this player was built with.
     pub fn config(&self) -> &EngineConfig {
         &self.config
+    }
+
+    /// `text` with the API key redacted, for what the player reports. `JevClient`
+    /// already redacts its errors; another chooser may not.
+    fn redacted(&self, text: &str) -> String {
+        redact(text, self.config.api_key.as_deref().unwrap_or(""))
     }
 
     /// The move to play, or `None` when the game is over.
@@ -177,7 +188,7 @@ impl<C: MoveChooser> ComputerPlayer<C> {
         let answer = match answer {
             Ok(answer) => answer,
             Err(error) => {
-                let note = format!("Jev unavailable ({error}) — local search");
+                let note = self.redacted(&format!("Jev unavailable ({error}) — local search"));
                 return Some(ComputerMove {
                     exchange,
                     ..plain(best.mv, MoveSource::Fallback, Some(note))
@@ -185,14 +196,15 @@ impl<C: MoveChooser> ComputerPlayer<C> {
             }
         };
         let Some(pick) = candidates.iter().find(|a| a.san == answer.choice) else {
-            let cut = if answer.choice.chars().count() > NOTE_KEY_CHARS {
+            let choice = self.redacted(&answer.choice);
+            let cut = if choice.chars().count() > NOTE_KEY_CHARS {
                 "…"
             } else {
                 ""
             };
             let note = format!(
                 "Jev returned an unknown option ({}{cut}) — local search",
-                printable(&answer.choice, NOTE_KEY_CHARS)
+                printable(&choice, NOTE_KEY_CHARS)
             );
             return Some(ComputerMove {
                 exchange,
@@ -237,7 +249,7 @@ impl<C: MoveChooser> ComputerPlayer<C> {
                 .cloned()
                 .collect(),
             confidence: Some(answer.confidence),
-            model: Some(answer.model),
+            model: Some(printable(&self.redacted(&answer.model), MODEL_CHARS)),
             latency: started.elapsed(),
             input_tokens: Some(answer.input_tokens),
             note,
@@ -280,6 +292,8 @@ mod tests {
 
     struct MockChooser {
         reply: Reply,
+        /// The model ID an answer reports.
+        model: String,
         seen: Mutex<Vec<ChoiceRequest>>,
         /// How many of the requests came through `choose_traced`.
         traced: AtomicUsize,
@@ -292,6 +306,7 @@ mod tests {
                     choice,
                     probabilities,
                 },
+                model: "jev-1.13.0".to_string(),
                 seen: Mutex::new(Vec::new()),
                 traced: AtomicUsize::new(0),
             }
@@ -300,9 +315,15 @@ mod tests {
         fn failing(error: JevError) -> MockChooser {
             MockChooser {
                 reply: Reply::Error(error),
+                model: "jev-1.13.0".to_string(),
                 seen: Mutex::new(Vec::new()),
                 traced: AtomicUsize::new(0),
             }
+        }
+
+        /// The same mock, reporting `model` in its answers.
+        fn with_model(self, model: String) -> MockChooser {
+            MockChooser { model, ..self }
         }
 
         fn requests(&self) -> Vec<ChoiceRequest> {
@@ -344,7 +365,7 @@ mod tests {
                         .map(|(k, p)| (k.to_string(), *p))
                         .collect(),
                     confidence: 0.8,
-                    model: "jev-1.13.0".to_string(),
+                    model: self.model.clone(),
                     input_tokens: 900,
                 }),
                 Reply::Error(error) => Err(error.clone()),
@@ -624,6 +645,58 @@ mod tests {
                 "Jev returned an unknown option (Qh8   [2J{}…) — local search",
                 "z".repeat(31)
             )
+        );
+    }
+
+    /// An API key the key tests look for in what the player reports.
+    const KEY: &str = "secret-key-123";
+
+    /// A player that sends [`KEY`] and asks `mock`.
+    fn keyed_player(mock: MockChooser) -> ComputerPlayer<MockChooser> {
+        let config = EngineConfig {
+            api_key: Some(KEY.to_string()),
+            ..EngineConfig::default()
+        };
+        ComputerPlayer::new(Some(mock), config)
+    }
+
+    #[test]
+    fn the_model_is_printable_and_never_shows_the_key() {
+        let model = format!("jev-1.13.0\r\n\x1b[2J {KEY}");
+        let mock = MockChooser::answering("Kd2", vec![("Kd2", 1.0)]).with_model(model);
+        let result = keyed_player(mock)
+            .choose_move(&game(HANGING_QUEEN_TRAP))
+            .unwrap();
+        assert_eq!(result.source, MoveSource::Jev);
+        assert_eq!(result.model.as_deref(), Some("jev-1.13.0   [2J <redacted>"));
+
+        let long = "m".repeat(100);
+        let mock = MockChooser::answering("Kd2", vec![("Kd2", 1.0)]).with_model(long);
+        let result = player(mock).choose_move(&game(HANGING_QUEEN_TRAP)).unwrap();
+        assert_eq!(result.model, Some("m".repeat(40)), "a model ID is short");
+    }
+
+    #[test]
+    fn notes_never_show_the_key() {
+        let choice = format!("Q{KEY}");
+        let choice: &'static str = Box::leak(choice.into_boxed_str());
+        let result = keyed_player(MockChooser::answering(choice, vec![(choice, 1.0)]))
+            .choose_move(&game(HANGING_QUEEN_TRAP))
+            .unwrap();
+        assert_eq!(result.source, MoveSource::Fallback);
+        assert_eq!(
+            result.note.as_deref(),
+            Some("Jev returned an unknown option (Q<redacted>) — local search")
+        );
+
+        // A chooser other than `JevClient` may not redact its errors.
+        let error = JevError::Transport(format!("reset by {KEY}"));
+        let result = keyed_player(MockChooser::failing(error))
+            .choose_move(&Game::new())
+            .unwrap();
+        assert_eq!(
+            result.note.as_deref(),
+            Some("Jev unavailable (network error: reset by <redacted>) — local search")
         );
     }
 

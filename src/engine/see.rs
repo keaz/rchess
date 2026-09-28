@@ -201,6 +201,12 @@ pub fn capturers(pos: &Position, target: Square, occupied: Bitboard, color: Colo
     pin_aware_capturers(pos, &pins(pos), target, occupied, color)
 }
 
+/// Whether `color` has a legal capture on `target`: a pinned piece only along its
+/// pin line, and a king only onto a square no enemy piece attacks once it has left.
+pub fn can_capture(pos: &Position, target: Square, color: Color) -> bool {
+    next_capturer(pos, &pins(pos), target, pos.occupied(), color).is_some()
+}
+
 fn pin_aware_capturers(
     pos: &Position,
     pins: &Pins,
