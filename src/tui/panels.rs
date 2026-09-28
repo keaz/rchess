@@ -225,8 +225,9 @@ fn menu(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap) {
     let notes_top = about_area.bottom().saturating_add(1);
     let notes_height = keys.y.saturating_sub(notes_top.saturating_add(1));
     let notes_area = Rect::new(inner.x, notes_top, inner.width, notes_height).intersection(inner);
+    let (notes, more) = fit_notes(notes, notes_area.width, notes_area.height);
     let mut top = notes_area.y;
-    for note in notes {
+    for note in notes.into_iter().chain(more) {
         let rows = note.rows(notes_area.width);
         let rect = Rect::new(notes_area.x, top, notes_area.width, rows).intersection(notes_area);
         note.render(frame, rect);
@@ -296,8 +297,47 @@ impl Note {
     }
 }
 
+/// The first of `notes` that fit in `rows` rows of `width` cells, and when some do not, a
+/// last note in their place saying how many warnings are not shown ("+2 more warnings").
+fn fit_notes(mut notes: Vec<Note>, width: u16, rows: u16) -> (Vec<Note>, Option<Note>) {
+    let needed = notes
+        .iter()
+        .map(|note| note.rows(width))
+        .fold(0u16, u16::saturating_add);
+    if needed <= rows || rows == 0 {
+        return (notes, None);
+    }
+    // One row for the count.
+    let room = rows - 1;
+    let mut used = 0u16;
+    let shown = notes
+        .iter()
+        .take_while(|note| {
+            used = used.saturating_add(note.rows(width));
+            used <= room
+        })
+        .count();
+    let hidden = notes
+        .drain(shown..)
+        .filter(|note| note.marker == WARNING_MARKER)
+        .count();
+    let text = match hidden {
+        1 => "+1 more warning".to_string(),
+        n => format!("+{n} more warnings"),
+    };
+    let more = Note {
+        marker: "",
+        text,
+        style: Style::new().yellow(),
+    };
+    (notes, Some(more))
+}
+
+/// What a warning note starts with on the menu.
+const WARNING_MARKER: &str = "! ";
+
 /// The engine status (green when Jev plays, yellow for the local search alone) and one
-/// `! ` note per warning.
+/// [`WARNING_MARKER`] note per warning.
 fn menu_notes(app: &App) -> Vec<Note> {
     let mut notes = vec![Note {
         marker: "",
@@ -309,7 +349,7 @@ fn menu_notes(app: &App) -> Vec<Note> {
         },
     }];
     notes.extend(app.warnings().iter().map(|warning| Note {
-        marker: "! ",
+        marker: WARNING_MARKER,
         text: warning.clone(),
         style: Style::new().yellow(),
     }));
@@ -650,56 +690,101 @@ fn status_lines(
 /// path loses folders from the middle of its folder part first (`~/…/chess/game.pgn`, then
 /// `~/…/game.pgn`, then `…/game.pgn`), so its start and file name stay; only when even that
 /// does not fit is the end cut, marked with [`ELLIPSIS`]. Without a path, [`fit_rows`].
+///
+/// Linear in the length of the message for a given panel: the shortened forms share the
+/// wrap of their start, and only those whose characters could fit at all are wrapped.
 fn fit_message(text: &str, path: Option<&str>, width: u16, rows: u16) -> String {
     let Some(path) = path else {
         return fit_rows(text, width, rows);
     };
-    let fits = |candidate: &String| wrapped_height(candidate, width) <= rows;
     let full = format!("{text}{path}");
-    if fits(&full) {
+    if wrapped_height(&full, width) <= rows {
         return full;
     }
-    let shorter: Vec<String> = elided_paths(path)
-        .into_iter()
-        .map(|short| format!("{text}{short}"))
-        .collect();
-    match shorter.iter().find(|candidate| fits(candidate)) {
-        Some(fitting) => fitting.clone(),
-        None => cut_to_fit(shorter.last().unwrap_or(&full), width, rows),
+    let Some(parts) = PathParts::new(path) else {
+        return cut_to_fit(&full, width, rows);
+    };
+    let limit = usize::from(rows);
+    // Every non-blank cell takes a cell of some row, so a form with more cannot fit.
+    let room = usize::from(width.max(1)) * limit;
+    let separator = solid_width("/");
+    // `{text}{head}/…`, then `/{folder}` for each kept folder, then `/{name}`.
+    let start = format!("{text}{}/{ELLIPSIS}", parts.head);
+    let fixed = solid_width(&start) + separator + solid_width(parts.name);
+    let mut wrapped_start = Wrapper::new(width);
+    wrapped_start.push_str(&start);
+    let mut kept_width = vec![0; parts.folders.len()];
+    for kept in 1..parts.folders.len() {
+        let folder = parts.folders[parts.folders.len() - kept];
+        kept_width[kept] = kept_width[kept - 1] + separator + solid_width(folder);
+    }
+    for kept in (0..parts.folders.len()).rev() {
+        if fixed + kept_width[kept] > room {
+            continue;
+        }
+        let tail = parts.tail(kept);
+        let mut wrapped = wrapped_start;
+        wrapped.push_str(&tail);
+        if wrapped.rows() <= limit {
+            return format!("{start}{tail}");
+        }
+    }
+    let shortest = format!("{text}{ELLIPSIS}/{}", parts.name);
+    if wrapped_height(&shortest, width) <= rows {
+        return shortest;
+    }
+    cut_to_fit(&shortest, width, rows)
+}
+
+/// A path split the way [`fit_message`] shortens it: its first folder (`~`, `/tmp`,
+/// `games`), the folders after it, and the file name.
+struct PathParts<'a> {
+    head: String,
+    folders: Vec<&'a str>,
+    name: &'a str,
+}
+
+impl<'a> PathParts<'a> {
+    /// `None` for a path without a folder.
+    fn new(path: &'a str) -> Option<PathParts<'a>> {
+        let (folders, name) = path.rsplit_once('/')?;
+        let mut folders = folders.split('/');
+        let first = folders.next().unwrap_or_default();
+        let mut folders: Vec<&str> = folders.collect();
+        // An absolute path's first folder keeps its leading slash: `/tmp`, not ``.
+        let head = if first.is_empty() && !folders.is_empty() {
+            format!("/{}", folders.remove(0))
+        } else {
+            first.to_string()
+        };
+        Some(PathParts {
+            head,
+            folders,
+            name,
+        })
+    }
+
+    /// The end of a shortened form that keeps the last `kept` folders:
+    /// `/{folder}` for each, then `/{name}`.
+    fn tail(&self, kept: usize) -> String {
+        let mut tail = String::new();
+        for folder in &self.folders[self.folders.len() - kept..] {
+            tail.push('/');
+            tail.push_str(folder);
+        }
+        tail.push('/');
+        tail.push_str(self.name);
+        tail
     }
 }
 
-/// Shorter forms of `path`, longest first: the folders after its first one (`~`, `/tmp`,
-/// `games`) are replaced by `…` from the left, a folder at a time, down to none; then the
-/// first one goes too. The file name is always kept.
-fn elided_paths(path: &str) -> Vec<String> {
-    let Some((folders, name)) = path.rsplit_once('/') else {
-        return Vec::new();
-    };
-    let mut parts: Vec<&str> = folders.split('/').collect();
-    // An absolute path's first folder keeps its leading slash: `/tmp`, not ``.
-    let head = if parts.first() == Some(&"") && parts.len() > 1 {
-        parts.remove(0);
-        format!("/{}", parts.remove(0))
-    } else {
-        parts.remove(0).to_string()
-    };
-    let mut shorter: Vec<String> = (0..parts.len())
-        .rev()
-        .map(|kept| {
-            let tail = &parts[parts.len() - kept..];
-            let mut short = format!("{head}/{ELLIPSIS}");
-            for part in tail {
-                short.push('/');
-                short.push_str(part);
-            }
-            short.push('/');
-            short.push_str(name);
-            short
-        })
-        .collect();
-    shorter.push(format!("{ELLIPSIS}/{name}"));
-    shorter
+/// Cells of `text` outside its whitespace: at least this many cells of any rows it
+/// wraps into are taken.
+fn solid_width(text: &str) -> usize {
+    text.chars()
+        .filter(|c| !c.is_whitespace())
+        .map(char_width)
+        .sum()
 }
 
 /// The Jev panel's text, laid out for one width: lines that always show (what was played
@@ -824,30 +909,43 @@ fn pack(
 }
 
 /// `text` if it wraps into `rows` rows of `width` cells, else its longest start that does
-/// with [`ELLIPSIS`] appended, cut between words when any such cut fits.
+/// with [`ELLIPSIS`] appended, cut between words when any such cut fits. Linear in the
+/// length of `text`: every cut is measured in one pass ([`Wrapper`]).
 fn fit_rows(text: &str, width: u16, rows: u16) -> String {
-    let fits = |cut: &String| wrapped_height(cut, width) <= rows;
     if wrapped_height(text, width) <= rows {
         return text.to_string();
     }
-    let cut_at = |end: usize| format!("{}{ELLIPSIS}", text[..end].trim_end());
-    text.char_indices()
-        .rev()
-        .filter(|&(_, c)| c.is_whitespace())
-        .map(|(end, _)| cut_at(end))
-        .find(fits)
-        .unwrap_or_else(|| cut_to_fit(text, width, rows))
+    let limit = usize::from(rows);
+    let mut wrapper = Wrapper::new(width);
+    let mut best = None;
+    for (end, c) in text.char_indices() {
+        if c.is_whitespace() && wrapper.rows_with_ellipsis() <= limit {
+            best = Some(end);
+        }
+        wrapper.push(c);
+    }
+    match best {
+        Some(end) => format!("{}{ELLIPSIS}", text[..end].trim_end()),
+        None => cut_to_fit(text, width, rows),
+    }
 }
 
 /// The longest start of `text` that wraps into `rows` rows of `width` cells with
-/// [`ELLIPSIS`] appended, cut between any two characters.
+/// [`ELLIPSIS`] appended, cut between any two characters. Linear in the length of `text`.
 fn cut_to_fit(text: &str, width: u16, rows: u16) -> String {
-    let cut_at = |end: usize| format!("{}{ELLIPSIS}", text[..end].trim_end());
-    text.char_indices()
-        .rev()
-        .map(|(end, _)| cut_at(end))
-        .find(|cut| wrapped_height(cut, width) <= rows)
-        .unwrap_or_else(|| ELLIPSIS.to_string())
+    let limit = usize::from(rows);
+    let mut wrapper = Wrapper::new(width);
+    let mut best = None;
+    for (end, c) in text.char_indices() {
+        if wrapper.rows_with_ellipsis() <= limit {
+            best = Some(end);
+        }
+        wrapper.push(c);
+    }
+    match best {
+        Some(end) => format!("{}{ELLIPSIS}", text[..end].trim_end()),
+        None => ELLIPSIS.to_string(),
+    }
 }
 
 /// Narrowest column for White's moves: `e4` or `Nf3` and at least two spaces, as in the
@@ -1493,35 +1591,126 @@ fn last_row(area: Rect) -> Rect {
 }
 
 /// Rows `text` takes when word-wrapped to `width` cells: greedy, like ratatui's word
-/// wrapper, with words longer than a row split between characters.
+/// wrapper, with words longer than a row split between characters. Widths are
+/// [`char_width`]'s.
 fn wrapped_height(text: &str, width: u16) -> u16 {
-    let width = usize::from(width.max(1));
-    let mut rows = 1usize;
-    let mut used = 0usize;
-    for word in text.split_whitespace() {
-        let w = Span::raw(word).width();
-        if used > 0 && used + 1 + w <= width {
-            used += 1 + w;
-            continue;
+    let mut wrapper = Wrapper::new(width);
+    wrapper.push_str(text);
+    u16::try_from(wrapper.rows()).unwrap_or(u16::MAX)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Characters fed to every [`Wrapper`] on this thread: the work of the fitting
+    /// functions, which a test bounds to keep them linear.
+    static WRAPPED_CHARS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The word wrap of [`wrapped_height`], fed a character at a time, so that the rows of
+/// every start of a text (with or without [`ELLIPSIS`] after it) are known in one pass.
+///
+/// The last word is kept apart until the next one starts: a start that ends in
+/// whitespace is cut back to that word, and an ellipsis joins it.
+#[derive(Clone, Copy, Debug)]
+struct Wrapper {
+    /// Cells per row (at least 1).
+    width: usize,
+    /// Rows taken by the words before `last`.
+    rows: usize,
+    /// Cells used on the last of those rows.
+    used: usize,
+    /// The last word so far.
+    last: Option<Word>,
+    /// Whether the last character pushed belongs to `last`.
+    in_word: bool,
+}
+
+/// A word as [`Wrapper`] places it: its width, and how it splits between characters when
+/// it is wider than a row.
+#[derive(Clone, Copy, Debug, Default)]
+struct Word {
+    width: usize,
+    /// Rows after the first that the word takes when split, starting a row.
+    split_rows: usize,
+    /// Cells used on the last of those rows.
+    split_used: usize,
+}
+
+impl Word {
+    /// Adds a character `cells` wide, in rows of `row` cells.
+    fn push(&mut self, cells: usize, row: usize) {
+        self.width += cells;
+        if self.split_used > 0 && self.split_used + cells > row {
+            self.split_rows += 1;
+            self.split_used = 0;
         }
-        if used > 0 {
-            rows += 1;
-            used = 0;
-        }
-        if w <= width {
-            used = w;
-            continue;
-        }
-        for c in word.chars() {
-            let cw = char_width(c);
-            if used > 0 && used + cw > width {
-                rows += 1;
-                used = 0;
-            }
-            used += cw;
+        self.split_used += cells;
+    }
+}
+
+impl Wrapper {
+    fn new(width: u16) -> Wrapper {
+        Wrapper {
+            width: usize::from(width.max(1)),
+            rows: 1,
+            used: 0,
+            last: None,
+            in_word: false,
         }
     }
-    u16::try_from(rows).unwrap_or(u16::MAX)
+
+    fn push(&mut self, c: char) {
+        #[cfg(test)]
+        WRAPPED_CHARS.with(|count| count.set(count.get() + 1));
+        if c.is_whitespace() {
+            self.in_word = false;
+            return;
+        }
+        if !self.in_word {
+            if let Some(word) = self.last.take() {
+                (self.rows, self.used) = self.place(word);
+            }
+            self.in_word = true;
+        }
+        let width = self.width;
+        self.last
+            .get_or_insert_with(Word::default)
+            .push(char_width(c), width);
+    }
+
+    fn push_str(&mut self, text: &str) {
+        for c in text.chars() {
+            self.push(c);
+        }
+    }
+
+    /// Rows, and cells used on the last row, once `word` follows the words before `last`.
+    fn place(&self, word: Word) -> (usize, usize) {
+        if self.used > 0 && self.used + 1 + word.width <= self.width {
+            return (self.rows, self.used + 1 + word.width);
+        }
+        let rows = self.rows + usize::from(self.used > 0);
+        if word.width <= self.width {
+            (rows, word.width)
+        } else {
+            (rows + word.split_rows, word.split_used)
+        }
+    }
+
+    /// Rows of the text pushed so far.
+    fn rows(&self) -> usize {
+        self.last.map_or(self.rows, |word| self.place(word).0)
+    }
+
+    /// Rows of the text pushed so far with its trailing whitespace dropped and
+    /// [`ELLIPSIS`] appended.
+    fn rows_with_ellipsis(&self) -> usize {
+        let mut word = self.last.unwrap_or_default();
+        for c in ELLIPSIS.chars() {
+            word.push(char_width(c), self.width);
+        }
+        self.place(word).0
+    }
 }
 
 /// The piece's English name.
@@ -1538,6 +1727,7 @@ const fn piece_name(kind: PieceKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::HashSet;
     use std::time::Duration;
 
@@ -2091,6 +2281,88 @@ mod tests {
     }
 
     #[test]
+    fn menu_warnings_that_do_not_fit_are_counted() {
+        let warnings: Vec<String> = (1..=6).map(|n| format!("warning {n}")).collect();
+        let screen = |height: u16| {
+            let h = Harness::build(FakeEngine::local(), (60, height), warnings.clone(), |app| {
+                app
+            });
+            h.screen()
+        };
+        // All six fit at 60×24.
+        let tall = screen(24);
+        assert!(tall.contains("! warning 6"), "{tall}");
+        assert!(!tall.contains("more warning"), "{tall}");
+        // At 60×20 the notes get four rows: the status, two warnings and the count.
+        let short = screen(20);
+        assert!(short.contains("! warning 2"), "{short}");
+        assert!(!short.contains("! warning 3"), "{short}");
+        assert!(short.contains("+4 more warnings"), "{short}");
+        // One row more shows one more warning.
+        let taller = screen(21);
+        assert!(taller.contains("! warning 3"), "{taller}");
+        assert!(taller.contains("+3 more warnings"), "{taller}");
+    }
+
+    #[test]
+    fn a_warning_too_long_for_the_rows_left_is_counted_too() {
+        // At 60x20 the notes get four rows: the status, a short warning, and no room for
+        // a warning three rows long, so the count takes its place.
+        let warnings = vec!["short".to_string(), "long ".repeat(25)];
+        let h = Harness::build(FakeEngine::local(), (60, 20), warnings, |app| app);
+        let screen = h.screen();
+        assert!(screen.contains("! short"), "{screen}");
+        assert!(!screen.contains("! long"), "{screen}");
+        assert!(screen.contains("+1 more warning "), "{screen}");
+    }
+
+    /// The characters [`Wrapper`] is fed on this thread while `fit` runs: the work of the
+    /// fitting functions, which wrap their text and every cut they try through it.
+    fn wrapped_chars<T>(fit: impl FnOnce() -> T) -> (T, usize) {
+        let before = WRAPPED_CHARS.with(Cell::get);
+        let result = fit();
+        (result, WRAPPED_CHARS.with(Cell::get) - before)
+    }
+
+    #[test]
+    fn long_messages_are_fitted_in_linear_time() {
+        // A pasted path of 20 000 characters (the error echoes it) used to take seconds a
+        // frame: every cut was wrapped again from the start. Each fit now wraps the message
+        // a few times at most, however long it is (plus a few forms that fit the panel):
+        // once to see whether it fits, once to find a cut, and once more to cut between
+        // characters when there is no word to cut at.
+        for n in [2_000, 20_000] {
+            let name = "x".repeat(n);
+            let words = "word ".repeat(n / 5);
+            let folders = "d/".repeat(n / 4);
+            let panel = 30 * 2;
+            // At most `times` passes over `len` characters, plus the forms that fit.
+            let linear = |len: usize, times: usize| times * len + panel * panel;
+
+            let (cut, work) = wrapped_chars(|| fit_rows(&name, 30, 2));
+            assert_eq!(cut.chars().count(), 60);
+            assert!(work <= linear(n, 3), "{n}: {work}");
+
+            let (cut, work) = wrapped_chars(|| fit_rows(&words, 30, 2));
+            assert!(cut.ends_with("word…"));
+            assert!(work <= linear(words.len(), 2), "{n}: {work}");
+
+            let path = format!("/{folders}game.pgn");
+            let (deep, work) = wrapped_chars(|| fit_message("saved ", Some(&path), 30, 2));
+            assert_eq!(deep, format!("saved /d/…/{}game.pgn", "d/".repeat(8)));
+            assert!(work <= linear(path.len(), 2), "{n}: {work}");
+
+            let path = format!("~/{name}");
+            let (long, work) = wrapped_chars(|| fit_message("saved ", Some(&path), 30, 2));
+            assert!(
+                long.starts_with("saved …/xxx") && long.ends_with('…'),
+                "{long}"
+            );
+            assert!(work <= linear(path.len(), 3), "{n}: {work}");
+        }
+    }
+
+    #[test]
     fn fit_rows_cuts_at_a_word_and_marks_the_cut() {
         assert_eq!(fit_rows("short note", 20, 1), "short note");
         assert_eq!(fit_rows("one two three four", 9, 1), "one two…");
@@ -2250,6 +2522,8 @@ mod tests {
         assert_eq!(h.app.hit_map(), &playing, "help records nothing");
         h.press(KeyCode::Esc);
 
+        // A move first, so that q asks.
+        h.moves(&["f3"]);
         h.char('q');
         for button in [Button::Confirm, Button::Cancel] {
             let rect = h
@@ -2279,7 +2553,7 @@ mod tests {
         }
         h.press(KeyCode::Esc);
 
-        h.moves(&["f3", "e5", "g4", "Qh4#"]);
+        h.moves(&["e5", "g4", "Qh4#"]);
         for button in GAME_OVER_BUTTONS {
             let rect = h
                 .app
@@ -2310,6 +2584,8 @@ mod tests {
     fn the_terminal_cursor_shows_only_while_typing() {
         let mut h = jev(80, 24);
         h.char('1');
+        // A move first, so that Ctrl+C asks below.
+        h.moves(&["e4"]);
         assert!(!h.terminal.backend().cursor_visible());
         h.char('/');
         h.type_text("e4");
@@ -2588,6 +2864,15 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_menu_with_more_warnings_than_fit() {
+        let warnings = (1..=6)
+            .map(|n| format!("warning {n}: something at start-up was not as expected"))
+            .collect();
+        let h = Harness::build(FakeEngine::local(), (60, 20), warnings, |app| app);
+        insta::assert_snapshot!("menu_warnings_60x20", h.terminal.backend());
+    }
+
+    #[test]
     fn snapshot_playing_start() {
         let mut h = jev(80, 24);
         h.char('1');
@@ -2691,6 +2976,8 @@ mod tests {
     fn snapshot_quit_confirmation() {
         let mut h = jev(80, 24);
         h.char('1');
+        // q asks only once a move has been played.
+        h.moves(&["e4"]);
         h.char('q');
         insta::assert_snapshot!("quit_80x24", h.terminal.backend());
     }

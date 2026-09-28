@@ -14,8 +14,9 @@
 //! the game-over overlay, else the board. Ctrl+C is the one global key: it asks to quit from anywhere.
 //! Ctrl+S opens the PGN save dialog from the board, the command box and the game-over
 //! overlay. Esc typed quickly before a key arrives as Alt+key: outside text fields it is
-//! handled as both keys; in the command box and the text dialogs Alt chords are ignored, so
-//! readline habits (Alt+B, Alt+F, ...) neither change the text nor reach the board.
+//! handled as both keys (the key is dropped when the Esc put the focus in a text field); in
+//! the command box and the text dialogs Alt chords are ignored, so readline habits (Alt+B,
+//! Alt+F, ...) neither change the text nor reach the board.
 //!
 //! The computer player is called "Jev" when the engine uses Jev ([`Engine::uses_jev`]) and
 //! "Local search" otherwise, in every label, message and saved PGN.
@@ -38,14 +39,16 @@
 //! one ([`EngineOutcome::Failed`]), the app stops asking and says so; space retries, from
 //! the board or an empty command box.
 //!
-//! Actions that throw away a game in progress (quit, new game, menu, resign) ask first, and
-//! their confirmation defaults to No, so a stray Enter never confirms one.
+//! Actions that throw away a game in progress (at least one move played and the game not
+//! over: quit, new game, menu) ask first, and so does resigning; their confirmation defaults
+//! to No, so a stray Enter never confirms one.
 //!
 //! In debug mode ([`App::with_debug`]) every Jev exchange that comes back with an engine
 //! reply is kept in a [`History`], stale replies included, and queued for the debug log.
-//! `d` on the board opens the full-screen exchange view ([`ExchangeView`]), which takes the
-//! keys (after the dialogs and Ctrl+C) until Esc closes it; engine replies are still applied
-//! underneath. The first debug log failure is shown once as a status message.
+//! `d` on the board or the game-over overlay opens the full-screen exchange view
+//! ([`ExchangeView`]), which takes the keys (after the dialogs and Ctrl+C) until Esc closes
+//! it; engine replies are still applied underneath. The first debug log failure is shown
+//! once as a status message.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -59,7 +62,9 @@ use ratatui::crossterm::event::{
 use ratatui::layout::{Position as CellPosition, Rect};
 use ratatui_image::picker::{Picker, ProtocolType};
 
-use super::board::{BoardGeometry, CellSize, Highlights, PieceImages, square_at};
+use super::board::{
+    BoardGeometry, CellSize, Highlights, PieceImages, min_picture_square, square_at,
+};
 use super::debug::{DebugLog, DebugSession, Exchange, ExchangeView, History};
 use super::event::AppEvent;
 use super::files::{SaveError, pgn_export, resolve_path, tilde_path, today, write_file};
@@ -1209,10 +1214,15 @@ impl App {
             if self.typing() {
                 return;
             }
-            // Elsewhere it is most likely Esc typed quickly before the key: handle both.
+            // Elsewhere it is most likely Esc typed quickly before the key: handle both,
+            // unless that Esc put the focus in a text field (it closed a promotion picker
+            // typed from the command box, or declined an overwrite typed in the save
+            // dialog), where the key would be typed into the text.
             if let KeyCode::Char(c) = key.code {
                 self.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-                self.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+                if !self.typing() {
+                    self.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+                }
                 return;
             }
         }
@@ -1319,6 +1329,7 @@ impl App {
                 Some('s') => self.game_over_button(Button::SavePgn),
                 Some('m') => self.game_over_button(Button::Menu),
                 Some('u') => self.undo(),
+                Some('d') => self.open_exchanges(),
                 Some('q') => self.request_quit(),
                 _ => {}
             },
@@ -1971,7 +1982,22 @@ impl App {
 
     fn cycle_glyphs(&mut self) {
         self.glyphs = self.glyphs.next(self.images_available());
-        self.show(Message::info(format!("glyphs: {}", self.glyphs)));
+        let mut text = format!("glyphs: {}", self.glyphs);
+        if self.glyphs == GlyphSet::Image && self.squares_too_small_for_pictures() {
+            // The Image style then looks just like Solid.
+            text.push_str(" (squares too small for pictures)");
+        }
+        self.show(Message::info(text));
+    }
+
+    /// True when the board as last drawn has squares smaller than pictures need
+    /// ([`min_picture_square`] for the picker's protocol).
+    fn squares_too_small_for_pictures(&self) -> bool {
+        let (Some(picker), Some(board)) = (&self.picker, &self.hits.board) else {
+            return false;
+        };
+        let (width, height) = min_picture_square(picker.protocol_type());
+        board.square_w < width || board.square_h < height
     }
 
     fn change_step_delay(&mut self, direction: i8) {
@@ -1989,7 +2015,7 @@ impl App {
     }
 
     fn request_quit(&mut self) {
-        if self.screen == Screen::Playing && self.game.outcome().is_none() {
+        if self.game_in_progress() {
             self.confirm(Question::Quit);
         } else {
             self.quit = true;
@@ -3003,7 +3029,8 @@ mod tests {
     fn alt_key_is_escape_then_the_key_outside_text_fields() {
         // Esc typed quickly before a key arrives as Alt+key.
         let mut h = hvh();
-        h.click_square(sq("e2"));
+        h.moves(&["e4"]);
+        h.click_square(sq("e7"));
         h.alt('f');
         assert_eq!(h.app.selected(), None, "Esc dropped the piece");
         assert!(h.app.flipped(), "then f flipped the board");
@@ -3021,6 +3048,41 @@ mod tests {
         h.alt('1');
         assert_eq!(h.app.mode(), Mode::HumanVsHuman);
         assert_eq!(h.app.screen_name(), "playing");
+    }
+
+    #[test]
+    fn an_alt_chord_whose_escape_opens_a_text_field_drops_its_key() {
+        // Esc closes a promotion picker typed from the command box and puts the move text
+        // back in the box: the key after it must not be typed there.
+        let mut h = hvh();
+        h.command(&format!(":fen {PROMOTION_FEN}"));
+        h.command("e8");
+        assert_eq!(h.app.dialog_name(), Some("promotion"));
+        h.alt('q');
+        assert_eq!(h.app.dialog_name(), None);
+        assert!(h.app.command_has_focus());
+        assert_eq!(h.app.command_text(), "e8");
+        assert!(h.uci().is_empty());
+        assert!(!h.app.should_quit());
+
+        // Esc declines an overwrite typed in the save dialog and gives the path back to
+        // edit: the key after it is dropped too.
+        let dir = TempDir::new("alt-overwrite");
+        let path = dir.join("game.pgn");
+        fs::write(&path, "old").expect("write");
+        let mut h = hvh();
+        h.moves(&["e4"]);
+        h.ctrl('s');
+        h.type_text(&path.display().to_string());
+        h.press(KeyCode::Enter);
+        assert_eq!(h.app.dialog_name(), Some("overwrite"));
+        h.alt('x');
+        assert_eq!(h.app.dialog_name(), Some("save pgn"));
+        assert!(matches!(
+            h.app.dialog(),
+            Some(Dialog::Input { editor, .. }) if editor.text() == path.display().to_string()
+        ));
+        assert_eq!(fs::read_to_string(&path).expect("read"), "old");
     }
 
     #[test]
@@ -3270,6 +3332,7 @@ mod tests {
         );
         h.command(":undo");
         assert_eq!(h.app.status_line(), NOTHING_TO_UNDO);
+        h.command("e4");
         h.command(":quit");
         assert_eq!(h.app.dialog_name(), Some("quit"));
     }
@@ -3331,6 +3394,10 @@ mod tests {
         assert_eq!(h.uci(), ["e2e4"]);
         h.send(paste("5\n"));
         assert_eq!(h.uci(), ["e2e4", "e7e5"]);
+        // A paste of nothing but a line break is an Enter for the text already typed.
+        h.type_text("Nf3");
+        h.send(paste("\r\n"));
+        assert_eq!(h.uci(), ["e2e4", "e7e5", "g1f3"]);
 
         let mut h = Harness::new();
         h.send(paste("e2e4\n"));
@@ -3420,7 +3487,38 @@ mod tests {
         h.command(":glyphs");
         h.command(":glyphs");
         assert_eq!(h.app.glyphs(), GlyphSet::Image);
-        assert_eq!(h.app.status_line(), "glyphs: image");
+        // Half-block pictures need 11×5 squares; 80×24 gives 5×2.
+        assert_eq!(
+            h.app.status_line(),
+            "glyphs: image (squares too small for pictures)"
+        );
+    }
+
+    #[test]
+    fn g_says_when_the_squares_are_too_small_for_pictures() {
+        let image_after_g = |protocol: ProtocolType, (width, height): (u16, u16)| {
+            let picker = graphics::picker_for(protocol, CellSize::DEFAULT);
+            let mut h = Harness::build(FakeEngine::local(), (width, height), Vec::new(), |app| {
+                app.with_picker(Some(picker))
+            });
+            h.char('1');
+            while h.app.glyphs() != GlyphSet::Image {
+                h.char('g');
+            }
+            h.app.status_line()
+        };
+        let too_small = "glyphs: image (squares too small for pictures)";
+        assert_eq!(image_after_g(ProtocolType::Halfblocks, (80, 24)), too_small);
+        assert_eq!(
+            image_after_g(ProtocolType::Halfblocks, (200, 60)),
+            "glyphs: image"
+        );
+        // Kitty, iTerm2 and Sixel pictures need only 5×2 squares.
+        assert_eq!(
+            image_after_g(ProtocolType::Sixel, (80, 24)),
+            "glyphs: image"
+        );
+        assert_eq!(image_after_g(ProtocolType::Kitty, (60, 20)), too_small);
     }
 
     /// A font size and protocol as the picker reports them.
@@ -3644,6 +3742,43 @@ mod tests {
     }
 
     #[test]
+    fn q_n_and_m_ask_only_while_a_game_is_in_progress() {
+        // No move played yet: there is nothing to throw away.
+        for key in ['q', 'n', 'm'] {
+            let mut h = hvh();
+            h.char(key);
+            assert_eq!(h.app.dialog_name(), None, "{key}");
+        }
+        let mut h = hvh();
+        h.char('q');
+        assert!(h.app.should_quit());
+        let mut h = hvh();
+        h.char('m');
+        assert_eq!(h.app.screen_name(), "menu");
+
+        // One move played: all three ask.
+        for (key, question) in [('q', "quit"), ('n', "new game"), ('m', "menu")] {
+            let mut h = hvh();
+            h.moves(&["e4"]);
+            h.char(key);
+            assert_eq!(h.app.dialog_name(), Some(question), "{key}");
+        }
+
+        // The game is over: none of them asks, from the overlay or from the board.
+        for dismissed in [false, true] {
+            for key in ['q', 'n', 'm'] {
+                let mut h = hvh();
+                h.moves(&["f3", "e5", "g4", "Qh4#"]);
+                if dismissed {
+                    h.press(KeyCode::Esc);
+                }
+                h.char(key);
+                assert_eq!(h.app.dialog_name(), None, "{key} dismissed={dismissed}");
+            }
+        }
+    }
+
+    #[test]
     fn new_game_and_menu_ask_while_a_game_is_in_progress() {
         let mut h = hvh();
         h.command("e4");
@@ -3698,6 +3833,11 @@ mod tests {
     fn quit_asks_only_while_a_game_is_in_progress() {
         let mut h = hvh();
         h.char('q');
+        assert!(h.app.should_quit(), "no move played yet: quits at once");
+
+        let mut h = hvh();
+        h.moves(&["e4"]);
+        h.char('q');
         assert_eq!(h.app.dialog_name(), Some("quit"));
         h.char('n');
         assert_eq!(h.app.dialog_name(), None);
@@ -3722,6 +3862,7 @@ mod tests {
     #[test]
     fn ctrl_c_works_from_any_focus() {
         let mut h = hvh();
+        h.moves(&["e4"]);
         h.char('/');
         h.ctrl('c');
         assert_eq!(h.app.dialog_name(), Some("quit"));
@@ -3729,6 +3870,7 @@ mod tests {
         assert!(h.app.should_quit());
 
         let mut h = hvh();
+        h.moves(&["e4"]);
         h.char('?');
         h.ctrl('c');
         assert_eq!(h.app.dialog_name(), Some("quit"));
@@ -3739,8 +3881,9 @@ mod tests {
     #[test]
     fn dialogs_are_modal_for_the_mouse() {
         let mut h = hvh();
+        h.moves(&["e4"]);
         h.char('q');
-        h.click_square(sq("e2"));
+        h.click_square(sq("e7"));
         assert_eq!(h.app.selected(), None);
         assert_eq!(h.app.dialog_name(), Some("quit"));
         h.click_hit(Hit::Button(Button::Cancel));
@@ -4874,6 +5017,35 @@ mod tests {
         assert_eq!(h.app.exchange_view(), None);
         assert_eq!(h.app.status_line(), DEBUG_OFF);
         assert_eq!(DEBUG_OFF, "debug mode is off (start with --debug)");
+    }
+
+    #[test]
+    fn d_works_from_the_game_over_overlay() {
+        let mut h = debug_app(
+            FakeEngine::local(),
+            (80, 24),
+            DebugLog::open(Err(NO_LOG_PATH.to_string())),
+        );
+        h.char('1');
+        h.moves(&FOOLS_MATE);
+        assert_eq!(h.app.screen_name(), "game over");
+        h.char('d');
+        assert!(h.app.exchange_view().is_some(), "d opens the exchange view");
+        assert!(h.screen().contains("Jev exchange"));
+        h.press(KeyCode::Esc);
+        assert_eq!(h.app.exchange_view(), None);
+        assert_eq!(
+            h.app.screen_name(),
+            "game over",
+            "Esc goes back to the overlay"
+        );
+
+        // Without debug mode it says so, as on the board.
+        let mut h = hvh();
+        h.moves(&FOOLS_MATE);
+        h.char('d');
+        assert_eq!(h.app.screen_name(), "game over");
+        assert_eq!(h.app.status_line(), DEBUG_OFF);
     }
 
     #[test]

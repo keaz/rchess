@@ -36,7 +36,7 @@ pub enum MoveTextError {
     #[error("type a move")]
     Empty,
     /// No legal move matches. Carries the trimmed input; the message shows at most
-    /// its first [`ECHO_MAX_CHARS`](crate::tui::glyphs::ECHO_MAX_CHARS) characters.
+    /// its first [`ECHO_MAX_WIDTH`](crate::tui::glyphs::ECHO_MAX_WIDTH) cells.
     #[error("not a legal move: {}", shorten(.0))]
     NotLegal(String),
     /// Several legal moves match. Carries their SAN (with check suffixes), sorted.
@@ -89,12 +89,11 @@ fn loose_match(pos: &ChessPosition, text: &str) -> Result<Move, MoveTextError> {
     if let Some(mv) = long_algebraic(pos, &wanted, named) {
         return Ok(mv);
     }
-    let kind_of = |mv: Move| pos.piece_at(mv.from()).map(|piece| piece.kind);
     let candidates: Vec<(Move, String)> = pos
         .legal_moves()
         .iter()
         .copied()
-        .filter(|&mv| named.is_none_or(|kind| kind_of(mv) == Some(kind)))
+        .filter(|&mv| named.is_none_or(|kind| moved_kind(pos, mv) == Some(kind)))
         .map(|mv| (mv, pos.to_san(mv)))
         .collect();
 
@@ -195,16 +194,20 @@ fn ambiguous(sans: impl Iterator<Item = String>) -> MoveTextError {
 /// Step 3: normalised text read as UCI, optionally after a piece letter that must name the
 /// piece on the origin square (`ng1f3`), and that must match `named` when there is one.
 fn long_algebraic(pos: &ChessPosition, wanted: &str, named: Option<PieceKind>) -> Option<Move> {
-    let kind_of = |mv: Move| pos.piece_at(mv.from()).map(|piece| piece.kind);
     if let Ok(mv) = pos.parse_uci(wanted)
-        && named.is_none_or(|kind| kind_of(mv) == Some(kind))
+        && named.is_none_or(|kind| moved_kind(pos, mv) == Some(kind))
     {
         return Some(mv);
     }
     let mut chars = wanted.chars();
     let letter = PieceKind::from_char(chars.next()?)?;
     let mv = pos.parse_uci(chars.as_str()).ok()?;
-    (kind_of(mv) == Some(letter) && named.is_none_or(|kind| kind == letter)).then_some(mv)
+    (moved_kind(pos, mv) == Some(letter) && named.is_none_or(|kind| kind == letter)).then_some(mv)
+}
+
+/// The kind of piece `mv` moves in `pos`.
+fn moved_kind(pos: &ChessPosition, mv: Move) -> Option<PieceKind> {
+    pos.piece_at(mv.from()).map(|piece| piece.kind)
 }
 
 /// The piece an uppercase leading letter names: `N`, `R`, `Q` and `K` always, `B` only when

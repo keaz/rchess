@@ -14,6 +14,7 @@ nothing touches the network), drives it with keystrokes or signals, and checks:
 * the menu and the game render (a tiny terminal emulator rebuilds the screen);
 * `1`, `/e4<Enter>`, `Esc`, `q`, `y` plays 1. e4 and quits after confirmation,
   and `qh5<Enter>` typed on the board does not quit (the question defaults to No);
+  before a move is played, `q` quits at once (nothing to lose);
 * `3` (play Black against the computer) gets a first move from the engine
   thread, and without a key the screen calls the computer "Local search";
   without debug mode `d` says so;
@@ -836,6 +837,8 @@ def scenario_arguments(binary):
         lines = app.screen().lines()
         check(any(re.search(r"\br +n +b +q +k +b +n +r\b", l) for l in lines), "ascii glyphs on the board")
         app.screen().show("ascii board")
+        app.send(b"/e4\r")
+        check(app.wait_screen("1. e4"), "a move is played, so the game is in progress")
         app.send(b"\x03")
         check(app.wait_screen("Quit the game in progress?"), "Ctrl+C asks for confirmation")
         quit_at = len(app.stream)
@@ -961,6 +964,11 @@ def scenario_query_unanswered(binary):
         check(app.wait_screen("glyphs: outline"), "the style was Solid (g goes on to Outline)")
         app.send(b"gg")
         check(app.wait_screen("glyphs: image"), "Image is still in the g cycle")
+        check(
+            "squares too" in app.screen().text(),
+            "the status says the squares are too small for pictures",
+            app.screen().text().split("Status", 1)[-1][:200],
+        )
         text = app.screen().text()
         # 80x24 gives 5x2 squares, too small for half-block pictures (11x5 at least).
         check(
@@ -980,11 +988,9 @@ def scenario_query_unanswered(binary):
         )
         set_window(app, ROWS, COLS, 0, 0)
         app.idle(0.3)
-        app.send(b"q")
-        check(app.wait_screen("Quit the game in progress?"), "q asks for confirmation")
         quit_at = len(app.stream)
-        app.send(b"y", settle=0)
-        check(app.wait_exit(), "process exits after y")
+        app.send(b"q", settle=0)
+        check(app.wait_exit(), "q quits at once: no move was played")
         check(app.status == 0, "exit status 0", f"status {app.status}")
         check_teardown(app, quit_at, "quit after an unanswered query")
     finally:
@@ -1143,11 +1149,9 @@ def scenario_query_kitty(binary):
         app.send(b"g")
         check(app.wait_screen("glyphs: solid"), "the style was Image (g goes on to Solid)")
         check("♜" in app.screen().text(), "then the pieces are solid glyphs")
-        app.send(b"q")
-        check(app.wait_screen("Quit the game in progress?"), "q asks for confirmation")
         quit_at = len(app.stream)
-        app.send(b"y", settle=0)
-        check(app.wait_exit(), "process exits after y")
+        app.send(b"q", settle=0)
+        check(app.wait_exit(), "q quits at once: no move was played")
         check(app.status == 0, "exit status 0", f"status {app.status}")
         check_teardown(app, quit_at, "quit after kitty pictures", kitty=True, live_from=second_at)
     finally:
@@ -1368,11 +1372,9 @@ def scenario_query_iterm2(binary):
         drawn = app.stream[answered_at:]
         check(ITERM2_PICTURE in drawn, "pieces are iTerm2 pictures")
         check(not SIXEL_RASTER.search(drawn), "and not Sixel pictures")
-        app.send(b"q")
-        check(app.wait_screen("Quit the game in progress?"), "q asks for confirmation")
         quit_at = len(app.stream)
-        app.send(b"y", settle=0)
-        check(app.wait_exit(), "process exits after y")
+        app.send(b"q", settle=0)
+        check(app.wait_exit(), "q quits at once: no move was played")
         check(app.status == 0, "exit status 0", f"status {app.status}")
         check_teardown(app, quit_at, "quit after iTerm2 pictures")
     finally:
@@ -1581,11 +1583,9 @@ def scenario_query_sixel_zoom(binary):
         check(len(wait_sixels(app, after_at, 32)) == 32, "and redraws the pictures")
         app.send(b"g")
         check(app.wait_screen("glyphs: solid"), "keys work after the unanswered query")
-        app.send(b"q")
-        check(app.wait_screen("Quit the game in progress?"), "q asks for confirmation")
         quit_at = len(app.stream)
-        app.send(b"y", settle=0)
-        check(app.wait_exit(), "process exits after y")
+        app.send(b"q", settle=0)
+        check(app.wait_exit(), "q quits at once: no move was played")
         check(app.status == 0, "exit status 0", f"status {app.status}")
         check_teardown(app, quit_at, "quit after the zoom")
     finally:

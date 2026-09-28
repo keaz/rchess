@@ -511,11 +511,14 @@ impl widgets::StatefulWidget for &BoardView<'_> {
         if clip.is_empty() {
             return;
         }
+        // Everything outside the squares (the label column and row) starts as a blank cell
+        // with no style of its own, as each square does, whatever was drawn there before.
         let grid = self.geometry.grid;
         for pos in self.geometry.outer.positions() {
             if !grid.contains(pos)
                 && let Some(cell) = cell_in(buf, clip, pos)
             {
+                cell.reset();
                 cell.set_symbol(glyphs::BLANK);
             }
         }
@@ -711,7 +714,8 @@ impl BoardView<'_> {
     }
 
     /// Rank numbers left of each rank's glyph row, file letters under each
-    /// file's glyph column; both follow the flip.
+    /// file's glyph column; both follow the flip. Each label cell is reset first,
+    /// so it keeps no style from an earlier draw.
     fn render_labels(&self, clip: Rect, buf: &mut Buffer) {
         let g = &self.geometry;
         if let Some(label_x) = g.grid.x.checked_sub(LABEL_COLUMNS) {
@@ -719,6 +723,7 @@ impl BoardView<'_> {
             for sq in Square::all().step_by(8) {
                 let y = glyph_cell(square_rect(g, sq)).y;
                 if let Some(cell) = cell_in(buf, clip, CellPosition::new(label_x, y)) {
+                    cell.reset();
                     cell.set_symbol(RANK_LABELS[usize::from(sq.rank())]);
                 }
             }
@@ -728,6 +733,7 @@ impl BoardView<'_> {
         for sq in Square::all().take(8) {
             let x = glyph_cell(square_rect(g, sq)).x;
             if let Some(cell) = cell_in(buf, clip, CellPosition::new(x, label_y)) {
+                cell.reset();
                 cell.set_symbol(FILE_LABELS[usize::from(sq.file())]);
             }
         }
@@ -746,7 +752,13 @@ fn cell_in(buf: &mut Buffer, clip: Rect, pos: CellPosition) -> Option<&mut Cell>
 #[cfg(test)]
 mod tests {
     use image::DynamicImage;
-    use ratatui::{Terminal, backend::TestBackend, layout::Size, style::Modifier, text::Span};
+    use ratatui::{
+        Terminal,
+        backend::TestBackend,
+        layout::Size,
+        style::{Modifier, Style},
+        text::Span,
+    };
     use ratatui_image::picker::{Picker, ProtocolType};
     use ratatui_image::{Image, Resize};
 
@@ -1140,6 +1152,52 @@ mod tests {
                 assert_eq!((ranks.as_str(), files.as_str()), ("87654321", "abcdefgh"));
             }
         }
+    }
+
+    #[test]
+    fn label_cells_keep_no_style_from_an_earlier_draw() {
+        // Whatever was drawn there before (a dialog, a tinted square of a larger board),
+        // the label column and row are drawn in the terminal's own colours.
+        let pal = palette(true);
+        let position = ChessPosition::startpos();
+        let area = Rect::new(0, 0, 25, 9);
+        let geometry = layout_board(area, false, CellSize::DEFAULT).expect("board fits");
+        let mut buf = Buffer::empty(area);
+        buf.set_style(
+            area,
+            Style::new()
+                .fg(Color::Yellow)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        );
+        BoardView {
+            position: &position,
+            geometry,
+            glyphs: GlyphSet::Solid,
+            palette: &pal,
+            highlights: &Highlights::default(),
+            no_color: false,
+            picker: None,
+            overlays: &[],
+        }
+        .render(area, &mut buf);
+        let outside: Vec<_> = geometry
+            .outer
+            .positions()
+            .filter(|&pos| !geometry.grid.contains(pos))
+            .collect();
+        assert!(outside.len() > 16, "a label column and a label row");
+        for pos in outside {
+            let cell = &buf[pos];
+            assert_eq!(
+                (cell.fg, cell.bg, cell.modifier),
+                (Color::Reset, Color::Reset, Modifier::empty()),
+                "{pos:?} {:?}",
+                cell.symbol()
+            );
+        }
+        assert_eq!(buf[(0, 0)].symbol(), "8");
+        assert_eq!(buf[(geometry.grid.x + 1, 8)].symbol(), "a");
     }
 
     #[test]

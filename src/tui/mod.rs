@@ -33,7 +33,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ratatui::backend::Backend;
-use ratatui::crossterm::event::Event;
+use ratatui::crossterm::event::{Event, KeyEventKind, MouseEventKind};
 
 use crate::core::Game;
 use crate::engine::{ComputerMove, ComputerPlayer, EngineConfig};
@@ -71,6 +71,7 @@ const USAGE: &str = concat!(
     "  --debug            debug mode: keep every Jev request and answer, show them\n",
     "                     with `d` during a game and append them to the debug log\n",
     "  -h, --help         show this help and exit\n",
+    "  -V, --version      show the version and exit\n",
     "\n",
     "Environment:\n",
     "  JEV_API_KEY        key for the Jev computer player (TYPESAFE_API_KEY also\n",
@@ -91,13 +92,28 @@ const USAGE: &str = concat!(
     "In the game press ? for help. Moves can be typed after / (e4, Nf3, e2e4).\n",
 );
 
+/// The `--version` text.
+const VERSION: &str = concat!(env!("CARGO_PKG_NAME"), " ", env!("CARGO_PKG_VERSION"), "\n");
+
+/// Writes `text` to `out`. A reader that has gone away (a closed pipe, as in
+/// `chess --help | true`) is not an error: nobody is left to read it, as with other
+/// command-line tools.
+fn print_quietly(out: &mut impl Write, text: &str) -> io::Result<()> {
+    match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        result => result,
+    }
+}
+
 /// Runs the terminal UI until the user quits or SIGINT, SIGTERM or SIGHUP
 /// arrives. `args` are the command-line arguments without the program name.
 ///
-/// `--help` prints the usage and returns without touching the terminal.
-/// Unknown arguments and a missing or invalid `--glyphs` value do not stop the
-/// program: they are listed as warnings on the menu, like invalid engine
-/// settings, and so is a graphics query that failed. The computer player comes
+/// `--help` prints the usage and `--version` the version (`chess 0.1.0`), and both
+/// return without touching the terminal; when stdout is a pipe that is already
+/// closed (`chess --help | true`), they return quietly. Unknown arguments and a
+/// missing or invalid `--glyphs` value do not stop the program: they are listed
+/// as warnings on the menu, like invalid engine settings, and so is a graphics
+/// query that failed. The computer player comes
 /// from `EngineConfig::from_env()`; with no `JEV_API_KEY` it plays by local
 /// search and never uses the network. In debug mode (`--debug` or `RCHESS_DEBUG`)
 /// it records its exchanges with Jev (`EngineConfig::trace`).
@@ -115,11 +131,12 @@ const USAGE: &str = concat!(
 /// # Errors
 ///
 /// When stdin or stdout is not a terminal, when signal handlers cannot be installed, or
-/// when the terminal cannot be set up, read or drawn. Writing the `--help` text
-/// can fail too.
+/// when the terminal cannot be set up, read or drawn. Writing the `--help` or
+/// `--version` text can fail too (not for a closed pipe).
 pub fn run(args: impl IntoIterator<Item = String>) -> io::Result<()> {
     let options = match parse_args(args) {
-        Cli::Help => return io::stdout().lock().write_all(USAGE.as_bytes()),
+        Cli::Help => return print_quietly(&mut io::stdout().lock(), USAGE),
+        Cli::Version => return print_quietly(&mut io::stdout().lock(), VERSION),
         Cli::Play(options) => options,
     };
     // Before touching the terminal: without a terminal on stdin the key reader fails only
@@ -355,8 +372,12 @@ impl Engine for PanickingEngine {
 /// What the command line asks for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Cli {
-    /// `-h` or `--help` appeared anywhere: print the usage and exit.
+    /// `-h` or `--help` appeared (before any `-V` or `--version`): print the usage
+    /// and exit.
     Help,
+    /// `-V` or `--version` appeared (before any `-h` or `--help`): print the version
+    /// and exit.
+    Version,
     /// Start the UI.
     Play(Options),
 }
@@ -373,8 +394,9 @@ struct Options {
     warnings: Vec<String>,
 }
 
-/// Reads `--glyphs <set>`, `--glyphs=<set>`, `--debug`, `-h` and `--help`. The last
-/// `--glyphs` wins. A `--glyphs` followed by nothing or by another option has no
+/// Reads `--glyphs <set>`, `--glyphs=<set>`, `--debug`, `-h`, `--help`, `-V` and
+/// `--version`. The last `--glyphs` wins; the first of help and version wins over
+/// everything. A `--glyphs` followed by nothing or by another option has no
 /// value; that and any other argument become warnings rather than errors.
 fn parse_args(args: impl IntoIterator<Item = String>) -> Cli {
     let mut options = Options::default();
@@ -382,6 +404,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Cli {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => return Cli::Help,
+            "-V" | "--version" => return Cli::Version,
             "--debug" => options.debug = true,
             "--glyphs" => match args.next_if(|value| !value.starts_with('-')) {
                 Some(value) => options.glyphs = Some(value),
@@ -411,13 +434,19 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Cli {
 /// and runs once however many resizes asked: `measure_font` asks the terminal
 /// ([`FontMeter::measure`] in production, up to [`graphics::QUERY_TIMEOUT`] when it
 /// does not answer) and its result goes to
-/// [`App::font_measured`] before the next draw.
+/// [`App::font_measured`] before the next draw. A draw inside the batch (below) that
+/// finds a measurement asked for runs it first, so that no picture is encoded for the
+/// old font.
 ///
 /// Drawing comes before each batch so that mouse events are hit-tested against
-/// what is on screen. Every batch ends with a `Tick`, so the screen is redrawn at
-/// least once per batch (the spinner and the Jev vs Jev delay depend on it);
-/// ratatui writes only the cells that changed. Once the app quits, the rest of
-/// the batch is dropped.
+/// what is on screen. An event that reads what the last draw found ([`reads_layout`]:
+/// the mouse's hit map, and for keys and pastes too whether the terminal was too small
+/// and where the board was) and follows, in the same batch, an event that may have
+/// changed the screen or its layout ([`changes_layout`]) waits for another draw, so it
+/// is handled against the new one; ticks and engine replies need no draw. Every batch
+/// ends with a `Tick`, so the screen is redrawn at least once per batch (the spinner
+/// and the Jev vs Jev delay depend on it); ratatui writes only the cells that changed.
+/// Once the app quits, the rest of the batch is dropped.
 ///
 /// `draw`, `next_batch` and `measure_font` are the terminal in production and a
 /// `TestBackend` with scripted batches and font sizes in tests. Engine replies
@@ -440,7 +469,20 @@ fn run_loop(
         let batch = next_batch(&replies)?;
         let now = Instant::now();
         let mut measure = false;
+        let mut stale = false;
         for event in batch {
+            if stale && reads_layout(&event) {
+                if measure {
+                    // The draw would encode pictures for the old font: measure first. A
+                    // later resize in the batch asks again.
+                    measure = false;
+                    let measured = measure_font(app);
+                    app.font_measured(measured);
+                }
+                draw(app)?;
+                stale = false;
+            }
+            stale |= changes_layout(&event);
             for action in app.handle(event, now) {
                 match action {
                     Action::RequestEngine(request) => {
@@ -459,6 +501,31 @@ fn run_loop(
         }
     }
     Ok(())
+}
+
+/// Whether handling `event` reads what the last draw found: the hit map (every mouse
+/// event), or whether the terminal was too small and where the board was (a key press
+/// or a paste, which the app ignores while the terminal is too small).
+fn reads_layout(event: &AppEvent) -> bool {
+    match event {
+        AppEvent::Term(Event::Key(key)) => key.kind == KeyEventKind::Press,
+        AppEvent::Term(Event::Mouse(_) | Event::Paste(_)) => true,
+        AppEvent::Term(_) | AppEvent::Engine(_) | AppEvent::Tick => false,
+    }
+}
+
+/// Whether `event` may change what is on screen and where: a key press, a click or
+/// release, a paste, a resize or an engine reply may; a tick, a wheel turn (which
+/// scrolls a list in place) and a drag or move of the pointer do not.
+fn changes_layout(event: &AppEvent) -> bool {
+    match event {
+        AppEvent::Term(Event::Key(key)) => key.kind == KeyEventKind::Press,
+        AppEvent::Term(Event::Mouse(mouse)) => {
+            matches!(mouse.kind, MouseEventKind::Down(_) | MouseEventKind::Up(_))
+        }
+        AppEvent::Term(Event::Paste(_) | Event::Resize(..)) | AppEvent::Engine(_) => true,
+        AppEvent::Term(_) | AppEvent::Tick => false,
+    }
 }
 
 /// Runs `request` on an engine thread, whose reply arrives on `replies`.
@@ -578,7 +645,7 @@ mod tests {
     fn debug_mode_can_be_asked_for() {
         let debug = |list: &[&str]| match parse_args(args(list)) {
             Cli::Play(options) => options,
-            Cli::Help => panic!("expected Play"),
+            other => panic!("expected Play, got {other:?}"),
         };
         assert!(!debug(&[]).debug);
         assert_eq!(
@@ -666,6 +733,8 @@ mod tests {
             "--glyphs",
             "--debug",
             "--help",
+            "--version",
+            "-V",
             "JEV_API_KEY",
             "TYPESAFE_API_KEY",
             "JEV_MODEL",
@@ -947,6 +1016,31 @@ mod tests {
     }
 
     #[test]
+    fn a_draw_inside_a_batch_measures_the_font_first() {
+        // A key after a resize waits for a redraw (it may read the new layout), and that
+        // draw must not encode pictures for the old font: the measurement the resize
+        // asked for comes before it.
+        let mut app = picture_game(ProtocolType::Sixel);
+        let run = drive_with_font(
+            &mut app,
+            &AtomicI32::new(0),
+            vec![
+                Step::Events(vec![
+                    AppEvent::Term(Event::Resize(100, 30)),
+                    key(KeyCode::Char('f')),
+                ]),
+                Step::Signal,
+            ],
+            Some(CellSize::new(8, 16)),
+        );
+        run.result.expect("loop ends cleanly");
+        assert_eq!(run.draws, 3, "before each batch, and before the key");
+        assert_eq!(run.measured_after, [1], "before the draw for the key");
+        assert_eq!(app.cell_size(), CellSize::new(8, 16));
+        assert!(app.flipped(), "the key was handled");
+    }
+
+    #[test]
     fn kitty_pictures_follow_a_font_zoom() {
         // Kitty and Ghostty size a placeholder picture from its pixel size and the
         // current cell size, so a picture made for the old font would be cropped or
@@ -1141,7 +1235,9 @@ mod tests {
 
         run.result.expect("loop ends cleanly");
         assert_eq!(run.unused_steps, 0);
-        assert_eq!(run.draws, 5, "one draw before every batch");
+        // One draw before every batch, and one before each key that follows another key
+        // in its batch (`e`, `4` and Enter after `/`).
+        assert_eq!(run.draws, 8);
         assert!(app.should_quit());
         assert_eq!(app.mode(), Mode::HumanVsHuman);
         assert_eq!(uci_moves(app.game()), ["e2e4"]);
@@ -1180,6 +1276,95 @@ mod tests {
         run.result.expect("loop ends cleanly");
         assert_eq!(app.screen(), Screen::Playing);
         assert_eq!(app.mode(), Mode::HumanVsHuman);
+    }
+
+    #[test]
+    fn a_click_after_a_key_in_the_same_batch_hits_the_new_layout() {
+        // `1` leaves the menu for the board; clicks that came in with it must be
+        // hit-tested against the board, not against the menu drawn before the batch.
+        let mut probe = new_app();
+        let _ = probe.handle(key(KeyCode::Char('1')), Instant::now());
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        terminal
+            .draw(|frame| probe.render(frame, Instant::now()))
+            .expect("probe draw");
+        let board = probe.hit_map().board.expect("the board is drawn at 80x24");
+        let middle = |square: &str| {
+            let rect = board::square_rect(&board, square.parse().expect("square"));
+            (rect.x + rect.width / 2, rect.y + rect.height / 2)
+        };
+        let (e2, e4) = (middle("e2"), middle("e4"));
+        let click = |(x, y): (u16, u16)| {
+            [
+                mouse(MouseEventKind::Down(MouseButton::Left), x, y),
+                mouse(MouseEventKind::Up(MouseButton::Left), x, y),
+            ]
+        };
+        let mut batch = chars("1");
+        batch.extend(click(e2));
+        batch.extend(click(e4));
+
+        let mut app = new_app();
+        let run = drive(
+            &mut app,
+            &AtomicI32::new(0),
+            vec![Step::Events(batch), Step::Signal],
+        );
+        run.result.expect("loop ends cleanly");
+        assert_eq!(app.mode(), Mode::HumanVsHuman);
+        assert_eq!(uci_moves(app.game()), ["e2e4"]);
+        // The draw before the batch, one before each mouse event (the key changed the
+        // screen, and each press or release may), and the one before the next batch.
+        assert_eq!(run.draws, 6);
+    }
+
+    #[test]
+    fn a_key_after_a_resize_in_the_same_batch_sees_the_new_size() {
+        // The terminal is too small at the first draw, then grows; the resize and the key
+        // come in one batch. The key must be handled as the new size allows, not ignored
+        // as the draw before the batch left it.
+        let mut app = new_app();
+        let mut terminal = Terminal::new(TestBackend::new(50, 15)).expect("test terminal");
+        let mut draws = 0;
+        let mut batches = VecDeque::from([
+            vec![
+                AppEvent::Term(Event::Resize(80, 24)),
+                key(KeyCode::Char('1')),
+            ],
+            vec![
+                AppEvent::Term(Event::Resize(50, 15)),
+                key(KeyCode::Char('f')),
+            ],
+        ]);
+        let result = run_loop(
+            &mut app,
+            &AtomicI32::new(0),
+            |app| {
+                draws += 1;
+                if draws == 2 {
+                    terminal.backend_mut().resize(80, 24);
+                } else if draws == 4 {
+                    terminal.backend_mut().resize(50, 15);
+                }
+                terminal
+                    .draw(|frame| app.render(frame, Instant::now()))
+                    .map(drop)
+                    .map_err(|never: Infallible| match never {})
+            },
+            |_| match batches.pop_front() {
+                Some(batch) => Ok(batch),
+                None => Err(io::Error::other("script ended")),
+            },
+            |_| None,
+        );
+        assert_eq!(
+            result.expect_err("script ended").to_string(),
+            "script ended"
+        );
+        assert_eq!(app.screen(), Screen::Playing, "1 started a game at 80x24");
+        assert!(!app.flipped(), "f was ignored at 50x15");
+        // Before each batch, and before each key after its resize.
+        assert_eq!(draws, 5);
     }
 
     #[test]
@@ -1439,18 +1624,27 @@ mod tests {
         });
         let mut app = App::new(engine, GlyphSet::Solid, true, Vec::new()).with_home(None);
         let quit = AtomicI32::new(0);
+        // Human vs Jev as White: after e4 the engine is asked, and never answers. With a
+        // move played, `q` asks first, and `y` quits.
+        let mut command = vec![key(KeyCode::Char('/'))];
+        command.extend(chars("e4"));
+        command.push(key(KeyCode::Enter));
         let started = Instant::now();
         let run = drive(
             &mut app,
             &quit,
             vec![
-                Step::Events(chars("3")),
+                Step::Events(chars("2")),
+                Step::Events(command),
+                Step::Events(vec![key(KeyCode::Esc)]),
                 Step::Events(chars("q")),
                 Step::Events(chars("y")),
             ],
         );
         let took = started.elapsed();
         run.result.expect("loop ends cleanly");
+        assert_eq!(run.unused_steps, 0, "y answered the confirmation");
+        assert_eq!(uci_moves(app.game()), ["e2e4"]);
         assert!(app.should_quit());
         assert!(app.is_thinking(), "the engine never answered");
         assert_eq!(app.in_flight(), 1);

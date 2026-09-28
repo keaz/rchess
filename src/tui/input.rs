@@ -11,8 +11,8 @@ use super::glyphs::shorten;
 ///
 /// The cursor is a position between characters (Unicode scalar values), so non-ASCII input
 /// is safe everywhere. Control characters and invisible format characters (zero-width
-/// spaces and joiners, bidirectional overrides, byte-order marks, line separators) are
-/// never stored.
+/// spaces and joiners, bidirectional overrides, byte-order marks, line separators, soft
+/// hyphens) are never stored.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LineEditor {
     text: String,
@@ -61,18 +61,28 @@ impl LineEditor {
     /// Inserts pasted text at the cursor and moves the cursor past it.
     ///
     /// Blank lines at the start are skipped: a line copied from a terminal or an editor
-    /// often begins with the previous line's break. Control and invisible format characters
+    /// often begins with the previous line's break. A tab becomes a space (so a pasted
+    /// `:fen\t<FEN>` keeps its words apart); other control and invisible format characters
     /// are stripped. Insertion stops at the next line break (`\n`, `\r`, U+0085, U+2028 or
     /// U+2029); the rest of `text` is dropped. Returns `true` when that line break was seen,
     /// so the caller can submit the line. Text made only of blank lines inserts nothing and
-    /// returns `false`.
+    /// returns `true` when the editor already holds text (the paste is an Enter), else
+    /// `false`.
     pub fn insert_str(&mut self, text: &str) -> bool {
+        if text.contains(is_line_break) && text.chars().all(|c| c.is_whitespace() || is_ignored(c))
+        {
+            return !self.text.is_empty();
+        }
         let text = skip_blank_lines(text);
         let (line, saw_line_break) = match text.find(is_line_break) {
             Some(end) => (&text[..end], true),
             None => (text, false),
         };
-        let clean: String = line.chars().filter(|&c| !is_ignored(c)).collect();
+        let clean: String = line
+            .chars()
+            .map(|c| if c == '\t' { ' ' } else { c })
+            .filter(|&c| !is_ignored(c))
+            .collect();
         self.text.insert_str(self.cursor, &clean);
         self.cursor += clean.len();
         saw_line_break
@@ -152,18 +162,24 @@ fn skip_blank_lines(mut text: &str) -> &str {
 }
 
 /// Characters the editor never stores: C0/C1 controls, line and paragraph separators, and
-/// invisible format characters (zero-width space/joiners, bidi marks, embeddings, overrides
-/// and isolates, word joiner and invisible operators, byte-order mark). These would make
-/// the drawn text differ from the parsed text.
+/// invisible format characters (soft hyphen, combining grapheme joiner, Arabic letter mark,
+/// Mongolian vowel separator, zero-width space/joiners, bidi marks, embeddings, overrides
+/// and isolates, word joiner and invisible operators, byte-order mark, interlinear
+/// annotation marks). These would make the drawn text differ from the parsed text.
 fn is_ignored(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
-            '\u{200B}'..='\u{200F}'
+            '\u{00AD}'
+                | '\u{034F}'
+                | '\u{061C}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
                 | '\u{2028}'..='\u{202E}'
                 | '\u{2060}'..='\u{2064}'
                 | '\u{2066}'..='\u{2069}'
                 | '\u{FEFF}'
+                | '\u{FFF9}'..='\u{FFFB}'
         )
 }
 
@@ -427,12 +443,12 @@ mod tests {
         let mut e = LineEditor::new();
         assert!(!e.insert_str("\nlater"));
         assert_eq!(e.text(), "later");
-        // Only blank lines: nothing is inserted and nothing is submitted.
-        let mut e = editor("e4");
+        // Only blank lines into an empty editor: nothing is inserted or submitted.
+        let mut e = LineEditor::new();
         for blank in ["\n", "\r\n", " \n\t\n", "\u{2028}"] {
             assert!(!e.insert_str(blank), "{blank:?}");
         }
-        assert_eq!(e.text(), "e4");
+        assert_eq!(e.text(), "");
         // Leading spaces on the first real line are kept: they may separate words.
         let mut e = editor(":fen");
         assert!(!e.insert_str(" 8/8/8/8/8/8/8/K6k w - - 0 1"));
@@ -445,8 +461,47 @@ mod tests {
     fn insert_str_strips_control_characters() {
         let mut e = LineEditor::new();
         assert!(!e.insert_str("\x1b[31me2\te4\x07\u{200B}\u{FEFF}"));
-        assert_eq!(e.text(), "[31me2e4");
-        assert_eq!(e.cursor(), 8);
+        assert_eq!(e.text(), "[31me2 e4");
+        assert_eq!(e.cursor(), 9);
+    }
+
+    #[test]
+    fn a_pasted_tab_becomes_a_space() {
+        let mut e = LineEditor::new();
+        assert!(e.insert_str(":fen\t8/8/8/8/8/8/8/K6k\tw\t-\t-\t0\t1\n"));
+        assert_eq!(e.text(), ":fen 8/8/8/8/8/8/8/K6k w - - 0 1");
+        assert_eq!(
+            parse_command(e.text()),
+            Ok(Command::Fen("8/8/8/8/8/8/8/K6k w - - 0 1".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_paste_of_only_line_breaks_submits_the_text_in_the_editor() {
+        for blank in ["\n", "\r\n", "\n\n", " \n\t\n", "\u{2028}", "\u{200B}\r"] {
+            let mut e = editor("e4");
+            assert!(e.insert_str(blank), "{blank:?}");
+            assert_eq!(e.text(), "e4", "{blank:?}");
+            assert_eq!(e.cursor(), 2, "{blank:?}");
+        }
+        // Without a line break it is text to insert.
+        let mut e = editor("e4");
+        assert!(!e.insert_str(" "));
+        assert_eq!(e.text(), "e4 ");
+    }
+
+    #[test]
+    fn invisible_format_characters_are_ignored() {
+        for c in [
+            '\u{00AD}', '\u{034F}', '\u{061C}', '\u{180E}', '\u{FFF9}', '\u{FFFA}', '\u{FFFB}',
+        ] {
+            assert!(is_ignored(c), "{c:?}");
+            let mut e = LineEditor::new();
+            e.insert(c);
+            assert_eq!(e.text(), "", "{c:?}");
+            assert!(!e.insert_str(&format!("e{c}4")));
+            assert_eq!(e.text(), "e4", "{c:?}");
+        }
     }
 
     #[test]

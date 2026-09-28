@@ -62,8 +62,8 @@ pub const FILLERS: [&str; 7] = [
 /// Ends text cut short: a long Jev note, or echoed input (see [`shorten`]).
 pub const ELLIPSIS: &str = "…";
 
-/// Characters of echoed user input that [`shorten`] keeps.
-pub const ECHO_MAX_CHARS: usize = 24;
+/// Cells of echoed user input that [`shorten`] keeps.
+pub const ECHO_MAX_WIDTH: usize = 24;
 
 /// Environment variable that selects the starting glyph set.
 pub const GLYPHS_ENV: &str = "RCHESS_GLYPHS";
@@ -457,21 +457,39 @@ pub fn no_color(get: impl Fn(&str) -> Option<String>) -> bool {
 }
 
 /// Cells `c` takes on screen by ratatui's measure: 1 for most characters, 2 for
-/// wide ones such as `日`, 0 for combining marks and variation selectors.
+/// wide ones such as `日`, 0 for combining marks, variation selectors and control
+/// characters (ratatui's buffer drops those).
 pub fn char_width(c: char) -> usize {
+    if c.is_control() {
+        return 0;
+    }
     let mut buf = [0u8; 4];
     Span::raw(&*c.encode_utf8(&mut buf)).width()
 }
 
-/// User input to echo in a message: `text` itself when it has at most
-/// [`ECHO_MAX_CHARS`] characters, else its first [`ECHO_MAX_CHARS`] and
+/// User input to echo in a message: `text` itself when it is at most
+/// [`ECHO_MAX_WIDTH`] cells wide, else its longest start that is, followed by
 /// [`ELLIPSIS`]. Command-line arguments, commands and move text all go through it,
 /// so a pasted FEN or a stray paragraph never floods a one-line message.
+///
+/// Widths are [`char_width`]'s, except that a control character counts as the
+/// escape a message prints for it (`\u{1b}` is 6 cells), since echoed input is
+/// shown with `{:?}` where it may hold one. The cut is always made before a
+/// character that takes cells, so a base character keeps its combining marks.
 pub fn shorten(text: &str) -> String {
-    match text.char_indices().nth(ECHO_MAX_CHARS) {
-        Some((end, _)) => format!("{}{ELLIPSIS}", &text[..end]),
-        None => text.to_string(),
+    let mut used = 0;
+    for (end, c) in text.char_indices() {
+        let width = if c.is_control() {
+            c.escape_debug().count()
+        } else {
+            char_width(c)
+        };
+        if width > 0 && used + width > ECHO_MAX_WIDTH {
+            return format!("{}{ELLIPSIS}", &text[..end]);
+        }
+        used += width;
     }
+    text.to_string()
 }
 
 #[cfg(test)]
@@ -639,6 +657,46 @@ mod tests {
             assert_eq!(char_width(c), width, "{c:?}");
             assert_eq!(char_width(c), Span::raw(c.to_string()).width(), "{c:?}");
         }
+    }
+
+    #[test]
+    fn control_characters_take_no_cells() {
+        // ratatui's buffer drops them, so they must not count towards a width.
+        for c in ['\0', '\t', '\n', '\u{1b}', '\u{7f}', '\u{9b}'] {
+            assert_eq!(char_width(c), 0, "{c:?}");
+            let mut buf = Buffer::empty(Rect::new(0, 0, 3, 1));
+            buf.set_string(0, 0, format!("a{c}b"), Style::new());
+            assert_eq!(buf[(1, 0)].symbol(), "b", "{c:?} took a cell");
+        }
+    }
+
+    #[test]
+    fn shorten_cuts_by_cells_and_keeps_combining_marks() {
+        // Wide characters count two cells each.
+        assert_eq!(shorten(&"日".repeat(12)), "日".repeat(12));
+        assert_eq!(shorten(&"日".repeat(13)), format!("{}…", "日".repeat(12)));
+        assert_eq!(
+            shorten(&format!("x{}", "日".repeat(12))),
+            format!("x{}…", "日".repeat(11))
+        );
+        // A combining mark stays with its base character and takes no cell.
+        let accented = "e\u{301}";
+        assert_eq!(shorten(&accented.repeat(24)), accented.repeat(24));
+        assert_eq!(
+            shorten(&accented.repeat(30)),
+            format!("{}…", accented.repeat(24))
+        );
+        let marks = format!("{}\u{301}\u{302}", "x".repeat(24));
+        assert_eq!(shorten(&marks), marks);
+        assert_eq!(shorten(&format!("{marks}y")), format!("{marks}…"));
+        // A control character counts as the escape a message prints for it.
+        assert_eq!(
+            shorten(&"\u{1b}".repeat(10)),
+            format!("{}…", "\u{1b}".repeat(4))
+        );
+        assert_eq!(shorten(&"\n".repeat(20)), format!("{}…", "\n".repeat(12)));
+        let echoed = format!("{:?}", shorten(&"\u{1b}[2J".repeat(10)));
+        assert!(echoed.chars().count() <= 24 + 3, "{echoed}");
     }
 
     #[test]
