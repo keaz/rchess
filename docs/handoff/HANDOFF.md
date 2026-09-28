@@ -4,11 +4,11 @@ Read this first. Follow the protocol in section 8 of
 `docs/superpowers/specs/2026-09-26-rchess-redesign-design.md`.
 
 ## Current
-Sub-project: cleanup (spec section 10) | Plan: docs/superpowers/plans/2026-09-28-cleanup.md
-Branch: chore/cleanup (spec section 10 and the plan committed; no code yet). main has feat/tui-polish merged locally at f18dd32, not pushed.
-Last completed task: cleanup plan written from a reviewed, restructured prototype and replayed twice on a fresh clone (every patch applies, tests patches fail as stated, counts 614/621/641/658/684/687/687, clippy -D warnings clean, pty smoke green)
-Next task: user reviews the plan and picks an execution method; then cleanup task 1
-State: green (the three failing legacy tests were deleted in 20642e0)
+Sub-project: cleanup | Plan: docs/superpowers/plans/2026-09-28-cleanup.md
+Branch: chore/cleanup
+Last completed task: cleanup task 1 (Remove the legacy code and dependencies)
+Next task: cleanup task 2 (engine fixes)
+State: green
 
 ## Verify before continuing
 env -u JEV_API_KEY -u TYPESAFE_API_KEY INSTA_UPDATE=no cargo test --lib tui:: && env -u JEV_API_KEY -u TYPESAFE_API_KEY cargo test --lib engine::
@@ -208,6 +208,7 @@ Copied from the git-ignored SDD ledger (.superpowers/sdd/2026-09-27-tui-polish/p
 - None.
 
 ## Log (newest first)
+- 2026-09-28 cleanup task 1 done: Remove the legacy code and dependencies
 - 2026-09-28 cleanup plan written: 7 tasks as git patches from a prototype reviewed for correctness and plan readiness, history rebuilt so each task's tests fail first; spec section 10 amended with the review rulings
 - 2026-09-28 feat/tui-polish merged into main locally (f18dd32); merged result verified: tui:: 451, engine:: 112, whole crate only the 3 known old-code failures, pty smoke green
 - 2026-09-28 tui-polish complete: tasks 1-8 applied and reviewed, final five-lens review fixed (Kitty font zoom, dev-profile Sixel crates, handoff minors) and re-reviewed; awaiting the user's manual test and merge
