@@ -207,7 +207,12 @@ pub fn spawn_request(
     thread::Builder::new()
         .name(ENGINE_THREAD.to_string())
         .spawn(move || {
-            let outcome = run_engine(engine.as_ref(), &request.game, local_search_move);
+            let outcome = run_engine(
+                engine.as_ref(),
+                &request.game,
+                request.provider,
+                local_search_move,
+            );
             // A send error means the UI has gone; nobody is left to tell.
             let _ = tx.send(EngineReply::new(&request, outcome));
         })
@@ -227,7 +232,8 @@ pub fn is_current(reply: &EngineReply, generation: u64, hash: u64) -> bool {
 fn run_engine(
     engine: &dyn Engine,
     game: &Game,
-    fallback: fn(&Game, Instant) -> Option<ComputerMove>,
+    provider: Provider,
+    fallback: fn(&Game, Instant, Provider) -> Option<ComputerMove>,
 ) -> EngineOutcome {
     let started = Instant::now();
     // `ComputerPlayer<JevClient>` holds ureq state that is not `UnwindSafe`. After
@@ -239,7 +245,7 @@ fn run_engine(
         Err(payload) => panic_message("engine", payload.as_ref()),
     };
     log::warn!("{engine_panic}; falling back to local search");
-    match panic::catch_unwind(AssertUnwindSafe(|| fallback(game, started))) {
+    match panic::catch_unwind(AssertUnwindSafe(|| fallback(game, started, provider))) {
         Ok(Some(mv)) => EngineOutcome::Move(mv),
         Ok(None) => EngineOutcome::GameOver,
         Err(payload) => EngineOutcome::Failed(format!(
@@ -249,9 +255,10 @@ fn run_engine(
     }
 }
 
-/// The local search's best move for `game`, noted [`ENGINE_ERROR_NOTE`], or
+/// The local search's best move for `game`, credited to `provider` (the engine that
+/// panicked) and noted [`ENGINE_ERROR_NOTE`], or
 /// `None` when the game is over.
-fn local_search_move(game: &Game, started: Instant) -> Option<ComputerMove> {
+fn local_search_move(game: &Game, started: Instant, provider: Provider) -> Option<ComputerMove> {
     if game.outcome().is_some() {
         return None;
     }
@@ -260,7 +267,7 @@ fn local_search_move(game: &Game, started: Instant) -> Option<ComputerMove> {
         mv: best,
         san: game.position().to_san(best),
         source: MoveSource::Fallback,
-        provider: crate::engine::Provider::Jev,
+        provider,
         top: Vec::new(),
         confidence: None,
         model: None,
@@ -312,19 +319,22 @@ mod tests {
     }
 
     /// A fallback that panics like `panic!` with a message.
-    fn exploding_search(_: &Game, _: Instant) -> Option<ComputerMove> {
+    fn exploding_search(_: &Game, _: Instant, _: Provider) -> Option<ComputerMove> {
         panic!("search exploded")
     }
 
     /// A fallback that panics with a payload that is not a string.
-    fn exploding_search_silently(_: &Game, _: Instant) -> Option<ComputerMove> {
+    fn exploding_search_silently(_: &Game, _: Instant, _: Provider) -> Option<ComputerMove> {
         panic::panic_any(7_u8)
     }
 
     /// Runs `turn` with a fallback that panics too, and returns the failure text.
-    fn double_failure(turn: Turn, fallback: fn(&Game, Instant) -> Option<ComputerMove>) -> String {
+    fn double_failure(
+        turn: Turn,
+        fallback: fn(&Game, Instant, Provider) -> Option<ComputerMove>,
+    ) -> String {
         let engine = fake(turn);
-        match run_engine(engine.as_ref(), &Game::new(), fallback) {
+        match run_engine(engine.as_ref(), &Game::new(), Provider::Jev, fallback) {
             EngineOutcome::Failed(message) => message,
             other => panic!("expected Failed, got {other:?}"),
         }
@@ -478,10 +488,20 @@ mod tests {
     #[test]
     fn a_working_engine_never_reaches_the_fallback() {
         let engine = fake(Turn::Play("g1f3"));
-        let outcome = run_engine(engine.as_ref(), &Game::new(), exploding_search);
+        let outcome = run_engine(
+            engine.as_ref(),
+            &Game::new(),
+            Provider::Jev,
+            exploding_search,
+        );
         assert!(matches!(outcome, EngineOutcome::Move(ref mv) if mv.san == "Nf3"));
         let engine = fake(Turn::GameOver);
-        let outcome = run_engine(engine.as_ref(), &Game::new(), exploding_search);
+        let outcome = run_engine(
+            engine.as_ref(),
+            &Game::new(),
+            Provider::Jev,
+            exploding_search,
+        );
         assert_eq!(outcome, EngineOutcome::GameOver);
     }
 
@@ -649,5 +669,17 @@ mod tests {
         let request = EngineRequest::new(7, Game::new(), Provider::Laya);
         assert_eq!(request.provider, Provider::Laya);
         assert_eq!(request.generation, 7);
+    }
+
+    #[test]
+    fn a_laya_panic_falls_back_to_a_move_credited_to_laya() {
+        let engine = Arc::new(FakeEngine::laya().scripted([Turn::Panic("laya exploded")]));
+        let reply = round_trip(engine, EngineRequest::new(1, Game::new(), Provider::Laya));
+        let EngineOutcome::Move(mv) = reply.outcome else {
+            panic!("expected a move, got {:?}", reply.outcome);
+        };
+        assert_eq!(mv.source, MoveSource::Fallback);
+        assert_eq!(mv.note.as_deref(), Some(ENGINE_ERROR_NOTE));
+        assert_eq!(mv.provider, Provider::Laya);
     }
 }
