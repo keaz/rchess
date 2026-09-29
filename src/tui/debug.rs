@@ -44,7 +44,7 @@ pub const DEBUG_LOG_ENV: &str = "RCHESS_DEBUG_LOG";
 /// Exchanges kept for the view; older ones are dropped.
 pub const HISTORY_LEN: usize = 50;
 /// What the exchange view says before the first exchange.
-pub const NO_EXCHANGES: &str = "no Jev requests yet";
+pub const NO_EXCHANGES: &str = "no requests yet";
 
 /// Name of the thread that writes the log.
 const LOG_THREAD: &str = "debug-log";

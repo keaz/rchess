@@ -970,6 +970,16 @@ impl App {
         }
     }
 
+    /// What the menu rows call `provider`: its name, or `Jev (off)` / `Laya (off)` when
+    /// its model is off, so rows that differ only in which engine is off stay apart.
+    pub fn menu_name(&self, provider: Provider) -> &'static str {
+        match (provider, self.enabled(provider)) {
+            (_, true) => provider.name(),
+            (Provider::Jev, false) => "Jev (off)",
+            (Provider::Laya, false) => "Laya (off)",
+        }
+    }
+
     /// [`player_name`](Self::player_name) for titles without room:
     /// [`LOCAL_SEARCH_SHORT_NAME`] for the local search.
     pub fn player_short_name(&self, provider: Provider) -> &'static str {
@@ -2803,8 +2813,8 @@ mod tests {
     use crate::tui::graphics;
     use crate::tui::panels::HELP_LINES;
     use crate::tui::test_support::engine::{
-        FakeEngine, LAYA_LOCAL_NOTE, REPLY_TIMEOUT, SENTINEL_KEY, chord, jev_move, key, mouse,
-        paste, traced_jev_move,
+        FakeEngine, LAYA_LOCAL_NOTE, LOCAL_NOTE, REPLY_TIMEOUT, SENTINEL_KEY, chord, jev_move, key,
+        mouse, paste, traced_jev_move,
     };
     use crate::tui::test_support::harness::{Harness, request};
     use crate::tui::test_support::{PROMOTION_FEN, TempDir, buffer_text, game_from, key_event, sq};
@@ -4826,16 +4836,17 @@ mod tests {
 
     #[test]
     fn without_a_jev_key_the_computer_is_called_local_search() {
-        // The only "Jev" left on screen is the variable name in the engine status and the
-        // menu's computer toggle, which names the models.
+        // The only "Jev" left on screen is the variable name in the engine status, the
+        // menu's computer toggle, which names the models, and menu rows marking Jev off.
         let without_key = |text: String| {
             text.replace("JEV_API_KEY", "")
                 .replace("Computer:  Jev   Laya", "")
+                .replace("Jev (off)", "")
         };
         let mut h = Harness::sized(FakeEngine::local(), 120, 40);
         let menu = h.screen();
         assert!(!without_key(menu.clone()).contains("Jev"), "{menu}");
-        assert!(menu.contains("Human vs Local search: play White"));
+        assert!(menu.contains("Human vs Jev (off): play White"), "{menu}");
         for _ in 0..MENU_ITEMS.len() {
             h.press(KeyCode::Down);
             let screen = h.screen();
@@ -5328,7 +5339,10 @@ mod tests {
         assert_eq!(h.app.screen_name(), "game over");
         h.char('d');
         assert!(h.app.exchange_view().is_some(), "d opens the exchange view");
-        assert!(h.screen().contains("Jev exchange"));
+        assert!(
+            h.screen().contains(" Exchange "),
+            "Human vs Human names no model"
+        );
         h.press(KeyCode::Esc);
         assert_eq!(h.app.exchange_view(), None);
         assert_eq!(
@@ -5357,7 +5371,8 @@ mod tests {
         );
         let screen = h.screen();
         assert!(screen.contains("Jev exchange"), "{screen}");
-        assert!(screen.contains("no Jev requests yet"), "{screen}");
+        assert!(screen.contains("no requests yet"), "{screen}");
+        assert!(!screen.contains("no Jev requests"), "{screen}");
         assert!(!screen.contains("Board"), "the view covers the screen");
         assert!(h.app.hit_map().board.is_none());
         h.char('e');
@@ -6190,5 +6205,16 @@ mod tests {
         );
         h.click_hit(Hit::MenuComputer(Provider::Jev));
         assert_eq!(h.app.computer(), Provider::Jev);
+    }
+
+    #[test]
+    fn a_reply_from_a_jev_engine_that_is_off_is_the_local_search() {
+        let mut h = Harness::with_engines(FakeEngine::local(), FakeEngine::laya());
+        let _ = h.char('3');
+        h.reply("e2e4");
+        let computer = h.app.last_computer().expect("the computer moved");
+        assert_eq!(computer.source, MoveSource::Fallback);
+        assert_eq!(computer.note.as_deref(), Some(LOCAL_NOTE));
+        assert_eq!(computer.provider, Provider::Jev);
     }
 }

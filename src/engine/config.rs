@@ -168,7 +168,8 @@ impl EngineConfig {
                     && let Some(host) = clear_text_host(&url)
                 {
                     config.warnings.push(format!(
-                        "LAYA_API_KEY is sent unencrypted to {host}; use https"
+                        "LAYA_API_KEY is sent unencrypted to {}; use https",
+                        printable(&host, URL_WARNING_CHARS)
                     ));
                 }
                 config.endpoint = url;
@@ -244,7 +245,7 @@ fn has_userinfo(url: &str) -> bool {
 }
 
 /// The host of a plain `http://` URL that is not this machine (`localhost`,
-/// `127.0.0.1`, `[::1]`), lower-cased; `None` for `https://` or a local host.
+/// `127.0.0.1`, `[::1]`, `0.0.0.0`, `[::]`), lower-cased; `None` for `https://` or a local host.
 fn clear_text_host(url: &str) -> Option<String> {
     let rest = url
         .get(..7)?
@@ -258,7 +259,13 @@ fn clear_text_host(url: &str) -> Option<String> {
         host_port.split(':').next().unwrap_or("")
     };
     let host = host.to_ascii_lowercase();
-    (!matches!(host.as_str(), "localhost" | "127.0.0.1" | "[::1]")).then_some(host)
+    // `0.0.0.0` and `[::]` are what laya-serve binds; connecting to them reaches this
+    // machine.
+    (!matches!(
+        host.as_str(),
+        "localhost" | "127.0.0.1" | "[::1]" | "0.0.0.0" | "[::]"
+    ))
+    .then_some(host)
 }
 
 #[cfg(test)]
@@ -554,5 +561,34 @@ mod tests {
         }
         // An `@` after the host (in the path or query) is not userinfo.
         assert!(laya(&[("LAYA_URL", "http://gpu-box/v1/systemone?by=a@b")]).enabled());
+    }
+
+    #[test]
+    fn the_address_laya_serve_binds_counts_as_local() {
+        for url in [
+            "http://0.0.0.0:8000/v1/systemone",
+            "http://[::]:8000/v1/systemone",
+        ] {
+            let c = laya(&[("LAYA_URL", url), ("LAYA_API_KEY", "k")]);
+            assert!(c.enabled(), "{url}");
+            assert!(c.warnings.is_empty(), "{url}: {:?}", c.warnings);
+        }
+    }
+
+    #[test]
+    fn the_clear_text_warning_shows_a_printable_cut_host() {
+        let host = format!("h{}\u{1b}[2J", "o".repeat(90));
+        let url = format!("http://{host}/v1/systemone");
+        let c = laya(&[("LAYA_URL", &url), ("LAYA_API_KEY", "k")]);
+        let warning = &c.warnings[0];
+        assert!(
+            warning.starts_with("LAYA_API_KEY is sent unencrypted to h"),
+            "{warning}"
+        );
+        assert!(!warning.contains('\u{1b}'), "{warning:?}");
+        assert!(
+            !warning.contains(&"o".repeat(60)),
+            "cut to 60 characters: {warning}"
+        );
     }
 }

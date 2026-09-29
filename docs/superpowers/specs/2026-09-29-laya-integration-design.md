@@ -296,3 +296,8 @@ With `pip install "laya[serve]"` and `laya-serve` running:
   does not quote it: ureq would send it as a Basic credential the debug record does not show,
   and the URL is shown on the menu and in the log. `laya-serve` takes `LAYA_API_KEY` instead.
 - An engine-panic fallback move is credited to the engine that panicked.
+- Menu rows name a disabled engine `Jev (off)` / `Laya (off)` so rows that differ only in which
+  engine plays stay apart; game titles still say `Local search`. The exchange view says
+  `no requests yet` and is titled ` Exchange ` in a game without a computer.
+- The clear-text key warning treats `0.0.0.0` and `[::]` (laya-serve's bind addresses) as local
+  and cuts the host it quotes to 60 printable characters.

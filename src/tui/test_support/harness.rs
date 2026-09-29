@@ -11,9 +11,7 @@ use ratatui::crossterm::event::{
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind,
 };
 
-use super::engine::{
-    FakeEngine, chord, jev_exchange, jev_move, key, local_move_for, model_move, mouse,
-};
+use super::engine::{FakeEngine, chord, jev_exchange, key, local_move_for, model_move, mouse};
 use super::{TEST_DATE, buffer_text, uci_moves};
 use crate::core::{Color as Side, Game, Square};
 use crate::engine::{ComputerMove, Provider};
@@ -303,9 +301,9 @@ impl Harness {
         })
     }
 
-    /// Answers the latest engine request with its model playing `uci` (Jev's details for
-    /// a Jev request, the Laya fake's for a Laya one), after `adjust` changes how the move
-    /// was chosen.
+    /// Answers the latest engine request with `uci`, as the fake for its provider reports it
+    /// (the model's details, or the local search's when that fake is off), after `adjust`
+    /// changes how the move was chosen.
     pub(crate) fn reply_with(
         &mut self,
         uci: &str,
@@ -313,12 +311,16 @@ impl Harness {
     ) -> Vec<Action> {
         let request = self.request.take().expect("an engine request");
         let pos = request.game.position();
-        // Jev requests keep Jev's details whatever the fake; a Laya request is answered the
-        // way the Laya fake would answer it.
-        let mut computer = match request.provider {
-            Provider::Jev => jev_move(pos, uci),
-            Provider::Laya if self.laya.enabled() => model_move(pos, uci, Provider::Laya),
-            Provider::Laya => local_move_for(pos, uci, Provider::Laya),
+        // Answered the way the fake for the request's provider would answer it: the model's
+        // details when it is on, the local search's move and note when it is off.
+        let fake = match request.provider {
+            Provider::Jev => &self.engine,
+            Provider::Laya => &self.laya,
+        };
+        let mut computer = if fake.enabled() {
+            model_move(pos, uci, request.provider)
+        } else {
+            local_move_for(pos, uci, request.provider)
         };
         adjust(&mut computer);
         self.answer(&request, EngineOutcome::Move(computer))

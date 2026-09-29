@@ -5,10 +5,10 @@ Read this first. Follow the protocol in section 8 of
 
 ## Current
 Sub-project: laya done (Laya as a second computer player; spec docs/superpowers/specs/2026-09-29-laya-integration-design.md)
-Branch: main (feat/laya merged locally at bc33854 and deleted; not pushed — main is ahead of origin/main)
-Last completed task: all 8 plan tasks, plus the final-review fix pass (panic fallback provider, LAYA_URL userinfo rejected)
-Next task: manual test below with a real laya-serve (incl. the `model` field check); push main so CI runs. Deferred minors: identical watch rows when both engines are off; "no Jev requests yet" under a Laya exchange title; clear-text warning host not sanitized; 0.0.0.0 counted as remote; harness reply_with answers disabled-Jev requests with jev_move
-State: green (cargo test 730 passed / 4 ignored, fmt, clippy, pty smoke ALL CHECKS PASSED)
+Branch: main (feat/laya merged at bc33854 and pushed; fix/laya-minors merged on top)
+Last completed task: laya deferred minors fixed (menu "(off)" labels, exchange view wording, clear-text warning host, 0.0.0.0 local, harness disabled-Jev replies)
+Next task: manual test below with a real laya-serve (incl. the `model` field check); push main so CI runs
+State: green (cargo test 735 passed / 4 ignored, fmt, clippy, pty smoke ALL CHECKS PASSED)
 Earlier: main is ahead of origin/main (not pushed); pushing it is still pending.
 
 ## Verify before continuing
