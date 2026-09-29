@@ -4,11 +4,12 @@ Read this first. Follow the protocol in section 8 of
 `docs/superpowers/specs/2026-09-26-rchess-redesign-design.md`.
 
 ## Current
-Sub-project: none in progress (core, engine, tui, tui-polish and cleanup are done)
-Branch: main (chore/cleanup merged locally at ab2383e; not pushed — main is ahead of origin/main; origin/chore/cleanup is an older copy at 7ddb5b2)
-Last completed task: cleanup sub-project merged (all 7 tasks, final review fixed and re-reviewed)
-Next task: push main to GitHub so the new CI (Ubuntu + macOS: fmt, clippy, build, test) runs; the follow-ups below are optional
-State: green (cargo test fully green, fmt and clippy -D warnings clean, pty smoke green locally)
+Sub-project: laya (Laya as a second computer player; Jev vs Laya) | Spec: docs/superpowers/specs/2026-09-29-laya-integration-design.md
+Branch: feat/laya (from main at fe1eb73)
+Last completed task: spec written and committed; waiting for the user's review of the spec
+Next task: after spec approval, write the plan (docs/superpowers/plans/2026-09-29-laya.md) with superpowers:writing-plans
+State: green (no code changed yet)
+Earlier: main is ahead of origin/main (not pushed); pushing it is still pending.
 
 ## Verify before continuing
 env -u JEV_API_KEY -u TYPESAFE_API_KEY INSTA_UPDATE=no cargo test
