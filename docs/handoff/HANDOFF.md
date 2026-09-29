@@ -7,7 +7,7 @@ Read this first. Follow the protocol in section 8 of
 Sub-project: laya done (Laya as a second computer player; spec docs/superpowers/specs/2026-09-29-laya-integration-design.md)
 Branch: main (feat/laya merged at bc33854 and pushed; fix/laya-minors merged on top)
 Last completed task: repetition guard: moves back to an earlier position are left off the model shortlist unless the side is worse (Laya was drawing by threefold repetition within 15 plies on every checkpoint)
-Next task: manual test below with a real laya-serve (incl. the `model` field check); push main so CI runs
+Next task: none required. Decision (2026-09-29): Laya's aimless shuffling in Laya vs Laya is a model limitation; the implementation is not changed further to make Laya play better (Jev is the strong player). Rules verified: a 222-move Laya vs Laya game ended by a genuine threefold repetition, with no position reaching three occurrences earlier.
 State: green (cargo test 737 passed / 4 ignored, fmt, clippy, pty smoke ALL CHECKS PASSED)
 Earlier: main is ahead of origin/main (not pushed); pushing it is still pending.
 
