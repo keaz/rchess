@@ -12,8 +12,8 @@
 //! sized for the largest board that fits beside the narrowest side column
 //! ([`SIDE_MIN_WIDTH`]) with squares shaped for the font ([`App::cell_size`]), and the
 //! Command box under it. The right column takes every column left over and stacks Status,
-//! the computer's panel (titled "Jev" or "Local search", only in games against the
-//! computer), Moves and Captured with shared borders. A board limited by the width is
+//! the computer's panel (titled "Jev", "Laya" or "Local search", only in games against
+//! the computer), Moves and Captured with shared borders. A board limited by the width is
 //! centred vertically in its block, which still fills the column.
 //!
 //! Status and Captured have fixed heights (Status per mode and terminal height), so they
@@ -50,16 +50,16 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Padding, Paragraph, Wrap};
 
 use super::app::{
-    App, Button, Dialog, GAME_OVER_BUTTONS, Hit, HitMap, InputPurpose, MENU_ITEMS, MenuItem,
-    Message, Mode, PROMOTION_CHOICES, Question, Screen, SidePick, TOO_SMALL, WAITING_FOR_ENGINE,
-    is_too_small, move_rows, outcome_text,
+    App, Button, Dialog, GAME_OVER_BUTTONS, Hit, HitMap, InputPurpose, LOCAL_SEARCH_NAME,
+    MENU_ITEMS, MenuItem, Message, Mode, PROMOTION_CHOICES, Question, Screen, SidePick, TOO_SMALL,
+    WAITING_FOR_ENGINE, is_too_small, move_rows, outcome_text,
 };
 use super::board::{BoardGeometry, BoardView, CellSize, PieceImages, layout_board};
 use super::debug::{BodyCache, BodyRows, ExchangeView, LineKind, NO_EXCHANGES, Record};
 use super::glyphs::{self, ELLIPSIS, GlyphSet, Palette, char_width};
 use super::input::LineEditor;
 use crate::core::{Color as Side, Game, Piece, PieceKind, Position as ChessPosition};
-use crate::engine::{ComputerMove, MoveSource};
+use crate::engine::{ComputerMove, MoveSource, Provider};
 
 /// The help dialog's text. The first [`HELP_KEY_WIDTH`] characters of each line are the
 /// key column (drawn bold); no line is wider than 56 cells, so the dialog fits a 60-column
@@ -195,7 +195,7 @@ fn menu(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap) {
     let width = MENU_WIDTH.min(area.width);
     let text_width = width.saturating_sub(2 + 2 * MENU_PADDING);
     let index = app.menu_index().min(MENU_ITEMS.len() - 1);
-    let computer = app.computer_name();
+    let computer = app.player_name(Provider::Jev);
     let about = menu_description(MENU_ITEMS[index], computer);
     let about_rows = wrapped_height(&about, text_width);
     let notes = menu_notes(app);
@@ -360,8 +360,8 @@ const WARNING_MARKER: &str = "! ";
 fn menu_notes(app: &App) -> Vec<Note> {
     let mut notes = vec![Note {
         marker: "",
-        text: app.engine_status().to_string(),
-        style: if app.uses_jev() {
+        text: app.engine_status(Provider::Jev).to_string(),
+        style: if app.enabled(Provider::Jev) {
             Style::new().green()
         } else {
             Style::new().yellow()
@@ -414,14 +414,14 @@ fn side_text_width(area: Rect, cell: CellSize) -> u16 {
     side_width.saturating_sub(SIDE_CHROME_WIDTH)
 }
 
-/// Text rows of the Status panel: whose turn, the Jev vs Jev pace line, the thinking line
+/// Text rows of the Status panel: whose turn, the watching pace line, the thinking line
 /// and a message that may wrap once. Fixed per mode and height, so the panels below never
 /// jump when a message comes or goes.
 fn status_rows(mode: Mode, height: u16) -> u16 {
     let roomy = height >= 24;
     match (mode, roomy) {
-        (Mode::JevVsJev, true) => 5,
-        (Mode::JevVsJev, false) | (_, true) => 4,
+        (Mode::Watch { .. }, true) => 5,
+        (Mode::Watch { .. }, false) | (_, true) => 4,
         (_, false) => 3,
     }
 }
@@ -485,8 +485,8 @@ fn playing(
     drawn: &mut Drawn,
 ) {
     let text_width = side_text_width(area, app.cell_size());
-    let jev = (app.mode() != Mode::HumanVsHuman)
-        .then(|| JevText::new(app.last_computer(), app.engine_status(), text_width));
+    let panel = app.panel_provider();
+    let jev = panel.map(|p| JevText::new(app.last_computer(), app.engine_status(p), text_width));
     let layout = playing_layout(
         area,
         app.cell_size(),
@@ -502,8 +502,8 @@ fn playing(
     );
     drawn.hits.push(layout.command, Hit::CommandBox);
     status_panel(frame, layout.status, app, now);
-    if let (Some(rect), Some(jev)) = (layout.jev, jev) {
-        let block = side_block(app.computer_name());
+    if let (Some(rect), Some(jev), Some(provider)) = (layout.jev, jev, panel) {
+        let block = side_block(app.player_name(provider));
         let rows = block.inner(rect).height;
         side_panel(frame, rect, block, jev.into_lines(rows));
     }
@@ -669,7 +669,7 @@ fn status_lines(
     }
     spans.push(Span::styled(turn_text, turn_style));
     let mut lines = vec![Line::from(spans)];
-    if app.mode() == Mode::JevVsJev && game.outcome().is_none() {
+    if app.mode().is_watch() && game.outcome().is_none() {
         let pace = if app.paused() {
             "paused · space resumes".to_string()
         } else {
@@ -681,7 +681,11 @@ fn status_lines(
         lines.push(Line::from(pace).dim());
     }
     if let Some(thinking) = app.thinking(now) {
-        let (spinner, computer) = (thinking.spinner, app.computer_name());
+        let spinner = thinking.spinner;
+        let computer = app
+            .mode()
+            .player(game.position().side_to_move())
+            .map_or(LOCAL_SEARCH_NAME, |p| app.player_name(p));
         let seconds = thinking.elapsed.as_secs_f32();
         let full = format!("{spinner} {computer} thinking... {seconds:.1}s");
         let brief = format!("{spinner} {computer}... {seconds:.1}s");
@@ -1749,13 +1753,14 @@ mod tests {
 
     use super::*;
     use crate::core::{START_FEN, Square};
+    use crate::engine::Provider;
     use crate::tui::board::{image_area, square_at, square_rect};
     use crate::tui::debug::{BodyCache, DebugLog, NO_LOG_PATH};
     use crate::tui::event::AppEvent;
     use crate::tui::glyphs::{ImageSupport, initial_glyphs};
     use crate::tui::graphics::picker_for;
     use crate::tui::test_support::engine::{FakeEngine, JEV_STATUS, traced_jev_move};
-    use crate::tui::test_support::harness::Harness;
+    use crate::tui::test_support::harness::{Harness, request};
     use crate::tui::test_support::{PROMOTION_FEN, game_from, sq};
     use crate::tui::worker::EngineOutcome;
     use crate::tui::worker::LOCAL_SEARCH_STATUS;
@@ -1914,7 +1919,13 @@ mod tests {
                     let at = format!("{width}x{height} font={font:?} jev={with_jev}");
                     let area = Rect::new(0, 0, width, height);
                     let (mode, jev_rows) = if with_jev {
-                        (Mode::JevVsJev, Some(40))
+                        (
+                            Mode::Watch {
+                                white: Provider::Jev,
+                                black: Provider::Jev,
+                            },
+                            Some(40),
+                        )
                     } else {
                         (Mode::HumanVsHuman, None)
                     };
@@ -1997,7 +2008,7 @@ mod tests {
         let rows = status_rows(h.app.mode(), area.height);
         let jev = JevText::new(
             None,
-            h.app.engine_status(),
+            h.app.engine_status(Provider::Jev),
             side_text_width(area, h.app.cell_size()),
         );
         let l = playing_layout(area, h.app.cell_size(), rows, Some(jev.rows()));
@@ -2083,7 +2094,13 @@ mod tests {
     #[test]
     fn the_jev_panel_grows_with_its_text_and_moves_gives_way() {
         let area = Rect::new(0, 0, 80, 24);
-        let rows = status_rows(Mode::HumanVsJev { human: Side::White }, 24);
+        let rows = status_rows(
+            Mode::HumanVsComputer {
+                human: Side::White,
+                computer: Provider::Jev,
+            },
+            24,
+        );
         let short = playing_layout(area, CellSize::DEFAULT, rows, Some(1));
         let long = playing_layout(area, CellSize::DEFAULT, rows, Some(6));
         assert_eq!(short.jev.expect("jev").height, JEV_MIN_ROWS + 2);
@@ -3270,5 +3287,29 @@ mod tests {
                 "{protocol:?}: the help covers no picture partly"
             );
         }
+    }
+
+    #[test]
+    fn jev_vs_laya_titles_and_panels_name_both() {
+        let mut h = Harness::with_engines(FakeEngine::jev(), FakeEngine::laya());
+        h.start(Mode::Watch {
+            white: Provider::Jev,
+            black: Provider::Laya,
+        });
+        let _ = request(&h.tick());
+        assert!(h.screen().contains("Jev thinking"), "{}", h.screen());
+        h.reply("e2e4");
+        h.at_ms(5_000);
+        let _ = request(&h.tick());
+        assert!(h.screen().contains("Laya thinking"), "{}", h.screen());
+        h.reply("e7e5");
+        assert!(
+            status_title(&h).contains(" Jev vs Laya "),
+            "{}",
+            status_title(&h)
+        );
+        let panel = panel_text(&h, "Laya");
+        assert!(panel.contains("played e5"), "{panel:?}");
+        assert!(panel.contains("laya-test"), "{panel:?}");
     }
 }

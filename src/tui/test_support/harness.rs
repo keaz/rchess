@@ -11,11 +11,13 @@ use ratatui::crossterm::event::{
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind,
 };
 
-use super::engine::{FakeEngine, chord, jev_exchange, jev_move, key, mouse};
+use super::engine::{
+    FakeEngine, chord, jev_exchange, jev_move, key, local_move_for, model_move, mouse,
+};
 use super::{TEST_DATE, buffer_text, uci_moves};
-use crate::core::{Color as Side, Square};
-use crate::engine::ComputerMove;
-use crate::tui::app::{Action, App, Hit};
+use crate::core::{Color as Side, Game, Square};
+use crate::engine::{ComputerMove, Provider};
+use crate::tui::app::{Action, App, Hit, Mode};
 use crate::tui::board::square_rect;
 use crate::tui::event::AppEvent;
 use crate::tui::glyphs::GlyphSet;
@@ -32,6 +34,8 @@ pub(crate) struct Harness {
     pub(crate) app: App,
     /// The engine the app was built with.
     pub(crate) engine: Arc<FakeEngine>,
+    /// The Laya engine the app was built with.
+    pub(crate) laya: Arc<FakeEngine>,
     /// What the app drew last.
     pub(crate) terminal: Terminal<TestBackend>,
     /// The time the harness started.
@@ -58,23 +62,54 @@ impl Harness {
         Harness::build(engine, (width, height), Vec::new(), |app| app)
     }
 
-    /// A `width`×`height` app with `engine` and startup `warnings`, changed by `configure`
-    /// before the first draw.
+    /// A `width`×`height` app with `engine` (Jev), a Laya engine without `LAYA_URL` and
+    /// startup `warnings`, changed by `configure` before the first draw.
     pub(crate) fn build(
         engine: FakeEngine,
+        size: (u16, u16),
+        warnings: Vec<String>,
+        configure: impl FnOnce(App) -> App,
+    ) -> Harness {
+        Harness::build_with(engine, FakeEngine::local_laya(), size, warnings, configure)
+    }
+
+    /// An 80×24 app on the menu with `jev` and `laya`.
+    pub(crate) fn with_engines(jev: FakeEngine, laya: FakeEngine) -> Harness {
+        Harness::build_with(jev, laya, (80, 24), Vec::new(), |app| app)
+    }
+
+    /// Starts `mode` on a new game, as a menu row would, and draws.
+    pub(crate) fn start(&mut self, mode: Mode) {
+        self.app.start_for_test(mode, Game::new());
+        self.draw();
+    }
+
+    /// A `width`×`height` app with `jev`, `laya` and startup `warnings`, changed by
+    /// `configure` before the first draw.
+    pub(crate) fn build_with(
+        jev: FakeEngine,
+        laya: FakeEngine,
         (width, height): (u16, u16),
         warnings: Vec<String>,
         configure: impl FnOnce(App) -> App,
     ) -> Harness {
-        let engine = Arc::new(engine);
-        let app = App::new(engine.clone(), GlyphSet::Solid, true, warnings)
-            .with_home(None)
-            .with_date(|| TEST_DATE.to_string())
-            .with_side_picker(|| Side::White);
+        let engine = Arc::new(jev);
+        let laya = Arc::new(laya);
+        let app = App::new(
+            engine.clone(),
+            laya.clone(),
+            GlyphSet::Solid,
+            true,
+            warnings,
+        )
+        .with_home(None)
+        .with_date(|| TEST_DATE.to_string())
+        .with_side_picker(|| Side::White);
         let t0 = Instant::now();
         let mut harness = Harness {
             app: configure(app),
             engine,
+            laya,
             terminal: Terminal::new(TestBackend::new(width, height)).expect("test terminal"),
             t0,
             now: t0,
@@ -228,7 +263,11 @@ impl Harness {
 
     /// What the fake engine answers to `request`, computed on this thread.
     pub(crate) fn reply_for(&self, request: &EngineRequest) -> EngineReply {
-        let outcome = match self.engine.choose(&request.game) {
+        let engine = match request.provider {
+            Provider::Jev => &self.engine,
+            Provider::Laya => &self.laya,
+        };
+        let outcome = match engine.choose(&request.game) {
             Some(computer) => EngineOutcome::Move(computer),
             None => EngineOutcome::GameOver,
         };
@@ -264,15 +303,23 @@ impl Harness {
         })
     }
 
-    /// Answers the latest engine request with Jev playing `uci`, after `adjust` changes how
-    /// the move was chosen.
+    /// Answers the latest engine request with its model playing `uci` (Jev's details for
+    /// a Jev request, the Laya fake's for a Laya one), after `adjust` changes how the move
+    /// was chosen.
     pub(crate) fn reply_with(
         &mut self,
         uci: &str,
         adjust: impl FnOnce(&mut ComputerMove),
     ) -> Vec<Action> {
         let request = self.request.take().expect("an engine request");
-        let mut computer = jev_move(request.game.position(), uci);
+        let pos = request.game.position();
+        // Jev requests keep Jev's details whatever the fake; a Laya request is answered the
+        // way the Laya fake would answer it.
+        let mut computer = match request.provider {
+            Provider::Jev => jev_move(pos, uci),
+            Provider::Laya if self.laya.enabled() => model_move(pos, uci, Provider::Laya),
+            Provider::Laya => local_move_for(pos, uci, Provider::Laya),
+        };
         adjust(&mut computer);
         self.answer(&request, EngineOutcome::Move(computer))
     }

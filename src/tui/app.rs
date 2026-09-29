@@ -18,8 +18,8 @@
 //! the command box and the text dialogs Alt chords are ignored, so readline habits (Alt+B,
 //! Alt+F, ...) neither change the text nor reach the board.
 //!
-//! The computer player is called "Jev" when the engine uses Jev ([`Engine::uses_jev`]) and
-//! "Local search" otherwise, in every label, message and saved PGN.
+//! The computer players are called "Jev" and "Laya" when their models are available
+//! ([`Engine::enabled`]) and "Local search" otherwise, in every label, message and saved PGN.
 //!
 //! Mouse events are hit-tested against the [`HitMap`] recorded by the most recent
 //! [`App::render`], so a click before the first draw does nothing. Drawing lives in
@@ -107,7 +107,7 @@ pub const LOCAL_SEARCH_NAME: &str = "Local search";
 /// [`LOCAL_SEARCH_NAME`] in the brief mode titles, where there is no room for it.
 pub const LOCAL_SEARCH_SHORT_NAME: &str = "Local";
 
-/// Jev vs Jev pauses between moves, shortest first. `-` and `+` step through them.
+/// Pauses between moves while watching, shortest first. `-` and `+` step through them.
 pub const STEP_DELAYS: [Duration; 10] = [
     Duration::from_millis(200),
     Duration::from_millis(300),
@@ -120,7 +120,7 @@ pub const STEP_DELAYS: [Duration; 10] = [
     Duration::from_millis(4000),
     Duration::from_millis(5000),
 ];
-/// Jev vs Jev pause between moves when a game starts.
+/// Pause between moves while watching, when a game starts.
 pub const DEFAULT_STEP_DELAY: Duration = Duration::from_secs(1);
 
 /// Promotion picker order; `q`, `r`, `b` and `n` pick directly.
@@ -168,45 +168,70 @@ pub const fn is_too_small(area: Rect) -> bool {
 pub enum Mode {
     /// Two people share the keyboard and mouse.
     HumanVsHuman,
-    /// The person plays `human`; the computer (Jev or the local search) plays the other.
-    HumanVsJev {
+    /// The person plays `human`; `computer` (or the local search, when it is off) plays
+    /// the other side.
+    HumanVsComputer {
         /// The person's side.
         human: Side,
+        /// Who plays the other side.
+        computer: Provider,
     },
     /// The computer plays both sides; the person watches.
-    JevVsJev,
+    Watch {
+        /// Who plays White.
+        white: Provider,
+        /// Who plays Black.
+        black: Provider,
+    },
 }
 
 impl Mode {
-    /// True when the engine plays `side` in this mode.
-    pub fn engine_plays(self, side: Side) -> bool {
+    /// The provider that plays `side`, or `None` when a person does.
+    pub fn player(self, side: Side) -> Option<Provider> {
         match self {
-            Mode::HumanVsHuman => false,
-            Mode::HumanVsJev { human } => side != human,
-            Mode::JevVsJev => true,
+            Mode::HumanVsHuman => None,
+            Mode::HumanVsComputer { human, computer } => (side != human).then_some(computer),
+            Mode::Watch { white, black } => Some(if side == Side::White { white } else { black }),
         }
     }
 
-    /// A short label with the computer called `computer`: `Human vs Human`,
-    /// `You (White) vs Jev` or `Local search vs Local search`.
-    pub fn label(self, computer: &str) -> String {
+    /// True when the engine plays `side` in this mode.
+    pub fn engine_plays(self, side: Side) -> bool {
+        self.player(side).is_some()
+    }
+
+    /// True when the computer plays both sides.
+    pub const fn is_watch(self) -> bool {
+        matches!(self, Mode::Watch { .. })
+    }
+
+    /// A short label with each computer called `name(provider)`: `Human vs Human`,
+    /// `You (White) vs Laya` or `Jev vs Laya`.
+    pub fn label(self, name: impl Fn(Provider) -> &'static str) -> String {
         match self {
             Mode::HumanVsHuman => "Human vs Human".to_string(),
-            Mode::HumanVsJev { human } => format!("You ({human}) vs {computer}"),
-            Mode::JevVsJev => format!("{computer} vs {computer}"),
+            Mode::HumanVsComputer { human, computer } => {
+                format!("You ({human}) vs {}", name(computer))
+            }
+            Mode::Watch { white, black } => format!("{} vs {}", name(white), name(black)),
         }
     }
 
     /// Labels to try in turn until one fits, longest first: [`label`](Self::label), then
-    /// briefer forms with the computer called `short`. Human vs computer as White gives
-    /// `You (White) vs Local search`, `You (W) vs Local`, `W You · B Local`; watching
-    /// gives `Local search vs Local search`, `Local vs Local`. No label repeats, so with
-    /// Jev watching is just `Jev vs Jev`.
-    pub fn labels(self, computer: &str, short: &str) -> Vec<String> {
-        let mut labels = vec![self.label(computer)];
+    /// briefer forms with each computer called `short(provider)`. Human vs computer as
+    /// White gives `You (White) vs Local search`, `You (W) vs Local`, `W You · B Local`;
+    /// watching gives `Local search vs Laya`, `Local vs Laya`. No label repeats, so
+    /// `Jev vs Jev` has one.
+    pub fn labels(
+        self,
+        name: impl Fn(Provider) -> &'static str,
+        short: impl Fn(Provider) -> &'static str,
+    ) -> Vec<String> {
+        let mut labels = vec![self.label(&name)];
         match self {
             Mode::HumanVsHuman => {}
-            Mode::HumanVsJev { human } => {
+            Mode::HumanVsComputer { human, computer } => {
+                let short = short(computer);
                 let initial = |side: Side| if side == Side::White { 'W' } else { 'B' };
                 let (white, black) = if human == Side::White {
                     ("You", short)
@@ -216,7 +241,9 @@ impl Mode {
                 labels.push(format!("You ({}) vs {short}", initial(human)));
                 labels.push(format!("W {white} · B {black}"));
             }
-            Mode::JevVsJev => labels.push(format!("{short} vs {short}")),
+            Mode::Watch { white, black } => {
+                labels.push(format!("{} vs {}", short(white), short(black)));
+            }
         }
         labels.dedup();
         labels
@@ -599,6 +626,25 @@ pub struct Thinking {
     pub spinner: &'static str,
 }
 
+/// One engine with what the UI reads from it once.
+struct EngineSlot {
+    engine: Arc<dyn Engine>,
+    /// [`Engine::status`].
+    status: String,
+    /// [`Engine::enabled`]: names the player after its model or "Local search".
+    enabled: bool,
+}
+
+impl EngineSlot {
+    fn new(engine: Arc<dyn Engine>) -> EngineSlot {
+        EngineSlot {
+            status: engine.status(),
+            enabled: engine.enabled(),
+            engine,
+        }
+    }
+}
+
 /// The request in flight for the current generation.
 #[derive(Clone, Copy, Debug)]
 struct Pending {
@@ -624,10 +670,9 @@ struct Drag {
 
 /// The whole TUI state. See the [module documentation](self).
 pub struct App {
-    engine: Arc<dyn Engine>,
-    engine_status: String,
-    /// [`Engine::uses_jev`], read once: names the computer "Jev" or "Local search".
-    uses_jev: bool,
+    /// The Jev engine and the Laya engine.
+    jev: EngineSlot,
+    laya: EngineSlot,
     warnings: Vec<String>,
     palette: Palette,
     /// The terminal shows no colour (`NO_COLOR`): the board marks highlights with text too.
@@ -681,13 +726,13 @@ pub struct App {
     /// The worker produced no move; no request is sent until space retries or the
     /// position changes.
     engine_failed: bool,
-    /// Jev vs Jev is paused: no request is sent and no move is played.
+    /// Watching is paused: no request is sent and no move is played.
     paused: bool,
     /// An answer that arrived while paused, applied when play resumes, with the number of
     /// its Jev exchange, kept (marked held) and logged when it arrived.
     held: Option<(EngineOutcome, Option<u64>)>,
     step_delay: Duration,
-    /// When the last Jev vs Jev move was applied; the next request is due one step
+    /// When the last move while watching was applied; the next request is due one step
     /// delay later. `None` means due now.
     step_anchor: Option<Instant>,
 
@@ -700,27 +745,30 @@ pub struct App {
 impl App {
     /// A new app on the menu screen.
     ///
-    /// `warnings` are startup notes (such as an unknown `--glyphs` value); the engine's own
-    /// [`Engine::warnings`] are added here, so callers must not pass them again (duplicates
-    /// are dropped). `HOME` is read once, for `~` in save paths.
+    /// `warnings` are startup notes (such as an unknown `--glyphs` value); the engines' own
+    /// [`Engine::warnings`] are added here (Jev's, then Laya's), so callers must not pass
+    /// them again (duplicates are dropped). `HOME` is read once, for `~` in save paths.
     pub fn new(
-        engine: Arc<dyn Engine>,
+        jev: Arc<dyn Engine>,
+        laya: Arc<dyn Engine>,
         glyphs: GlyphSet,
         truecolor: bool,
         warnings: Vec<String>,
     ) -> App {
-        let engine_status = engine.status();
-        let uses_jev = engine.enabled();
-        let mut all_warnings = engine.warnings();
-        for warning in warnings {
+        let mut all_warnings: Vec<String> = Vec::new();
+        for warning in jev
+            .warnings()
+            .into_iter()
+            .chain(laya.warnings())
+            .chain(warnings)
+        {
             if !all_warnings.contains(&warning) {
                 all_warnings.push(warning);
             }
         }
         App {
-            engine,
-            engine_status,
-            uses_jev,
+            jev: EngineSlot::new(jev),
+            laya: EngineSlot::new(laya),
             warnings: all_warnings,
             palette: glyphs::palette(truecolor),
             no_color: false,
@@ -853,28 +901,77 @@ impl App {
 
     // ----- read accessors -----
 
-    /// The engine, for the run loop's `worker::spawn_request`.
-    pub fn engine(&self) -> &Arc<dyn Engine> {
-        &self.engine
+    fn slot(&self, provider: Provider) -> &EngineSlot {
+        match provider {
+            Provider::Jev => &self.jev,
+            Provider::Laya => &self.laya,
+        }
     }
 
-    /// The engine's one-line status for the menu.
-    pub fn engine_status(&self) -> &str {
-        &self.engine_status
+    /// The engine for `provider`, for the run loop's `worker::spawn_request`.
+    pub fn engine(&self, provider: Provider) -> &Arc<dyn Engine> {
+        &self.slot(provider).engine
     }
 
-    /// True when the computer's moves come from Jev ([`Engine::uses_jev`]).
-    pub fn uses_jev(&self) -> bool {
-        self.uses_jev
+    /// `provider`'s engine status for the menu.
+    pub fn engine_status(&self, provider: Provider) -> &str {
+        &self.slot(provider).status
     }
 
-    /// What the UI calls the computer player: [`JEV_NAME`] or [`LOCAL_SEARCH_NAME`].
-    pub fn computer_name(&self) -> &'static str {
-        if self.uses_jev {
-            JEV_NAME
+    /// True when `provider`'s model is available ([`Engine::enabled`]).
+    pub fn enabled(&self, provider: Provider) -> bool {
+        self.slot(provider).enabled
+    }
+
+    /// What the UI calls `provider`'s player: its name ([`Provider::name`]) or
+    /// [`LOCAL_SEARCH_NAME`] when its model is off.
+    pub fn player_name(&self, provider: Provider) -> &'static str {
+        if self.enabled(provider) {
+            provider.name()
         } else {
             LOCAL_SEARCH_NAME
         }
+    }
+
+    /// [`player_name`](Self::player_name) for titles without room:
+    /// [`LOCAL_SEARCH_SHORT_NAME`] for the local search.
+    pub fn player_short_name(&self, provider: Provider) -> &'static str {
+        if self.enabled(provider) {
+            provider.name()
+        } else {
+            LOCAL_SEARCH_SHORT_NAME
+        }
+    }
+
+    /// [`Mode::label`] of the current mode, with the players' names.
+    pub fn mode_label(&self) -> String {
+        self.mode.label(|p| self.player_name(p))
+    }
+
+    /// [`Mode::labels`] of the current mode, longest first, for a title that must fit.
+    pub fn mode_labels(&self) -> Vec<String> {
+        self.mode
+            .labels(|p| self.player_name(p), |p| self.player_short_name(p))
+    }
+
+    /// The computer whose panel is shown: the one that made the last computer move, else
+    /// the one to move, else the other side's; `None` in Human vs Human.
+    pub fn panel_provider(&self) -> Option<Provider> {
+        if let Some(computer) = self.last_computer() {
+            return Some(computer.provider);
+        }
+        let side = self.game.position().side_to_move();
+        self.mode.player(side).or_else(|| self.mode.player(!side))
+    }
+
+    /// PGN `White` and `Black` names: `You`, or the side's [`player_name`](Self::player_name).
+    pub fn player_names(&self) -> (&'static str, &'static str) {
+        let name = |side: Side| {
+            self.mode
+                .player(side)
+                .map_or("You", |p| self.player_name(p))
+        };
+        (name(Side::White), name(Side::Black))
     }
 
     /// Startup and engine warnings for the menu.
@@ -890,21 +987,6 @@ impl App {
     /// The current (or last) game's mode.
     pub fn mode(&self) -> Mode {
         self.mode
-    }
-
-    /// [`Mode::label`] of the current mode, with the computer's name.
-    pub fn mode_label(&self) -> String {
-        self.mode.label(self.computer_name())
-    }
-
-    /// [`Mode::labels`] of the current mode, longest first, for a title that must fit.
-    pub fn mode_labels(&self) -> Vec<String> {
-        let short = if self.uses_jev {
-            JEV_NAME
-        } else {
-            LOCAL_SEARCH_SHORT_NAME
-        };
-        self.mode.labels(self.computer_name(), short)
     }
 
     /// The screen under the dialogs.
@@ -958,12 +1040,11 @@ impl App {
         }
         let pos = self.game.position();
         let side = pos.side_to_move();
-        let who = match self.mode {
-            Mode::HumanVsJev { human } if with_player && human == side => " (you)".to_string(),
-            Mode::HumanVsJev { .. } | Mode::JevVsJev if with_player => {
-                format!(" ({})", self.computer_name())
-            }
-            _ => String::new(),
+        let who = match self.mode.player(side) {
+            _ if !with_player => String::new(),
+            Some(provider) => format!(" ({})", self.player_name(provider)),
+            None if matches!(self.mode, Mode::HumanVsComputer { .. }) => " (you)".to_string(),
+            None => String::new(),
         };
         let check = if pos.is_check() { " · Check" } else { "" };
         format!("{side} to move{who}{check}")
@@ -1127,7 +1208,7 @@ impl App {
         })
     }
 
-    /// True when Jev vs Jev is paused.
+    /// True when watching is paused.
     pub fn paused(&self) -> bool {
         self.paused
     }
@@ -1137,7 +1218,7 @@ impl App {
         self.held.is_some()
     }
 
-    /// The Jev vs Jev pause between moves.
+    /// the pause between moves.
     pub fn step_delay(&self) -> Duration {
         self.step_delay
     }
@@ -1157,18 +1238,6 @@ impl App {
         self.move_scroll
     }
 
-    /// PGN `White` and `Black` names: `You`, or the [`computer_name`](Self::computer_name)
-    /// (`Jev` or `Local search`).
-    pub fn player_names(&self) -> (&'static str, &'static str) {
-        let computer = self.computer_name();
-        match self.mode {
-            Mode::HumanVsHuman => ("You", "You"),
-            Mode::HumanVsJev { human: Side::White } => ("You", computer),
-            Mode::HumanVsJev { human: Side::Black } => (computer, "You"),
-            Mode::JevVsJev => (computer, computer),
-        }
-    }
-
     /// Areas recorded by the last [`render`](Self::render).
     pub fn hit_map(&self) -> &HitMap {
         &self.hits
@@ -1186,7 +1255,7 @@ impl App {
     /// Key events count only when their kind is `Press`. While the last draw showed only
     /// [`TOO_SMALL`], keys, clicks and pastes are ignored (they would act on a screen nobody
     /// can see), except Ctrl+C, which then quits at once: its confirmation could not be seen
-    /// either. `now` stamps engine requests and schedules Jev vs Jev steps; pass the time the
+    /// either. `now` stamps engine requests and schedules the steps while watching; pass the time the
     /// event was collected.
     #[must_use = "the run loop must execute the returned actions"]
     pub fn handle(&mut self, event: AppEvent, now: Instant) -> Vec<Action> {
@@ -1306,9 +1375,21 @@ impl App {
                     SidePick::Black => Side::Black,
                     SidePick::Random => (self.pick_side)(),
                 };
-                self.start(Mode::HumanVsJev { human }, Game::new());
+                self.start(
+                    Mode::HumanVsComputer {
+                        human,
+                        computer: Provider::Jev,
+                    },
+                    Game::new(),
+                );
             }
-            MenuItem::JevVsJev => self.start(Mode::JevVsJev, Game::new()),
+            MenuItem::JevVsJev => self.start(
+                Mode::Watch {
+                    white: Provider::Jev,
+                    black: Provider::Jev,
+                },
+                Game::new(),
+            ),
             MenuItem::LoadFen => self.open_input(InputPurpose::LoadFen { from_menu: true }),
             MenuItem::Quit => self.quit = true,
         }
@@ -1378,7 +1459,7 @@ impl App {
     }
 
     fn board_char(&mut self, c: char) {
-        let watching = self.mode == Mode::JevVsJev;
+        let watching = self.mode.is_watch();
         match c {
             'u' => self.undo(),
             'f' => self.flipped = !self.flipped,
@@ -1439,10 +1520,10 @@ impl App {
 
     fn command_key(&mut self, key: KeyEvent) {
         // No command or move starts with a space, so in an empty box space does what it
-        // does on the board: retry a failed engine, or pause Jev vs Jev.
+        // does on the board: retry a failed engine, or pause watching.
         if typed_char(&key) == Some(' ')
             && self.command.is_empty()
-            && (self.engine_failed || self.mode == Mode::JevVsJev)
+            && (self.engine_failed || self.mode.is_watch())
         {
             self.board_char(' ');
             return;
@@ -1788,7 +1869,7 @@ impl App {
         self.show(message);
     }
 
-    /// True when it is the engine's turn, nothing stops it, and in Jev vs Jev the step
+    /// True when it is the engine's turn, nothing stops it, and while watching the step
     /// delay since the last move has passed.
     fn engine_due(&self, now: Instant) -> bool {
         let turn = self.screen != Screen::Menu
@@ -1797,7 +1878,7 @@ impl App {
             && !self.paused
             && !self.engine_failed
             && self.held.is_none();
-        let step_done = self.mode != Mode::JevVsJev
+        let step_done = !self.mode.is_watch()
             || self.step_anchor.is_none_or(|anchor| {
                 anchor
                     .checked_add(self.step_delay)
@@ -1812,12 +1893,13 @@ impl App {
         if self.pending.is_some() || self.in_flight >= MAX_IN_FLIGHT || !self.engine_due(now) {
             return None;
         }
+        let provider = self.mode.player(self.game.position().side_to_move())?;
         self.pending = Some(Pending { since: now });
         self.in_flight += 1;
         Some(EngineRequest::new(
             self.generation,
             self.game.clone(),
-            Provider::Jev,
+            provider,
         ))
     }
 
@@ -1827,7 +1909,13 @@ impl App {
     fn start(&mut self, mode: Mode, game: Game) {
         self.mode = mode;
         self.game = game;
-        self.flipped = matches!(mode, Mode::HumanVsJev { human: Side::Black });
+        self.flipped = matches!(
+            mode,
+            Mode::HumanVsComputer {
+                human: Side::Black,
+                ..
+            }
+        );
         self.screen = Screen::Playing;
         self.dialogs.clear();
         self.message = None;
@@ -1837,6 +1925,12 @@ impl App {
         self.cursor = None;
         self.invalidate();
         self.person_ended_turn();
+    }
+
+    /// [`start`](Self::start) for tests, which pick modes the menu has no row for yet.
+    #[cfg(test)]
+    pub(crate) fn start_for_test(&mut self, mode: Mode, game: Game) {
+        self.start(mode, game);
     }
 
     /// True when leaving would throw away moves of an unfinished game.
@@ -1939,12 +2033,21 @@ impl App {
         if self.game.outcome().is_some() {
             return Err(GAME_IS_OVER.to_string());
         }
-        let computer = self.computer_name();
         match self.mode {
-            Mode::JevVsJev => Err(format!("{computer} plays both sides; you are watching")),
-            Mode::HumanVsJev { human } if self.game.position().side_to_move() != human => {
+            Mode::Watch { white, black } if white == black => Err(format!(
+                "{} plays both sides; you are watching",
+                self.player_name(white)
+            )),
+            Mode::Watch { white, black } => Err(format!(
+                "{} and {} play; you are watching",
+                self.player_name(white),
+                self.player_name(black)
+            )),
+            Mode::HumanVsComputer { human, computer }
+                if self.game.position().side_to_move() != human =>
+            {
                 // Short enough for one row of the narrowest Status panel.
-                Err(format!("{computer} to move"))
+                Err(format!("{} to move", self.player_name(computer)))
             }
             _ => Ok(()),
         }
@@ -1985,14 +2088,14 @@ impl App {
         self.selected = None;
         self.drag = None;
         self.move_scroll = 0;
-        if self.mode == Mode::JevVsJev {
+        if self.mode.is_watch() {
             self.step_anchor = Some(now);
         }
         self.check_game_over();
     }
 
     /// Takes back one ply, or two against Jev so it is the person's turn again (one when
-    /// Jev has not replied yet). A pending resignation is withdrawn first. Jev vs Jev
+    /// Jev has not replied yet). A pending resignation is withdrawn first. While watching
     /// takes back one ply and pauses.
     fn undo(&mut self) {
         if self.screen == Screen::Menu {
@@ -2006,7 +2109,9 @@ impl App {
             return;
         }
         let plies = match self.mode {
-            Mode::HumanVsJev { human } if self.game.position().side_to_move() == human => 2,
+            Mode::HumanVsComputer { human, .. } if self.game.position().side_to_move() == human => {
+                2
+            }
             _ => 1,
         };
         if self.game.moves().len() < plies {
@@ -2023,7 +2128,7 @@ impl App {
         } else {
             "took back 2 moves"
         };
-        if self.mode == Mode::JevVsJev {
+        if self.mode.is_watch() {
             // The pace line in the Status panel says so.
             self.paused = true;
         }
@@ -2073,7 +2178,7 @@ impl App {
     }
 
     fn open_resign(&mut self) {
-        if self.mode == Mode::JevVsJev {
+        if self.mode.is_watch() {
             self.show(Message::error(NOTHING_TO_RESIGN));
         } else if self.game.outcome().is_some() {
             self.error(GAME_IS_OVER);
@@ -2085,8 +2190,8 @@ impl App {
     /// The person resigns: their side against Jev, the side to move otherwise.
     fn resign(&mut self) {
         let loser = match self.mode {
-            Mode::HumanVsJev { human } => human,
-            Mode::HumanVsHuman | Mode::JevVsJev => self.game.position().side_to_move(),
+            Mode::HumanVsComputer { human, .. } => human,
+            Mode::HumanVsHuman | Mode::Watch { .. } => self.game.position().side_to_move(),
         };
         self.game.resign(loser);
         self.invalidate();
@@ -2649,8 +2754,8 @@ mod tests {
     use crate::tui::graphics;
     use crate::tui::panels::HELP_LINES;
     use crate::tui::test_support::engine::{
-        FakeEngine, REPLY_TIMEOUT, SENTINEL_KEY, chord, jev_move, key, mouse, paste,
-        traced_jev_move,
+        FakeEngine, LAYA_LOCAL_NOTE, REPLY_TIMEOUT, SENTINEL_KEY, chord, jev_move, key, mouse,
+        paste, traced_jev_move,
     };
     use crate::tui::test_support::harness::{Harness, request};
     use crate::tui::test_support::{PROMOTION_FEN, TempDir, buffer_text, game_from, key_event, sq};
@@ -2702,7 +2807,13 @@ mod tests {
         h.char('0');
         assert_eq!(h.app.screen_name(), "menu", "no such items");
         assert!(h.char('2').is_empty(), "White moves first, so Jev waits");
-        assert_eq!(h.app.mode(), Mode::HumanVsJev { human: Side::White });
+        assert_eq!(
+            h.app.mode(),
+            Mode::HumanVsComputer {
+                human: Side::White,
+                computer: Provider::Jev
+            }
+        );
         assert_eq!(h.app.menu_index(), 1);
         assert!(!h.app.flipped());
     }
@@ -2711,7 +2822,13 @@ mod tests {
     fn human_vs_jev_as_black_starts_flipped_and_asks_the_engine() {
         let mut h = Harness::new();
         let request = request(&h.char('3'));
-        assert_eq!(h.app.mode(), Mode::HumanVsJev { human: Side::Black });
+        assert_eq!(
+            h.app.mode(),
+            Mode::HumanVsComputer {
+                human: Side::Black,
+                computer: Provider::Jev
+            }
+        );
         assert!(h.app.flipped());
         assert_eq!(request.generation, h.app.generation());
         assert_eq!(request.hash, ChessPosition::startpos().hash());
@@ -2726,14 +2843,26 @@ mod tests {
             app.with_side_picker(|| Side::Black)
         });
         assert_eq!(h.char('4').len(), 1);
-        assert_eq!(h.app.mode(), Mode::HumanVsJev { human: Side::Black });
+        assert_eq!(
+            h.app.mode(),
+            Mode::HumanVsComputer {
+                human: Side::Black,
+                computer: Provider::Jev
+            }
+        );
         assert!(h.app.flipped());
 
         let mut h = Harness::build(FakeEngine::local(), (80, 24), Vec::new(), |app| {
             app.with_side_picker(|| Side::White)
         });
         assert!(h.char('4').is_empty());
-        assert_eq!(h.app.mode(), Mode::HumanVsJev { human: Side::White });
+        assert_eq!(
+            h.app.mode(),
+            Mode::HumanVsComputer {
+                human: Side::White,
+                computer: Provider::Jev
+            }
+        );
         assert!(!h.app.flipped());
     }
 
@@ -2741,7 +2870,13 @@ mod tests {
     fn menu_click_starts_jev_vs_jev() {
         let mut h = Harness::new();
         let actions = h.click_hit(Hit::MenuItem(4));
-        assert_eq!(h.app.mode(), Mode::JevVsJev);
+        assert_eq!(
+            h.app.mode(),
+            Mode::Watch {
+                white: Provider::Jev,
+                black: Provider::Jev
+            }
+        );
         assert_eq!(h.app.menu_index(), 4);
         assert_eq!(request(&actions).hash, ChessPosition::startpos().hash());
     }
@@ -2758,7 +2893,7 @@ mod tests {
             h.app.warnings(),
             ["JEV_TIMEOUT_MS ignored", "--glyphs: unknown glyph set"]
         );
-        assert_eq!(h.app.engine_status(), LOCAL_SEARCH_STATUS);
+        assert_eq!(h.app.engine_status(Provider::Jev), LOCAL_SEARCH_STATUS);
         let screen = h.screen();
         assert!(screen.contains(LOCAL_SEARCH_STATUS));
         assert!(screen.contains("! JEV_TIMEOUT_MS ignored"));
@@ -2943,7 +3078,13 @@ mod tests {
     #[test]
     fn clicks_before_the_first_draw_do_nothing() {
         let engine = Arc::new(FakeEngine::local());
-        let mut app = App::new(engine, GlyphSet::Solid, true, Vec::new());
+        let mut app = App::new(
+            engine,
+            local_laya_engine(),
+            GlyphSet::Solid,
+            true,
+            Vec::new(),
+        );
         let now = Instant::now();
         assert!(app.handle(key(KeyCode::Char('1')), now).is_empty());
         for (column, row) in [(5, 5), (20, 10), (40, 12)] {
@@ -4336,7 +4477,8 @@ mod tests {
         h.char('2');
         let request = request(&h.command("e4"));
         let (tx, rx) = mpsc::channel();
-        spawn_request(Arc::clone(h.app.engine()), request, tx).expect("spawn engine thread");
+        spawn_request(Arc::clone(h.app.engine(Provider::Jev)), request, tx)
+            .expect("spawn engine thread");
         let reply = rx.recv_timeout(REPLY_TIMEOUT).expect("engine reply");
         h.send(AppEvent::Engine(reply));
         assert_eq!(h.uci(), ["e2e4", "c7c5"]);
@@ -4688,10 +4830,16 @@ mod tests {
 
     #[test]
     fn mode_labels_shorten_step_by_step() {
-        let white = Mode::HumanVsJev { human: Side::White };
-        let black = Mode::HumanVsJev { human: Side::Black };
-        let local = |mode: Mode| mode.labels(LOCAL_SEARCH_NAME, LOCAL_SEARCH_SHORT_NAME);
-        let jev = |mode: Mode| mode.labels(JEV_NAME, JEV_NAME);
+        let white = Mode::HumanVsComputer {
+            human: Side::White,
+            computer: Provider::Jev,
+        };
+        let black = Mode::HumanVsComputer {
+            human: Side::Black,
+            computer: Provider::Jev,
+        };
+        let local = |mode: Mode| mode.labels(|_| LOCAL_SEARCH_NAME, |_| LOCAL_SEARCH_SHORT_NAME);
+        let jev = |mode: Mode| mode.labels(|_| JEV_NAME, |_| JEV_NAME);
         assert_eq!(
             local(white),
             [
@@ -4709,14 +4857,23 @@ mod tests {
             ]
         );
         assert_eq!(
-            local(Mode::JevVsJev),
+            local(Mode::Watch {
+                white: Provider::Jev,
+                black: Provider::Jev
+            }),
             ["Local search vs Local search", "Local vs Local"]
         );
         assert_eq!(
             jev(white),
             ["You (White) vs Jev", "You (W) vs Jev", "W You · B Jev"]
         );
-        assert_eq!(jev(Mode::JevVsJev), ["Jev vs Jev"]);
+        assert_eq!(
+            jev(Mode::Watch {
+                white: Provider::Jev,
+                black: Provider::Jev
+            }),
+            ["Jev vs Jev"]
+        );
         assert_eq!(local(Mode::HumanVsHuman), ["Human vs Human"]);
 
         let mut h = Harness::new();
@@ -4724,7 +4881,13 @@ mod tests {
         assert_eq!(h.app.mode_labels(), local(black));
         let mut h = Harness::with_engine(FakeEngine::jev());
         h.char('5');
-        assert_eq!(h.app.mode_labels(), jev(Mode::JevVsJev));
+        assert_eq!(
+            h.app.mode_labels(),
+            jev(Mode::Watch {
+                white: Provider::Jev,
+                black: Provider::Jev
+            })
+        );
     }
 
     #[test]
@@ -4898,7 +5061,10 @@ mod tests {
         assert_eq!(h.app.game().position().to_fen(), TWO_KNIGHTS_FEN);
         assert_eq!(
             h.app.mode(),
-            Mode::HumanVsJev { human: Side::White },
+            Mode::HumanVsComputer {
+                human: Side::White,
+                computer: Provider::Jev
+            },
             "loaded in the current mode"
         );
         h.command(": SavePGN ");
@@ -5667,9 +5833,15 @@ mod tests {
             ..EngineConfig::default()
         };
         let engine = Arc::new(crate::engine::ComputerPlayer::from_config(config));
-        let mut app = App::new(engine, GlyphSet::Solid, true, Vec::new())
-            .with_home(None)
-            .with_debug(DebugLog::start(path.clone()));
+        let mut app = App::new(
+            engine,
+            local_laya_engine(),
+            GlyphSet::Solid,
+            true,
+            Vec::new(),
+        )
+        .with_home(None)
+        .with_debug(DebugLog::start(path.clone()));
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))
             .expect("test terminal");
         let now = Instant::now();
@@ -5711,5 +5883,148 @@ mod tests {
             h.screen()
                 .contains("d         exchange view (start with --debug)")
         );
+    }
+
+    /// A Laya engine without `LAYA_URL`, for apps built by hand.
+    fn local_laya_engine() -> Arc<dyn Engine> {
+        Arc::new(FakeEngine::local_laya())
+    }
+
+    #[test]
+    fn mode_players() {
+        use crate::engine::Provider::{Jev, Laya};
+        let watch = Mode::Watch {
+            white: Jev,
+            black: Laya,
+        };
+        assert_eq!(watch.player(Side::White), Some(Jev));
+        assert_eq!(watch.player(Side::Black), Some(Laya));
+        assert!(watch.is_watch() && watch.engine_plays(Side::Black));
+        let human = Mode::HumanVsComputer {
+            human: Side::Black,
+            computer: Laya,
+        };
+        assert_eq!(human.player(Side::White), Some(Laya));
+        assert_eq!(human.player(Side::Black), None);
+        assert!(!human.is_watch());
+        assert_eq!(Mode::HumanVsHuman.player(Side::White), None);
+    }
+
+    #[test]
+    fn mode_labels_use_each_sides_name() {
+        use crate::engine::Provider::{Jev, Laya};
+        let name = |p: Provider| if p == Jev { "Jev" } else { "Local search" };
+        let short = |p: Provider| if p == Jev { "Jev" } else { "Local" };
+        assert_eq!(
+            Mode::Watch {
+                white: Jev,
+                black: Laya
+            }
+            .labels(name, short),
+            vec!["Jev vs Local search", "Jev vs Local"]
+        );
+        assert_eq!(
+            Mode::Watch {
+                white: Jev,
+                black: Jev
+            }
+            .labels(name, short),
+            vec!["Jev vs Jev"]
+        );
+        assert_eq!(
+            Mode::HumanVsComputer {
+                human: Side::White,
+                computer: Laya
+            }
+            .labels(name, short),
+            vec![
+                "You (White) vs Local search",
+                "You (W) vs Local",
+                "W You · B Local"
+            ]
+        );
+    }
+
+    #[test]
+    fn jev_vs_laya_asks_each_engine_for_its_side() {
+        let mut h = Harness::with_engines(FakeEngine::jev(), FakeEngine::laya());
+        h.start(Mode::Watch {
+            white: Provider::Jev,
+            black: Provider::Laya,
+        });
+        let first = request(&h.tick());
+        assert_eq!(first.provider, Provider::Jev);
+        h.reply("e2e4");
+        h.at_ms(5_000);
+        let second = request(&h.tick());
+        assert_eq!(second.provider, Provider::Laya);
+        h.reply("e7e5");
+        assert_eq!(h.uci(), vec!["e2e4", "e7e5"]);
+        assert_eq!(h.app.mode_label(), "Jev vs Laya");
+        assert_eq!(h.app.player_names(), ("Jev", "Laya"));
+        assert_eq!(
+            h.app.last_computer().map(|c| c.provider),
+            Some(Provider::Laya)
+        );
+        assert_eq!(h.app.panel_provider(), Some(Provider::Laya));
+    }
+
+    #[test]
+    fn human_vs_laya_names_laya_and_asks_laya() {
+        let mut h = Harness::with_engines(FakeEngine::jev(), FakeEngine::laya());
+        h.start(Mode::HumanVsComputer {
+            human: Side::Black,
+            computer: Provider::Laya,
+        });
+        assert!(h.app.flipped());
+        assert_eq!(h.app.turn_text(), "White to move (Laya)");
+        assert_eq!(request(&h.tick()).provider, Provider::Laya);
+        h.reply("e2e4");
+        assert_eq!(h.app.turn_text(), "Black to move (you)");
+        assert_eq!(h.app.player_names(), ("Laya", "You"));
+        assert_eq!(h.app.mode_label(), "You (Black) vs Laya");
+    }
+
+    #[test]
+    fn a_disabled_engine_is_named_local_search_on_its_side_only() {
+        let mut h = Harness::with_engines(FakeEngine::jev(), FakeEngine::local_laya());
+        h.start(Mode::Watch {
+            white: Provider::Laya,
+            black: Provider::Jev,
+        });
+        assert_eq!(h.app.mode_label(), "Local search vs Jev");
+        assert_eq!(h.app.player_names(), ("Local search", "Jev"));
+        assert_eq!(request(&h.tick()).provider, Provider::Laya);
+        h.reply("e2e4");
+        assert_eq!(
+            h.app
+                .last_computer()
+                .and_then(|c| c.note.clone())
+                .as_deref(),
+            Some(LAYA_LOCAL_NOTE)
+        );
+    }
+
+    #[test]
+    fn the_in_flight_cap_counts_both_engines() {
+        let mut h = Harness::with_engines(FakeEngine::jev(), FakeEngine::laya());
+        let mode = Mode::Watch {
+            white: Provider::Jev,
+            black: Provider::Laya,
+        };
+        // `start` bumps the generation and clears `pending`, so each new game sends a
+        // request while the discarded ones still count against the cap.
+        h.start(mode);
+        assert_eq!(request(&h.tick()).provider, Provider::Jev);
+        h.start(mode);
+        assert_eq!(request(&h.tick()).provider, Provider::Jev);
+        h.start(mode);
+        assert!(
+            !h.tick()
+                .iter()
+                .any(|a| matches!(a, Action::RequestEngine(_))),
+            "a third request waits for MAX_IN_FLIGHT"
+        );
+        assert_eq!(h.app.in_flight(), MAX_IN_FLIGHT);
     }
 }

@@ -6,8 +6,8 @@ Read this first. Follow the protocol in section 8 of
 ## Current
 Sub-project: laya (Laya as a second computer player; Jev vs Laya) | Spec: docs/superpowers/specs/2026-09-29-laya-integration-design.md
 Branch: feat/laya (from main at fe1eb73)
-Last completed task: Task 4 (engines and requests carry a provider)
-Next task: Task 5 (modes with a provider per side, two engines in the app)
+Last completed task: Task 5 (modes with a provider per side, two engines in the app)
+Next task: Task 6 (menu: computer toggle and watching pairings)
 State: green (cargo test, fmt, clippy)
 Earlier: main is ahead of origin/main (not pushed); pushing it is still pending.
 
