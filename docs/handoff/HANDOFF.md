@@ -6,8 +6,8 @@ Read this first. Follow the protocol in section 8 of
 ## Current
 Sub-project: laya (Laya as a second computer player; Jev vs Laya) | Spec: docs/superpowers/specs/2026-09-29-laya-integration-design.md
 Branch: feat/laya (from main at fe1eb73)
-Last completed task: spec written and committed; waiting for the user's review of the spec
-Next task: after spec approval, write the plan (docs/superpowers/plans/2026-09-29-laya.md) with superpowers:writing-plans
+Last completed task: spec approved; plan written (docs/superpowers/plans/2026-09-29-laya.md), waiting for the user's review and execution choice
+Next task: Task 1 of the plan (Provider and Laya configuration)
 State: green (no code changed yet)
 Earlier: main is ahead of origin/main (not pushed); pushing it is still pending.
 
