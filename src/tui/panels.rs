@@ -537,7 +537,17 @@ fn playing(
 ) {
     let text_width = side_text_width(area, app.cell_size());
     let panel = app.panel_provider();
-    let jev = panel.map(|p| JevText::new(app.last_computer(), app.engine_status(p), text_width));
+    // Before the first computer move, the status of each engine in this game.
+    let mut providers: Vec<Provider> = [Side::White, Side::Black]
+        .into_iter()
+        .filter_map(|side| app.mode().player(side))
+        .collect();
+    providers.dedup();
+    let statuses: Vec<&str> = providers
+        .into_iter()
+        .map(|p| app.engine_status(p))
+        .collect();
+    let jev = panel.map(|_| JevText::new(app.last_computer(), &statuses, text_width));
     let layout = playing_layout(
         area,
         app.cell_size(),
@@ -873,13 +883,15 @@ struct JevText {
 impl JevText {
     /// The text for the last computer move, or the engine status before there is one.
     /// Each line is packed to `width` so it breaks between items, never inside one.
-    fn new(computer: Option<&ComputerMove>, engine_status: &str, width: u16) -> JevText {
+    fn new(computer: Option<&ComputerMove>, statuses: &[&str], width: u16) -> JevText {
         let Some(computer) = computer else {
+            let mut lines: Vec<Line<'static>> = statuses
+                .iter()
+                .map(|status| Line::from((*status).to_string()).dim())
+                .collect();
+            lines.push(Line::from("no move yet").dim());
             return JevText {
-                lines: vec![
-                    Line::from(engine_status.to_string()).dim(),
-                    Line::from("no move yet").dim(),
-                ],
+                lines,
                 note: None,
                 width,
             };
@@ -1196,16 +1208,25 @@ fn exchange_screen(
     view: ExchangeView,
     bodies: &mut BodyCache,
 ) -> ExchangeView {
-    let block = Block::bordered()
-        .title(Line::from(" Jev exchange ").bold())
-        .title_bottom(Line::from(EXCHANGE_KEYS).dim())
-        .padding(Padding::horizontal(1));
-    let inner = block.inner(area);
     let history = app.exchanges();
     let shown = history.and_then(|history| {
         let index = view.index(history)?;
         Some((index, history.len(), history.get(index)?))
     });
+    // The shown exchange's model, or before any the computer this game shows.
+    let engine = shown.map_or_else(
+        || {
+            app.panel_provider()
+                .map_or("Jev", Provider::name)
+                .to_string()
+        },
+        |(_, _, record)| record.exchange.engine.clone(),
+    );
+    let block = Block::bordered()
+        .title(Line::from(format!(" {engine} exchange ")).bold())
+        .title_bottom(Line::from(EXCHANGE_KEYS).dim())
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
     let Some((index, count, record)) = shown else {
         frame.render_widget(block, area);
         frame.render_widget(Line::from(NO_EXCHANGES).dim(), row_of(inner, 0));
@@ -2060,7 +2081,7 @@ mod tests {
         let rows = status_rows(h.app.mode(), area.height);
         let jev = JevText::new(
             None,
-            h.app.engine_status(Provider::Jev),
+            &[h.app.engine_status(Provider::Jev)],
             side_text_width(area, h.app.cell_size()),
         );
         let l = playing_layout(area, h.app.cell_size(), rows, Some(jev.rows()));
@@ -2771,7 +2792,7 @@ mod tests {
 
     /// The Jev panel's lines at `width` with room for everything.
     fn jev_lines(computer: Option<&ComputerMove>, status: &str, width: u16) -> Vec<Line<'static>> {
-        let text = JevText::new(computer, status, width);
+        let text = JevText::new(computer, &[status], width);
         let rows = text.rows();
         text.into_lines(rows)
     }
@@ -2831,7 +2852,7 @@ mod tests {
             ["played Nf3 · local search", "870 ms", "Jev timed out"]
         );
         // Too few rows: the note is cut, the rest stays.
-        let text = JevText::new(Some(&computer), JEV_STATUS, 40);
+        let text = JevText::new(Some(&computer), &[JEV_STATUS], 40);
         assert_eq!(text.rows(), 3);
         assert_eq!(
             texts(&text.into_lines(2)),
@@ -3397,5 +3418,50 @@ mod tests {
         assert!(screen.contains("Quit"), "{screen}");
         assert!(screen.contains("Computer:"), "{screen}");
         insta::assert_snapshot!("menu_min_size_60x20", h.terminal.backend());
+    }
+
+    #[test]
+    fn a_watching_panel_lists_both_engines_before_the_first_move() {
+        let mut h = Harness::with_engines(FakeEngine::jev(), FakeEngine::laya());
+        h.start(Mode::Watch {
+            white: Provider::Jev,
+            black: Provider::Laya,
+        });
+        let panel = panel_text(&h, "Jev");
+        assert!(panel.contains(JEV_STATUS), "{panel:?}");
+        // The URL wraps in the narrow panel, so only its start is on one row.
+        assert!(panel.contains("Laya ready (http://"), "{panel:?}");
+        assert!(panel.contains("no move yet"), "{panel:?}");
+    }
+
+    #[test]
+    fn a_human_vs_laya_panel_shows_only_laya_before_its_move() {
+        let mut h = Harness::with_engines(FakeEngine::jev(), FakeEngine::laya());
+        h.start(Mode::HumanVsComputer {
+            human: Side::White,
+            computer: Provider::Laya,
+        });
+        let panel = panel_text(&h, "Laya");
+        assert!(panel.contains("Laya ready (http://"), "{panel:?}");
+        assert!(!panel.contains("Jev"), "{panel:?}");
+    }
+
+    #[test]
+    fn the_exchange_view_is_titled_by_its_engine() {
+        let mut h = Harness::build_with(
+            FakeEngine::jev(),
+            FakeEngine::laya(),
+            (100, 30),
+            Vec::new(),
+            |app| app.with_debug(DebugLog::open(Err(NO_LOG_PATH.to_string()))),
+        );
+        h.start(Mode::HumanVsComputer {
+            human: Side::Black,
+            computer: Provider::Laya,
+        });
+        let _ = request(&h.tick());
+        h.reply_traced("e2e4");
+        h.char('d');
+        assert!(h.screen().contains(" Laya exchange "), "{}", h.screen());
     }
 }

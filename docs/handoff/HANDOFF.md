@@ -6,8 +6,8 @@ Read this first. Follow the protocol in section 8 of
 ## Current
 Sub-project: laya (Laya as a second computer player; Jev vs Laya) | Spec: docs/superpowers/specs/2026-09-29-laya-integration-design.md
 Branch: feat/laya (from main at fe1eb73)
-Last completed task: Task 6 (menu: computer toggle and watching pairings)
-Next task: Task 7 (side panel before the first move, debug mode per engine)
+Last completed task: Task 7 (side panel before the first move, debug mode per engine)
+Next task: Task 8 (offline Laya on a real terminal, docs, final verification)
 State: green (cargo test, fmt, clippy)
 Earlier: main is ahead of origin/main (not pushed); pushing it is still pending.
 

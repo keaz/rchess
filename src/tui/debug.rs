@@ -132,7 +132,9 @@ pub struct Exchange {
     pub fullmove: u16,
     /// The chosen move in SAN; played unless the reply was stale.
     pub san: String,
-    /// How the move was chosen: the `MoveSource` label (`Jev`,
+    /// The model that was asked: `Jev` or `Laya`.
+    pub engine: String,
+    /// How the move was chosen: the `MoveSource` label (`Jev`, `Laya`,
     /// `vetoed (Jev picked Qh4)` or `local search`).
     pub source: String,
     /// Time for the whole engine call.
@@ -149,6 +151,7 @@ impl Exchange {
             ply: game.moves().len(),
             fullmove: game.position().fullmove_number(),
             san: computer.san.clone(),
+            engine: computer.provider.name().to_string(),
             source: computer.source.label(computer.provider),
             latency: computer.latency,
             http,
@@ -617,6 +620,7 @@ struct LogRecord<'a> {
     time: String,
     ply: usize,
     played: &'a str,
+    engine: &'a str,
     source: &'a str,
     stale: bool,
     held: bool,
@@ -667,6 +671,7 @@ pub fn log_line(record: &Record) -> serde_json::Result<String> {
         time: rfc3339(record.time),
         ply: exchange.ply,
         played: &exchange.san,
+        engine: &exchange.engine,
         source: &exchange.source,
         stale: record.stale,
         held: record.held,
@@ -1590,6 +1595,7 @@ mod tests {
             "\"time\"",
             "\"ply\"",
             "\"played\"",
+            "\"engine\"",
             "\"source\"",
             "\"stale\"",
             "\"held\"",
@@ -1608,6 +1614,7 @@ mod tests {
                 "time": "2026-09-21T14:13:20.123Z",
                 "ply": 0,
                 "played": "e4",
+                "engine": "Jev",
                 "source": "Jev",
                 "stale": false,
                 "held": false,
@@ -2046,5 +2053,23 @@ mod tests {
         assert_eq!(session.log_failure(), None);
         let text = fs::read_to_string(&path).unwrap();
         assert_eq!(text.lines().count(), 1);
+    }
+
+    #[test]
+    fn the_log_names_the_engine() {
+        let game = Game::new();
+        let laya = ComputerMove {
+            provider: crate::engine::Provider::Laya,
+            ..jev_move(game.position(), "e2e4")
+        };
+        let exchange = Exchange::new(&game, &laya, jev_exchange());
+        assert_eq!(exchange.engine, "Laya");
+        assert_eq!(exchange.source, "Laya");
+        let mut history = History::new();
+        let record = history
+            .push(exchange, false, at_ms(1_790_000_000_123))
+            .clone();
+        let value: Value = serde_json::from_str(&log_line(&record).unwrap()).unwrap();
+        assert_eq!(value["engine"], json!("Laya"));
     }
 }

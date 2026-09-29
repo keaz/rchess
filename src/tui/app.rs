@@ -5874,33 +5874,49 @@ mod tests {
 
     #[test]
     fn the_api_key_never_reaches_the_screen_or_the_log() {
+        key_never_shown(Provider::Jev);
+    }
+
+    #[test]
+    fn the_laya_key_never_reaches_the_screen_or_the_log() {
+        key_never_shown(Provider::Laya);
+    }
+
+    /// Plays one traced move of `provider`, whose engine holds [`SENTINEL_KEY`], against
+    /// a server that echoes the key, then checks the exchange view and the log.
+    fn key_never_shown(provider: Provider) {
         let dir = TempDir::new("debug-app");
         let path = dir.join("jev.jsonl");
         // The exchange the engine records against a server that echoes the key, carried
         // by a traced move as the worker delivers it. The player is only the app's engine;
         // building it is offline, and no move is asked of it.
-        let config = EngineConfig {
-            api_key: Some(SENTINEL_KEY.to_string()),
-            trace: true,
-            ..EngineConfig::default()
+        let keyed = |config: EngineConfig| -> Arc<dyn Engine> {
+            Arc::new(crate::engine::ComputerPlayer::from_config(EngineConfig {
+                api_key: Some(SENTINEL_KEY.to_string()),
+                trace: true,
+                ..config
+            }))
         };
-        let engine = Arc::new(crate::engine::ComputerPlayer::from_config(config));
-        let mut app = App::new(
-            engine,
-            local_laya_engine(),
-            GlyphSet::Solid,
-            true,
-            Vec::new(),
-        )
-        .with_home(None)
-        .with_debug(DebugLog::start(path.clone()));
+        let jev = keyed(EngineConfig::default());
+        // Port 9 is closed; building the client is offline and no move is asked of it.
+        let laya = keyed(EngineConfig::laya_from_vars(|name| {
+            (name == "LAYA_URL").then(|| "http://127.0.0.1:9/v1/systemone".to_string())
+        }));
+        let mut app = App::new(jev, laya, GlyphSet::Solid, true, Vec::new())
+            .with_home(None)
+            .with_debug(DebugLog::start(path.clone()));
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))
             .expect("test terminal");
         let now = Instant::now();
+        if provider == Provider::Laya {
+            let _ = app.handle(AppEvent::Term(key_event(KeyCode::Tab)), now);
+        }
         let actions = app.handle(AppEvent::Term(key_event(KeyCode::Char('3'))), now);
         let request = request(&actions);
+        assert_eq!(request.provider, provider);
         let computer = ComputerMove {
             exchange: Some(Box::new(recorded_exchange(SENTINEL_KEY))),
+            provider,
             ..jev_move(request.game.position(), "e2e4")
         };
         let _ = app.handle(
