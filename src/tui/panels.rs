@@ -250,7 +250,7 @@ fn menu(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap) {
         };
         let line = Line::from(format!(
             "{marker} {number} {}",
-            item.label(computer, |p| app.player_name(p))
+            item.label(app.menu_name(app.computer()), |p| app.menu_name(p))
         ));
         frame.render_widget(if selected { line.reversed() } else { line }, row);
         hits.push(row, Hit::MenuItem(index));
@@ -3476,5 +3476,40 @@ mod tests {
         assert!(screen.contains(" Exchange "), "{screen}");
         assert!(!screen.contains("Jev exchange"), "{screen}");
         assert!(screen.contains("no requests yet"), "{screen}");
+    }
+
+    #[test]
+    fn menu_rows_mark_an_engine_that_is_off() {
+        let h = Harness::with_engines(FakeEngine::jev(), FakeEngine::local_laya());
+        let screen = h.screen();
+        assert!(screen.contains("2. Human vs Jev: play White"), "{screen}");
+        assert!(screen.contains("5. Jev vs Jev (watch)"), "{screen}");
+        assert!(
+            screen.contains("6. Laya (off) vs Laya (off) (watch)"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("7. Jev (White) vs Laya (off) (watch)"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("8. Laya (off) (White) vs Jev (watch)"),
+            "{screen}"
+        );
+
+        let mut h = Harness::new();
+        h.press(KeyCode::Tab);
+        let screen = h.screen();
+        assert!(
+            screen.contains("2. Human vs Laya (off): play White"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("5. Jev (off) vs Jev (off) (watch)"),
+            "{screen}"
+        );
+        // The game itself names who really plays.
+        h.char('6');
+        assert_eq!(h.app.mode_label(), "Local search vs Local search");
     }
 }

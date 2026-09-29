@@ -970,6 +970,16 @@ impl App {
         }
     }
 
+    /// What the menu rows call `provider`: its name, or `Jev (off)` / `Laya (off)` when
+    /// its model is off, so rows that differ only in which engine is off stay apart.
+    pub fn menu_name(&self, provider: Provider) -> &'static str {
+        match (provider, self.enabled(provider)) {
+            (_, true) => provider.name(),
+            (Provider::Jev, false) => "Jev (off)",
+            (Provider::Laya, false) => "Laya (off)",
+        }
+    }
+
     /// [`player_name`](Self::player_name) for titles without room:
     /// [`LOCAL_SEARCH_SHORT_NAME`] for the local search.
     pub fn player_short_name(&self, provider: Provider) -> &'static str {
@@ -4826,16 +4836,17 @@ mod tests {
 
     #[test]
     fn without_a_jev_key_the_computer_is_called_local_search() {
-        // The only "Jev" left on screen is the variable name in the engine status and the
-        // menu's computer toggle, which names the models.
+        // The only "Jev" left on screen is the variable name in the engine status, the
+        // menu's computer toggle, which names the models, and menu rows marking Jev off.
         let without_key = |text: String| {
             text.replace("JEV_API_KEY", "")
                 .replace("Computer:  Jev   Laya", "")
+                .replace("Jev (off)", "")
         };
         let mut h = Harness::sized(FakeEngine::local(), 120, 40);
         let menu = h.screen();
         assert!(!without_key(menu.clone()).contains("Jev"), "{menu}");
-        assert!(menu.contains("Human vs Local search: play White"));
+        assert!(menu.contains("Human vs Jev (off): play White"), "{menu}");
         for _ in 0..MENU_ITEMS.len() {
             h.press(KeyCode::Down);
             let screen = h.screen();
@@ -5328,7 +5339,10 @@ mod tests {
         assert_eq!(h.app.screen_name(), "game over");
         h.char('d');
         assert!(h.app.exchange_view().is_some(), "d opens the exchange view");
-        assert!(h.screen().contains(" Exchange "), "Human vs Human names no model");
+        assert!(
+            h.screen().contains(" Exchange "),
+            "Human vs Human names no model"
+        );
         h.press(KeyCode::Esc);
         assert_eq!(h.app.exchange_view(), None);
         assert_eq!(
