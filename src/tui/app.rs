@@ -131,13 +131,28 @@ pub const PROMOTION_CHOICES: [PieceKind; 4] = [
     PieceKind::Knight,
 ];
 
-/// Menu entries, top to bottom. The digits `1`..=`7` start them directly.
-pub const MENU_ITEMS: [MenuItem; 7] = [
+/// Menu entries, top to bottom. The digits `1`..=`9` start the first nine directly.
+pub const MENU_ITEMS: [MenuItem; 10] = [
     MenuItem::HumanVsHuman,
-    MenuItem::HumanVsJev(SidePick::White),
-    MenuItem::HumanVsJev(SidePick::Black),
-    MenuItem::HumanVsJev(SidePick::Random),
-    MenuItem::JevVsJev,
+    MenuItem::HumanVsComputer(SidePick::White),
+    MenuItem::HumanVsComputer(SidePick::Black),
+    MenuItem::HumanVsComputer(SidePick::Random),
+    MenuItem::Watch {
+        white: Provider::Jev,
+        black: Provider::Jev,
+    },
+    MenuItem::Watch {
+        white: Provider::Laya,
+        black: Provider::Laya,
+    },
+    MenuItem::Watch {
+        white: Provider::Jev,
+        black: Provider::Laya,
+    },
+    MenuItem::Watch {
+        white: Provider::Laya,
+        black: Provider::Jev,
+    },
     MenuItem::LoadFen,
     MenuItem::Quit,
 ];
@@ -305,10 +320,15 @@ pub enum SidePick {
 pub enum MenuItem {
     /// Start a Human vs Human game.
     HumanVsHuman,
-    /// Start a Human vs Jev game.
-    HumanVsJev(SidePick),
-    /// Start watching Jev play itself.
-    JevVsJev,
+    /// Start a game against the computer picked by the menu's toggle ([`App::computer`]).
+    HumanVsComputer(SidePick),
+    /// Start watching `white` play `black`.
+    Watch {
+        /// Who plays White.
+        white: Provider,
+        /// Who plays Black.
+        black: Provider,
+    },
     /// Open the FEN dialog; the position is played Human vs Human.
     LoadFen,
     /// Leave the program.
@@ -316,14 +336,26 @@ pub enum MenuItem {
 }
 
 impl MenuItem {
-    /// The text shown in the menu, with the computer called `computer`.
-    pub fn label(self, computer: &str) -> String {
+    /// The text shown in the menu, with the toggled computer called `computer` and each
+    /// watching side called `name(provider)`.
+    pub fn label(self, computer: &str, name: impl Fn(Provider) -> &'static str) -> String {
         match self {
             MenuItem::HumanVsHuman => "Human vs Human".to_string(),
-            MenuItem::HumanVsJev(SidePick::White) => format!("Human vs {computer}: play White"),
-            MenuItem::HumanVsJev(SidePick::Black) => format!("Human vs {computer}: play Black"),
-            MenuItem::HumanVsJev(SidePick::Random) => format!("Human vs {computer}: random side"),
-            MenuItem::JevVsJev => format!("{computer} vs {computer} (watch)"),
+            MenuItem::HumanVsComputer(SidePick::White) => {
+                format!("Human vs {computer}: play White")
+            }
+            MenuItem::HumanVsComputer(SidePick::Black) => {
+                format!("Human vs {computer}: play Black")
+            }
+            MenuItem::HumanVsComputer(SidePick::Random) => {
+                format!("Human vs {computer}: random side")
+            }
+            MenuItem::Watch { white, black } if white == black => {
+                format!("{} vs {} (watch)", name(white), name(black))
+            }
+            MenuItem::Watch { white, black } => {
+                format!("{} (White) vs {} (watch)", name(white), name(black))
+            }
             MenuItem::LoadFen => "Load FEN".to_string(),
             MenuItem::Quit => "Quit".to_string(),
         }
@@ -508,6 +540,8 @@ pub enum Button {
 pub enum Hit {
     /// Index into [`MENU_ITEMS`].
     MenuItem(usize),
+    /// A computer name on the menu's toggle row.
+    MenuComputer(Provider),
     /// A button of the top dialog or the game-over overlay.
     Button(Button),
     /// A promotion picker choice.
@@ -706,6 +740,8 @@ pub struct App {
     flipped: bool,
     dialogs: Vec<Dialog>,
     menu_index: usize,
+    /// The menu's toggle: the opponent of the "Human vs …" rows, for this session only.
+    computer: Provider,
     game_over_choice: usize,
 
     selected: Option<Square>,
@@ -790,6 +826,7 @@ impl App {
             flipped: false,
             dialogs: Vec::new(),
             menu_index: 0,
+            computer: Provider::Jev,
             game_over_choice: 0,
             selected: None,
             cursor: None,
@@ -1228,6 +1265,19 @@ impl App {
         self.menu_index
     }
 
+    /// The computer the menu's "Human vs …" rows play against.
+    pub fn computer(&self) -> Provider {
+        self.computer
+    }
+
+    /// Switches the menu's toggle to the other computer.
+    fn toggle_computer(&mut self) {
+        self.computer = match self.computer {
+            Provider::Jev => Provider::Laya,
+            Provider::Laya => Provider::Jev,
+        };
+    }
+
     /// The highlighted game-over button (index into [`GAME_OVER_BUTTONS`]).
     pub fn game_over_choice(&self) -> usize {
         self.game_over_choice
@@ -1349,6 +1399,9 @@ impl App {
             KeyCode::Down => self.menu_index = (self.menu_index + 1) % MENU_ITEMS.len(),
             KeyCode::Home => self.menu_index = 0,
             KeyCode::End => self.menu_index = last,
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
+                self.toggle_computer();
+            }
             KeyCode::Enter => self.activate_menu(self.menu_index),
             _ => match typed_char(&key) {
                 Some('k') => self.menu_index = self.menu_index.checked_sub(1).unwrap_or(last),
@@ -1369,7 +1422,7 @@ impl App {
     fn activate_menu(&mut self, index: usize) {
         match MENU_ITEMS[index] {
             MenuItem::HumanVsHuman => self.start(Mode::HumanVsHuman, Game::new()),
-            MenuItem::HumanVsJev(pick) => {
+            MenuItem::HumanVsComputer(pick) => {
                 let human = match pick {
                     SidePick::White => Side::White,
                     SidePick::Black => Side::Black,
@@ -1378,18 +1431,14 @@ impl App {
                 self.start(
                     Mode::HumanVsComputer {
                         human,
-                        computer: Provider::Jev,
+                        computer: self.computer,
                     },
                     Game::new(),
                 );
             }
-            MenuItem::JevVsJev => self.start(
-                Mode::Watch {
-                    white: Provider::Jev,
-                    black: Provider::Jev,
-                },
-                Game::new(),
-            ),
+            MenuItem::Watch { white, black } => {
+                self.start(Mode::Watch { white, black }, Game::new())
+            }
             MenuItem::LoadFen => self.open_input(InputPurpose::LoadFen { from_menu: true }),
             MenuItem::Quit => self.quit = true,
         }
@@ -1655,14 +1704,14 @@ impl App {
             return;
         }
         match self.screen {
-            Screen::Menu => {
-                if let Some(Hit::MenuItem(index)) = hit
-                    && index < MENU_ITEMS.len()
-                {
+            Screen::Menu => match hit {
+                Some(Hit::MenuItem(index)) if index < MENU_ITEMS.len() => {
                     self.menu_index = index;
                     self.activate_menu(index);
                 }
-            }
+                Some(Hit::MenuComputer(provider)) => self.computer = provider,
+                _ => {}
+            },
             Screen::GameOver => {
                 if let Some(Hit::Button(button)) = hit {
                     self.game_over_button(button);
@@ -2803,9 +2852,8 @@ mod tests {
         assert_eq!(h.app.menu_index(), MENU_ITEMS.len() - 1);
         h.press(KeyCode::Home);
         assert_eq!(h.app.menu_index(), 0);
-        h.char('9');
         h.char('0');
-        assert_eq!(h.app.screen_name(), "menu", "no such items");
+        assert_eq!(h.app.screen_name(), "menu", "no such item");
         assert!(h.char('2').is_empty(), "White moves first, so Jev waits");
         assert_eq!(
             h.app.mode(),
@@ -2903,7 +2951,7 @@ mod tests {
     #[test]
     fn menu_load_fen_rejects_bad_text_without_echoing_it() {
         let mut h = Harness::new();
-        h.char('6');
+        h.char('9');
         assert_eq!(h.app.dialog_name(), Some("load fen"));
         h.press(KeyCode::Enter);
         assert!(matches!(
@@ -2922,7 +2970,7 @@ mod tests {
         assert_eq!(h.app.dialog_name(), None);
         assert_eq!(h.app.screen_name(), "menu");
 
-        h.char('6');
+        h.char('9');
         h.type_text(PROMOTION_FEN);
         h.click_hit(Hit::Button(Button::Confirm));
         assert_eq!(h.app.dialog_name(), None);
@@ -2938,7 +2986,7 @@ mod tests {
         h.char('q');
         assert!(h.app.should_quit());
         let mut h = Harness::new();
-        h.click_hit(Hit::MenuItem(6));
+        h.click_hit(Hit::MenuItem(MENU_ITEMS.len() - 1));
         assert!(h.app.should_quit());
     }
 
@@ -3601,7 +3649,7 @@ mod tests {
         let mut h = Harness::new();
         h.send(paste("e2e4\n"));
         assert_eq!(h.app.screen_name(), "menu", "nothing to paste into");
-        h.char('6');
+        h.char('9');
         h.send(paste(&format!("{TWO_KNIGHTS_FEN}\n")));
         assert_eq!(h.app.game().position().to_fen(), TWO_KNIGHTS_FEN);
     }
@@ -4778,8 +4826,12 @@ mod tests {
 
     #[test]
     fn without_a_jev_key_the_computer_is_called_local_search() {
-        // The only "Jev" left on screen is the variable name in the engine status.
-        let without_key = |text: String| text.replace("JEV_API_KEY", "");
+        // The only "Jev" left on screen is the variable name in the engine status and the
+        // menu's computer toggle, which names the models.
+        let without_key = |text: String| {
+            text.replace("JEV_API_KEY", "")
+                .replace("Computer:  Jev   Laya", "")
+        };
         let mut h = Harness::sized(FakeEngine::local(), 120, 40);
         let menu = h.screen();
         assert!(!without_key(menu.clone()).contains("Jev"), "{menu}");
@@ -4792,7 +4844,7 @@ mod tests {
                 !without_key(screen.clone()).contains("Jev"),
                 "{index}: {screen}"
             );
-            if MENU_ITEMS[index] == MenuItem::HumanVsJev(SidePick::Black) {
+            if MENU_ITEMS[index] == MenuItem::HumanVsComputer(SidePick::Black) {
                 assert!(screen.contains("Local search plays White and opens"));
             }
         }
@@ -6026,5 +6078,101 @@ mod tests {
             "a third request waits for MAX_IN_FLIGHT"
         );
         assert_eq!(h.app.in_flight(), MAX_IN_FLIGHT);
+    }
+
+    #[test]
+    fn the_menu_lists_both_computers_and_four_watching_pairings() {
+        use crate::engine::Provider::{Jev, Laya};
+        assert_eq!(
+            MENU_ITEMS,
+            [
+                MenuItem::HumanVsHuman,
+                MenuItem::HumanVsComputer(SidePick::White),
+                MenuItem::HumanVsComputer(SidePick::Black),
+                MenuItem::HumanVsComputer(SidePick::Random),
+                MenuItem::Watch {
+                    white: Jev,
+                    black: Jev
+                },
+                MenuItem::Watch {
+                    white: Laya,
+                    black: Laya
+                },
+                MenuItem::Watch {
+                    white: Jev,
+                    black: Laya
+                },
+                MenuItem::Watch {
+                    white: Laya,
+                    black: Jev
+                },
+                MenuItem::LoadFen,
+                MenuItem::Quit,
+            ]
+        );
+    }
+
+    #[test]
+    fn tab_and_arrows_switch_the_computer() {
+        let mut h = Harness::with_engines(FakeEngine::jev(), FakeEngine::laya());
+        assert_eq!(h.app.computer(), Provider::Jev);
+        h.press(KeyCode::Tab);
+        assert_eq!(h.app.computer(), Provider::Laya);
+        h.press(KeyCode::Tab);
+        assert_eq!(h.app.computer(), Provider::Jev);
+        h.press(KeyCode::Right);
+        assert_eq!(h.app.computer(), Provider::Laya);
+        h.press(KeyCode::Left);
+        assert_eq!(h.app.computer(), Provider::Jev);
+        h.press(KeyCode::BackTab);
+        assert_eq!(h.app.computer(), Provider::Laya);
+    }
+
+    #[test]
+    fn the_toggle_picks_the_opponent_of_rows_two_to_four() {
+        let mut h = Harness::with_engines(FakeEngine::jev(), FakeEngine::laya());
+        h.press(KeyCode::Tab);
+        let actions = h.char('3');
+        assert_eq!(
+            h.app.mode(),
+            Mode::HumanVsComputer {
+                human: Side::Black,
+                computer: Provider::Laya
+            }
+        );
+        assert_eq!(request(&actions).provider, Provider::Laya);
+    }
+
+    #[test]
+    fn digits_start_the_watching_pairings() {
+        use crate::engine::Provider::{Jev, Laya};
+        for (digit, white, black) in [
+            ('5', Jev, Jev),
+            ('6', Laya, Laya),
+            ('7', Jev, Laya),
+            ('8', Laya, Jev),
+        ] {
+            let mut h = Harness::with_engines(FakeEngine::jev(), FakeEngine::laya());
+            let actions = h.char(digit);
+            assert_eq!(h.app.mode(), Mode::Watch { white, black }, "{digit}");
+            assert_eq!(request(&actions).provider, white, "{digit}");
+        }
+        let mut h = Harness::new();
+        h.char('9');
+        assert_eq!(h.app.dialog_name(), Some("load fen"));
+    }
+
+    #[test]
+    fn clicking_a_computer_name_picks_it() {
+        let mut h = Harness::with_engines(FakeEngine::jev(), FakeEngine::laya());
+        h.click_hit(Hit::MenuComputer(Provider::Laya));
+        assert_eq!(h.app.computer(), Provider::Laya);
+        assert_eq!(
+            h.app.screen(),
+            Screen::Menu,
+            "the click does not start a game"
+        );
+        h.click_hit(Hit::MenuComputer(Provider::Jev));
+        assert_eq!(h.app.computer(), Provider::Jev);
     }
 }

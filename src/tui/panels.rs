@@ -195,8 +195,8 @@ fn menu(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap) {
     let width = MENU_WIDTH.min(area.width);
     let text_width = width.saturating_sub(2 + 2 * MENU_PADDING);
     let index = app.menu_index().min(MENU_ITEMS.len() - 1);
-    let computer = app.player_name(Provider::Jev);
-    let about = menu_description(MENU_ITEMS[index], computer);
+    let computer = app.player_name(app.computer());
+    let about = menu_description(MENU_ITEMS[index], computer, |p| app.player_name(p));
     let about_rows = wrapped_height(&about, text_width);
     let notes = menu_notes(app);
     let notes_rows = notes
@@ -204,10 +204,16 @@ fn menu(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap) {
         .map(|note| note.rows(text_width))
         .fold(0u16, u16::saturating_add);
     let items = u16::try_from(MENU_ITEMS.len()).unwrap_or(u16::MAX);
-    // Borders, title, gap, items, gap, about, gap, notes, gap, keys.
-    let height = [2, 1, 1, items, 1, about_rows, 1, notes_rows, 1, 1]
-        .into_iter()
-        .fold(0u16, u16::saturating_add);
+    // Borders, heading, items, gap, about, gap, notes, gap, keys. The about line goes
+    // first when the menu does not fit, so the engine statuses keep their rows.
+    let sum = |rows: [u16; 9]| rows.into_iter().fold(0u16, u16::saturating_add);
+    let full = sum([2, 1, items, 1, about_rows, 1, notes_rows, 1, 1]);
+    let (about_rows, about_gap) = if full > area.height {
+        (0, 0)
+    } else {
+        (about_rows, 1)
+    };
+    let height = sum([2, 1, items, 1, about_rows, about_gap, notes_rows, 1, 1]);
     let rect = centered(area, width, height);
     let block = Block::bordered()
         .title(" rchess ".bold())
@@ -215,16 +221,41 @@ fn menu(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap) {
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
-    frame.render_widget(Line::from("New game").bold(), row_of(inner, 0));
-    for (index, (item, offset)) in MENU_ITEMS.iter().zip(2u16..).enumerate() {
+    let heading = row_of(inner, 0);
+    let mut spans = vec![Span::raw("New game").bold(), Span::raw(" · Computer: ")];
+    let mut x = heading.x + u16::try_from("New game · Computer: ".chars().count()).unwrap_or(0);
+    for provider in [Provider::Jev, Provider::Laya] {
+        let text = format!(" {} ", provider.name());
+        let width = u16::try_from(text.chars().count()).unwrap_or(0);
+        let span = if provider == app.computer() {
+            Span::raw(text).reversed()
+        } else {
+            Span::raw(text)
+        };
+        spans.push(span);
+        let hit = Rect::new(x, heading.y, width, 1).intersection(heading);
+        hits.push(hit, Hit::MenuComputer(provider));
+        x = x.saturating_add(width).saturating_add(1);
+        spans.push(Span::raw(" "));
+    }
+    frame.render_widget(Line::from(spans), heading);
+    for (index, (item, offset)) in MENU_ITEMS.iter().zip(1u16..).enumerate() {
         let row = row_of(inner, offset);
         let selected = index == app.menu_index();
         let marker = if selected { ">" } else { " " };
-        let line = Line::from(format!("{marker} {}. {}", index + 1, item.label(computer)));
+        let number = if index < 9 {
+            format!("{}.", index + 1)
+        } else {
+            "  ".to_string()
+        };
+        let line = Line::from(format!(
+            "{marker} {number} {}",
+            item.label(computer, |p| app.player_name(p))
+        ));
         frame.render_widget(if selected { line.reversed() } else { line }, row);
         hits.push(row, Hit::MenuItem(index));
     }
-    let about_top = inner.y.saturating_add(items + 3);
+    let about_top = inner.y.saturating_add(items + 2);
     let about_area = Rect::new(inner.x, about_top, inner.width, about_rows).intersection(inner);
     frame.render_widget(
         Paragraph::new(about).dim().wrap(Wrap { trim: true }),
@@ -232,7 +263,7 @@ fn menu(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap) {
     );
     // The keys stay on the bottom row; the notes get what is left above them.
     let keys = last_row(inner);
-    let notes_top = about_area.bottom().saturating_add(1);
+    let notes_top = about_area.bottom().saturating_add(about_gap);
     let notes_height = keys.y.saturating_sub(notes_top.saturating_add(1));
     let notes_area = Rect::new(inner.x, notes_top, inner.width, notes_height).intersection(inner);
     let (notes, more) = fit_notes(notes, notes_area.width, notes_area.height);
@@ -243,24 +274,41 @@ fn menu(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap) {
         note.render(frame, rect);
         top = top.saturating_add(rows);
     }
-    frame.render_widget(
-        Line::from("arrows/jk choose · Enter/1-7 start · q quit").dim(),
-        keys,
+    let hint = fitted(
+        "arrows/jk choose · Tab computer · Enter/1-9 start · q quit".to_string(),
+        "jk choose · Tab computer · 1-9 start · q quit".to_string(),
+        keys.width,
     );
+    frame.render_widget(Line::from(hint).dim(), keys);
 }
 
-/// One line about a menu entry, with the computer called `computer`.
-fn menu_description(item: MenuItem, computer: &str) -> String {
+/// One line about a menu entry, with the toggled computer called `computer` and each
+/// watching side called `name(provider)`.
+fn menu_description(
+    item: MenuItem,
+    computer: &str,
+    name: impl Fn(Provider) -> &'static str,
+) -> String {
     match item {
         MenuItem::HumanVsHuman => "Two players take turns at this keyboard.".to_string(),
-        MenuItem::HumanVsJev(SidePick::White) => "You play White and move first.".to_string(),
-        MenuItem::HumanVsJev(SidePick::Black) => {
+        MenuItem::HumanVsComputer(SidePick::White) => "You play White and move first.".to_string(),
+        MenuItem::HumanVsComputer(SidePick::Black) => {
             format!("{computer} plays White and opens; the board is flipped.")
         }
-        MenuItem::HumanVsJev(SidePick::Random) => {
+        MenuItem::HumanVsComputer(SidePick::Random) => {
             "A coin flip decides which side you play.".to_string()
         }
-        MenuItem::JevVsJev => format!("Watch {computer} play itself (space pauses, +/- pace)."),
+        MenuItem::Watch { white, black } if white == black => {
+            format!(
+                "Watch {} play itself (space pauses, +/- pace).",
+                name(white)
+            )
+        }
+        MenuItem::Watch { white, black } => format!(
+            "Watch {} (White) play {} (space pauses, +/- pace).",
+            name(white),
+            name(black)
+        ),
         MenuItem::LoadFen => "Paste a FEN and play it, Human vs Human.".to_string(),
         MenuItem::Quit => "Leave rchess.".to_string(),
     }
@@ -355,18 +403,21 @@ fn fit_notes(mut notes: Vec<Note>, width: u16, rows: u16) -> (Vec<Note>, Option<
 /// What a warning note starts with on the menu.
 const WARNING_MARKER: &str = "! ";
 
-/// The engine status (green when Jev plays, yellow for the local search alone) and one
-/// [`WARNING_MARKER`] note per warning.
+/// The engine statuses (green when that model plays, yellow for the local search alone)
+/// and one [`WARNING_MARKER`] note per warning.
 fn menu_notes(app: &App) -> Vec<Note> {
-    let mut notes = vec![Note {
-        marker: "",
-        text: app.engine_status(Provider::Jev).to_string(),
-        style: if app.enabled(Provider::Jev) {
-            Style::new().green()
-        } else {
-            Style::new().yellow()
-        },
-    }];
+    let mut notes: Vec<Note> = [Provider::Jev, Provider::Laya]
+        .into_iter()
+        .map(|provider| Note {
+            marker: "",
+            text: app.engine_status(provider).to_string(),
+            style: if app.enabled(provider) {
+                Style::new().green()
+            } else {
+                Style::new().yellow()
+            },
+        })
+        .collect();
     notes.extend(app.warnings().iter().map(|warning| Note {
         marker: WARNING_MARKER,
         text: warning.clone(),
@@ -1754,6 +1805,7 @@ mod tests {
     use super::*;
     use crate::core::{START_FEN, Square};
     use crate::engine::Provider;
+    use crate::tui::app::{MIN_HEIGHT, MIN_WIDTH};
     use crate::tui::board::{image_area, square_at, square_rect};
     use crate::tui::debug::{BodyCache, DebugLog, NO_LOG_PATH};
     use crate::tui::event::AppEvent;
@@ -2327,21 +2379,22 @@ mod tests {
         let tall = screen(24);
         assert!(tall.contains("! warning 6"), "{tall}");
         assert!(!tall.contains("more warning"), "{tall}");
-        // At 60×20 the notes get four rows: the status, two warnings and the count.
+        // At 60×20 the notes get four rows: the two engine statuses, a warning and the
+        // count.
         let short = screen(20);
-        assert!(short.contains("! warning 2"), "{short}");
-        assert!(!short.contains("! warning 3"), "{short}");
-        assert!(short.contains("+4 more warnings"), "{short}");
+        assert!(short.contains("! warning 1"), "{short}");
+        assert!(!short.contains("! warning 2"), "{short}");
+        assert!(short.contains("+5 more warnings"), "{short}");
         // One row more shows one more warning.
         let taller = screen(21);
-        assert!(taller.contains("! warning 3"), "{taller}");
-        assert!(taller.contains("+3 more warnings"), "{taller}");
+        assert!(taller.contains("! warning 2"), "{taller}");
+        assert!(taller.contains("+4 more warnings"), "{taller}");
     }
 
     #[test]
     fn a_warning_too_long_for_the_rows_left_is_counted_too() {
-        // At 60x20 the notes get four rows: the status, a short warning, and no room for
-        // a warning three rows long, so the count takes its place.
+        // At 60x20 the notes get four rows: the two engine statuses, a short warning, and
+        // no room for a warning three rows long, so the count takes its place.
         let warnings = vec!["short".to_string(), "long ".repeat(25)];
         let h = Harness::build(FakeEngine::local(), (60, 20), warnings, |app| app);
         let screen = h.screen();
@@ -3040,7 +3093,7 @@ mod tests {
     #[test]
     fn snapshot_load_fen_error_at_the_minimum_size() {
         let mut h = jev(60, 20);
-        h.char('6');
+        h.char('9');
         h.type_text("hello");
         h.press(KeyCode::Enter);
         insta::assert_snapshot!("load_fen_error_60x20", h.terminal.backend());
@@ -3311,5 +3364,38 @@ mod tests {
         let panel = panel_text(&h, "Laya");
         assert!(panel.contains("played e5"), "{panel:?}");
         assert!(panel.contains("laya-test"), "{panel:?}");
+    }
+
+    #[test]
+    fn menu_with_both_engines() {
+        let h = Harness::with_engines(FakeEngine::jev(), FakeEngine::laya());
+        insta::assert_snapshot!("menu_both_engines_80x24", h.terminal.backend());
+    }
+
+    #[test]
+    fn menu_with_laya_selected_and_no_laya_url() {
+        let mut h = Harness::with_engines(FakeEngine::jev(), FakeEngine::local_laya());
+        h.press(KeyCode::Tab);
+        insta::assert_snapshot!("menu_laya_off_80x24", h.terminal.backend());
+    }
+
+    #[test]
+    fn menu_fits_the_minimum_size_with_warnings() {
+        let jev =
+            FakeEngine::jev().with_warnings(&["JEV_MAX_OPTIONS=lots is not a number; using 40"]);
+        let laya = FakeEngine::local_laya()
+            .with_warnings(&["LAYA_URL=x is not an http(s) URL; Laya is off"]);
+        let h = Harness::build_with(
+            jev,
+            laya,
+            (MIN_WIDTH, MIN_HEIGHT),
+            vec!["unknown --glyphs value".to_string()],
+            |app| app,
+        );
+        let screen = h.screen();
+        assert!(screen.contains("1. Human vs Human"), "{screen}");
+        assert!(screen.contains("Quit"), "{screen}");
+        assert!(screen.contains("Computer:"), "{screen}");
+        insta::assert_snapshot!("menu_min_size_60x20", h.terminal.backend());
     }
 }
