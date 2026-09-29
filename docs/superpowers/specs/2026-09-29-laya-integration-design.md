@@ -292,3 +292,7 @@ With `pip install "laya[serve]"` and `laya-serve` running:
 - The menu toggle names the models (`Jev`, `Laya`) even when an engine is off, so the two choices
   stay distinguishable.
 - `--help` lists the Laya variables.
+- A `LAYA_URL` with a user name or password (`user:pass@host`) is rejected with a warning that
+  does not quote it: ureq would send it as a Basic credential the debug record does not show,
+  and the URL is shown on the menu and in the log. `laya-serve` takes `LAYA_API_KEY` instead.
+- An engine-panic fallback move is credited to the engine that panicked.

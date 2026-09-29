@@ -466,7 +466,7 @@ The API key never appears anywhere the app writes: not in the view, the log, not
 | `JEV_MODEL` | `jev-latest` | Model alias or versioned ID. |
 | `JEV_MAX_OPTIONS` | `40` | Shortlist size, 1–255. |
 | `JEV_FILTER_LOSING` | `true` | Keep `losing` moves off the shortlist when others exist. |
-| `LAYA_URL` | none | `laya-serve` endpoint, e.g. `http://127.0.0.1:8000/v1/systemone`. Without it, Laya uses local search. |
+| `LAYA_URL` | none | `laya-serve` endpoint, e.g. `http://127.0.0.1:8000/v1/systemone` (no `user:pass@`; use `LAYA_API_KEY`). Without it, Laya uses local search. |
 | `LAYA_API_KEY` | none | Key `laya-serve` asks for, if it was started with one. |
 | `LAYA_MODEL` | `laya` | Model sent to `laya-serve`. |
 | `LAYA_MAX_OPTIONS` | `40` | Laya's shortlist size, 1–255. |

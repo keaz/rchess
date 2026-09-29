@@ -157,7 +157,13 @@ impl EngineConfig {
         }
         if let Some(url) = non_empty("LAYA_URL") {
             let lower = url.to_ascii_lowercase();
-            if lower.starts_with("http://") || lower.starts_with("https://") {
+            if has_userinfo(&url) {
+                // The URL is not quoted: its password would reach the menu.
+                config.warnings.push(
+                    "LAYA_URL has a user name or password; Laya is off (use LAYA_API_KEY)"
+                        .to_string(),
+                );
+            } else if lower.starts_with("http://") || lower.starts_with("https://") {
                 if config.api_key.is_some()
                     && let Some(host) = clear_text_host(&url)
                 {
@@ -225,6 +231,16 @@ fn non_empty(get: &impl Fn(&str) -> Option<String>) -> impl Fn(&str) -> Option<S
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
     }
+}
+
+/// True when `url`'s authority (between `://` and the next `/`, `?` or `#`) has a
+/// `user[:password]@` part. ureq would send it as a Basic credential that the debug
+/// record does not show, and the URL itself is shown on the menu and in the log.
+fn has_userinfo(url: &str) -> bool {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    rest.split(['/', '?', '#'])
+        .next()
+        .is_some_and(|authority| authority.contains('@'))
 }
 
 /// The host of a plain `http://` URL that is not this machine (`localhost`,
@@ -486,7 +502,7 @@ mod tests {
                 .any(|w| w.starts_with("LAYA_API_KEY is sent unencrypted"))
         };
         assert!(warned("http://gpu-box:8000/v1/systemone"));
-        assert!(warned("HTTP://user@gpu-box.lan/v1/systemone"));
+        assert!(warned("HTTP://gpu-box.lan:8000/v1/systemone"));
         for url in [
             "http://localhost:8000/v1/systemone",
             "http://127.0.0.1/v1/systemone",
@@ -519,5 +535,24 @@ mod tests {
         assert!(!text.contains("secret-laya-9"), "{text}");
         assert!(text.contains("Laya"), "{text}");
         assert!(text.contains(LOCAL_URL), "{text}");
+    }
+
+    #[test]
+    fn laya_rejects_a_url_with_a_user_name_or_password() {
+        for url in [
+            "http://me:secret-pass@gpu-box:8000/v1/systemone",
+            "https://me@gpu-box/v1/systemone",
+        ] {
+            let c = laya(&[("LAYA_URL", url)]);
+            assert!(!c.enabled(), "{url}");
+            assert_eq!(
+                c.warnings,
+                vec!["LAYA_URL has a user name or password; Laya is off (use LAYA_API_KEY)"]
+            );
+            let text = format!("{c:?}");
+            assert!(!text.contains("secret-pass"), "{text}");
+        }
+        // An `@` after the host (in the path or query) is not userinfo.
+        assert!(laya(&[("LAYA_URL", "http://gpu-box/v1/systemone?by=a@b")]).enabled());
     }
 }

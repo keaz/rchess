@@ -6,9 +6,9 @@ Read this first. Follow the protocol in section 8 of
 ## Current
 Sub-project: laya (Laya as a second computer player; Jev vs Laya) | Spec: docs/superpowers/specs/2026-09-29-laya-integration-design.md
 Branch: feat/laya (from main at fe1eb73)
-Last completed task: Task 8 (offline Laya pty scenario, docs, final verification); all 8 plan tasks done
-Next task: whole-branch review, then the manual test below with a real laya-serve (incl. the `model` field check), then merge feat/laya
-State: green (cargo test 728 passed / 4 ignored, fmt, clippy, pty smoke ALL CHECKS PASSED)
+Last completed task: all 8 plan tasks, plus the final-review fix pass (panic fallback provider, LAYA_URL userinfo rejected)
+Next task: the manual test below with a real laya-serve (incl. the `model` field check), then merge feat/laya; deferred minors are in the final report
+State: green (cargo test 730 passed / 4 ignored, fmt, clippy, pty smoke ALL CHECKS PASSED)
 Earlier: main is ahead of origin/main (not pushed); pushing it is still pending.
 
 ## Verify before continuing
