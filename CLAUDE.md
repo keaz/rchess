@@ -86,7 +86,8 @@ is tracked in `docs/handoff/HANDOFF.md` (the protocol is spec section 8).
   records each exchange with the API key redacted. Every transport test is offline, against a
   scripted server on 127.0.0.1.
 - `player`: `ComputerPlayer::choose_move` plays forced moves and mate-in-one directly, otherwise
-  asks Jev one `choice` question over a shortlist and vetoes blunders. It never fails: every
+  asks Jev one `choice` question over a shortlist (moves that repeat an earlier position are left
+  off unless the side is worse) and vetoes blunders. It never fails: every
   problem (no key, HTTP errors, a bad answer) falls back to the local search's best move, noted
   in `ComputerMove.note`, with `MoveSource` saying where the move came from
   (`MoveSource::label(provider)` names the model) and `ComputerMove.provider` which model.
