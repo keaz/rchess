@@ -1213,17 +1213,17 @@ fn exchange_screen(
         let index = view.index(history)?;
         Some((index, history.len(), history.get(index)?))
     });
-    // The shown exchange's model, or before any the computer this game shows.
-    let engine = shown.map_or_else(
-        || {
-            app.panel_provider()
-                .map_or("Jev", Provider::name)
-                .to_string()
-        },
-        |(_, _, record)| record.exchange.engine.clone(),
-    );
+    // The shown exchange's model, or before any the computer this game shows; a game
+    // without a computer names none.
+    let title = shown
+        .map(|(_, _, record)| record.exchange.engine.clone())
+        .or_else(|| app.panel_provider().map(|p| p.name().to_string()))
+        .map_or_else(
+            || " Exchange ".to_string(),
+            |engine| format!(" {engine} exchange "),
+        );
     let block = Block::bordered()
-        .title(Line::from(format!(" {engine} exchange ")).bold())
+        .title(Line::from(title).bold())
         .title_bottom(Line::from(EXCHANGE_KEYS).dim())
         .padding(Padding::horizontal(1));
     let inner = block.inner(area);
@@ -3463,5 +3463,18 @@ mod tests {
         h.reply_traced("e2e4");
         h.char('d');
         assert!(h.screen().contains(" Laya exchange "), "{}", h.screen());
+    }
+
+    #[test]
+    fn the_exchange_view_names_no_model_in_human_vs_human() {
+        let mut h = Harness::build(FakeEngine::jev(), (100, 30), Vec::new(), |app| {
+            app.with_debug(DebugLog::open(Err(NO_LOG_PATH.to_string())))
+        });
+        h.char('1');
+        h.char('d');
+        let screen = h.screen();
+        assert!(screen.contains(" Exchange "), "{screen}");
+        assert!(!screen.contains("Jev exchange"), "{screen}");
+        assert!(screen.contains("no requests yet"), "{screen}");
     }
 }

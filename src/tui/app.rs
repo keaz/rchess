@@ -5328,7 +5328,7 @@ mod tests {
         assert_eq!(h.app.screen_name(), "game over");
         h.char('d');
         assert!(h.app.exchange_view().is_some(), "d opens the exchange view");
-        assert!(h.screen().contains("Jev exchange"));
+        assert!(h.screen().contains(" Exchange "), "Human vs Human names no model");
         h.press(KeyCode::Esc);
         assert_eq!(h.app.exchange_view(), None);
         assert_eq!(
@@ -5357,7 +5357,8 @@ mod tests {
         );
         let screen = h.screen();
         assert!(screen.contains("Jev exchange"), "{screen}");
-        assert!(screen.contains("no Jev requests yet"), "{screen}");
+        assert!(screen.contains("no requests yet"), "{screen}");
+        assert!(!screen.contains("no Jev requests"), "{screen}");
         assert!(!screen.contains("Board"), "the view covers the screen");
         assert!(h.app.hit_map().board.is_none());
         h.char('e');

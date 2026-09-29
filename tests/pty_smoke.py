@@ -23,7 +23,7 @@ network), drives it with keystrokes or signals, and checks:
   menu says Laya is ready, Laya's moves fall back to the local search with a
   "Laya unavailable" note, the game goes on, and quitting restores the terminal;
 * --debug (and RCHESS_DEBUG=1) against the local search: the Status border says
-  DEBUG, `d` shows an exchange view with "no Jev requests yet", and no debug log
+  DEBUG, `d` shows an exchange view with "no requests yet", and no debug log
   is created, since no Jev request was made;
 * the graphics query (spec 9.3), on a pty that
   - never answers: the query is written once, in raw mode, between ?1049h and
@@ -980,11 +980,11 @@ def scenario_debug(binary, via_env):
         check(app.wait_screen("Black to move", timeout=10.0), "the computer played White's first move")
         check("DEBUG" in app.screen().text(), "the Status border says DEBUG")
         app.send(b"d")
-        check(app.wait_screen("no Jev requests yet"), "d opens the exchange view, which has nothing yet")
+        check(app.wait_screen("no requests yet"), "d opens the exchange view, which has nothing yet")
         app.screen().show("exchange view")
         app.send(b"\x1b", settle=0)
         check(
-            app.wait_screen_without("no Jev requests yet") and "Black to move" in app.screen().text(),
+            app.wait_screen_without("no requests yet") and "Black to move" in app.screen().text(),
             "Esc goes back to the board",
         )
         app.send(b"q")
