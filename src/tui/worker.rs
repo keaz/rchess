@@ -27,7 +27,10 @@ use std::time::Instant;
 
 use super::debug::Exchange;
 use crate::core::Game;
-use crate::engine::{ComputerMove, ComputerPlayer, EngineConfig, MoveChooser, MoveSource, analyse};
+use crate::engine::{
+    ComputerMove, ComputerPlayer, EngineConfig, MoveChooser, MoveSource, Provider, analyse,
+    printable,
+};
 
 /// Name of every engine thread. The panic hook in `terminal` leaves the terminal
 /// alone for panics on any thread other than "main", including this one.
@@ -39,6 +42,10 @@ pub const ENGINE_ERROR_NOTE: &str = "engine error — local search";
 
 /// [`Engine::status`] of a player without a Jev key.
 pub const LOCAL_SEARCH_STATUS: &str = "No JEV_API_KEY — local search";
+/// [`Engine::status`] of a Laya player without `LAYA_URL`.
+pub const LAYA_LOCAL_SEARCH_STATUS: &str = "No LAYA_URL — local search";
+/// Longest part of `LAYA_URL` shown in the Laya status.
+const STATUS_URL_CHARS: usize = 40;
 
 /// Something that picks computer moves. `ComputerPlayer` in production; tests use
 /// scripted fakes so they never touch the network.
@@ -47,12 +54,16 @@ pub trait Engine: Send + Sync {
     /// many seconds, so only [`spawn_request`] calls it, off the UI thread.
     fn choose(&self, game: &Game) -> Option<ComputerMove>;
 
-    /// One line for the menu: `Jev ready (<model>)` or [`LOCAL_SEARCH_STATUS`].
+    /// One line for the menu: `Jev ready (<model>)`, `Laya ready (<url>)`,
+    /// [`LOCAL_SEARCH_STATUS`] or [`LAYA_LOCAL_SEARCH_STATUS`].
     fn status(&self) -> String;
 
-    /// True when moves come from Jev, false when only the local search plays. The UI
-    /// names the computer player after it: "Jev" or "Local search".
-    fn uses_jev(&self) -> bool;
+    /// The model this engine asks.
+    fn provider(&self) -> Provider;
+
+    /// True when the model is available (Jev has a key, Laya a URL); otherwise every
+    /// move comes from the local search and the UI calls the player "Local search".
+    fn enabled(&self) -> bool;
 
     /// Human-readable notes about ignored or adjusted settings, shown on the menu.
     fn warnings(&self) -> Vec<String>;
@@ -67,12 +78,16 @@ impl<C: MoveChooser> Engine for ComputerPlayer<C> {
         status_for(self.config())
     }
 
+    fn provider(&self) -> Provider {
+        self.config().provider
+    }
+
     /// `ComputerPlayer` does not expose whether it holds a chooser, so this is
-    /// read from its config: `ComputerPlayer::from_config` builds a Jev client
-    /// exactly when `api_key` is set, which makes the two equivalent for the
-    /// player the TUI runs.
-    fn uses_jev(&self) -> bool {
-        self.config().api_key.is_some()
+    /// read from its config: `ComputerPlayer::from_config` builds a client exactly
+    /// when the config is enabled, which makes the two equivalent for the player the
+    /// TUI runs.
+    fn enabled(&self) -> bool {
+        self.config().enabled()
     }
 
     fn warnings(&self) -> Vec<String> {
@@ -82,10 +97,16 @@ impl<C: MoveChooser> Engine for ComputerPlayer<C> {
 
 /// The menu status line for a player built from `config`.
 fn status_for(config: &EngineConfig) -> String {
-    if config.api_key.is_some() {
-        format!("Jev ready ({})", config.model)
-    } else {
-        LOCAL_SEARCH_STATUS.to_string()
+    match (config.provider, config.enabled()) {
+        (Provider::Jev, true) => format!("Jev ready ({})", config.model),
+        (Provider::Jev, false) => LOCAL_SEARCH_STATUS.to_string(),
+        (Provider::Laya, true) => {
+            format!(
+                "Laya ready ({})",
+                printable(&config.endpoint, STATUS_URL_CHARS)
+            )
+        }
+        (Provider::Laya, false) => LAYA_LOCAL_SEARCH_STATUS.to_string(),
     }
 }
 
@@ -98,16 +119,19 @@ pub struct EngineRequest {
     pub hash: u64,
     /// A snapshot of the game; the engine thread owns it.
     pub game: Game,
+    /// The model that must answer: the player of the side to move.
+    pub provider: Provider,
 }
 
 impl EngineRequest {
-    /// A request for `game`'s current position, stamped with `generation`.
+    /// A request to `provider` for `game`'s current position, stamped with `generation`.
     #[must_use]
-    pub fn new(generation: u64, game: Game) -> EngineRequest {
+    pub fn new(generation: u64, game: Game, provider: Provider) -> EngineRequest {
         EngineRequest {
             generation,
             hash: game.position().hash(),
             game,
+            provider,
         }
     }
 }
@@ -266,7 +290,7 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use crate::engine::JevClient;
+    use crate::engine::{JevClient, Provider};
     use crate::tui::test_support::engine::{
         FakeEngine, REPLY_TIMEOUT, Turn, jev_exchange, jev_move,
     };
@@ -309,7 +333,7 @@ mod tests {
     #[test]
     fn request_new_stamps_the_position_hash() {
         let game = Game::new();
-        let request = EngineRequest::new(7, game.clone());
+        let request = EngineRequest::new(7, game.clone(), Provider::Jev);
         assert_eq!(request.generation, 7);
         assert_eq!(request.hash, game.position().hash());
     }
@@ -318,7 +342,10 @@ mod tests {
     fn normal_move_echoes_generation_and_hash() {
         let game = Game::new();
         let engine = fake(Turn::Play("e2e4"));
-        let reply = round_trip(engine.clone(), EngineRequest::new(3, game.clone()));
+        let reply = round_trip(
+            engine.clone(),
+            EngineRequest::new(3, game.clone(), Provider::Jev),
+        );
 
         assert_eq!(reply.generation, 3);
         assert_eq!(reply.hash, game.position().hash());
@@ -334,7 +361,7 @@ mod tests {
         let game = game_from(crate::core::START_FEN, &["e2e4"]);
         let reply = round_trip(
             fake(Turn::Traced("e7e5")),
-            EngineRequest::new(2, game.clone()),
+            EngineRequest::new(2, game.clone(), Provider::Jev),
         );
         assert_eq!(
             reply.outcome,
@@ -354,7 +381,7 @@ mod tests {
 
     #[test]
     fn untraced_replies_carry_no_exchange() {
-        let request = EngineRequest::new(1, Game::new());
+        let request = EngineRequest::new(1, Game::new(), Provider::Jev);
         assert_eq!(
             round_trip(fake(Turn::Play("e2e4")), request.clone()).exchange,
             None
@@ -372,7 +399,10 @@ mod tests {
 
     #[test]
     fn no_move_means_game_over() {
-        let reply = round_trip(fake(Turn::GameOver), EngineRequest::new(5, Game::new()));
+        let reply = round_trip(
+            fake(Turn::GameOver),
+            EngineRequest::new(5, Game::new(), Provider::Jev),
+        );
         assert_eq!(reply.generation, 5);
         assert_eq!(reply.outcome, EngineOutcome::GameOver);
     }
@@ -385,7 +415,10 @@ mod tests {
             Turn::PanicOther,
         ] {
             let game = Game::new();
-            let reply = round_trip(fake(turn), EngineRequest::new(9, game.clone()));
+            let reply = round_trip(
+                fake(turn),
+                EngineRequest::new(9, game.clone(), Provider::Jev),
+            );
             assert_eq!(reply.generation, 9);
             assert_eq!(reply.hash, game.position().hash());
             let EngineOutcome::Move(mv) = reply.outcome else {
@@ -404,7 +437,7 @@ mod tests {
     fn the_fallback_latency_includes_the_failed_call() {
         let reply = round_trip(
             fake(Turn::SlowPanic(Duration::from_millis(60))),
-            EngineRequest::new(1, Game::new()),
+            EngineRequest::new(1, Game::new(), Provider::Jev),
         );
         let EngineOutcome::Move(mv) = reply.outcome else {
             panic!("expected the fallback move, got {:?}", reply.outcome);
@@ -418,7 +451,7 @@ mod tests {
         let mate = Game::from_fen(MATED).unwrap();
         let reply = round_trip(
             fake(Turn::Panic("chooser exploded")),
-            EngineRequest::new(1, mate),
+            EngineRequest::new(1, mate, Provider::Jev),
         );
         assert_eq!(reply.outcome, EngineOutcome::GameOver);
     }
@@ -457,12 +490,18 @@ mod tests {
         let engine = Arc::new(
             FakeEngine::jev().scripted([Turn::Panic("chooser exploded"), Turn::Play("g1f3")]),
         );
-        let first = round_trip(engine.clone(), EngineRequest::new(1, Game::new()));
+        let first = round_trip(
+            engine.clone(),
+            EngineRequest::new(1, Game::new(), Provider::Jev),
+        );
         assert!(matches!(
             &first.outcome,
             EngineOutcome::Move(mv) if mv.note.as_deref() == Some(ENGINE_ERROR_NOTE)
         ));
-        let second = round_trip(engine.clone(), EngineRequest::new(2, Game::new()));
+        let second = round_trip(
+            engine.clone(),
+            EngineRequest::new(2, Game::new(), Provider::Jev),
+        );
         assert_eq!(second.generation, 2);
         assert!(matches!(
             &second.outcome,
@@ -476,8 +515,12 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         drop(rx);
         let engine = fake(Turn::Play("e2e4"));
-        let thread = spawn_request(engine.clone(), EngineRequest::new(1, Game::new()), tx)
-            .expect("engine thread spawns");
+        let thread = spawn_request(
+            engine.clone(),
+            EngineRequest::new(1, Game::new(), Provider::Jev),
+            tx,
+        )
+        .expect("engine thread spawns");
         // The thread ends after its send, so a panic there would fail the join.
         thread
             .join()
@@ -502,7 +545,7 @@ mod tests {
     #[test]
     fn stale_after_the_game_moves_on() {
         let mut game = Game::new();
-        let request = EngineRequest::new(1, game.clone());
+        let request = EngineRequest::new(1, game.clone(), Provider::Jev);
         let reply = round_trip(fake(Turn::Play("e2e4")), request);
         assert!(is_current(&reply, 1, game.position().hash()));
 
@@ -531,15 +574,15 @@ mod tests {
     }
 
     #[test]
-    fn computer_player_uses_jev_exactly_when_a_key_is_set() {
+    fn computer_player_is_enabled_exactly_when_a_key_is_set() {
         // Building the client is offline; only `choose` would reach the network.
         let with_key = ComputerPlayer::from_config(EngineConfig {
             api_key: Some("test-key".to_string()),
             ..EngineConfig::default()
         });
-        assert!(with_key.uses_jev());
+        assert!(Engine::enabled(&with_key));
         let without_key = ComputerPlayer::from_config(EngineConfig::default());
-        assert!(!without_key.uses_jev());
+        assert!(!Engine::enabled(&without_key));
     }
 
     #[test]
@@ -560,7 +603,10 @@ mod tests {
             EngineConfig::default(),
         ));
         let game = Game::new();
-        let reply = round_trip(player.clone(), EngineRequest::new(1, game.clone()));
+        let reply = round_trip(
+            player.clone(),
+            EngineRequest::new(1, game.clone(), Provider::Jev),
+        );
         let EngineOutcome::Move(mv) = reply.outcome else {
             panic!("expected a move, got {:?}", reply.outcome);
         };
@@ -569,7 +615,39 @@ mod tests {
 
         // Fool's mate: White is checkmated, so there is no move.
         let mate = Game::from_fen(MATED).unwrap();
-        let reply = round_trip(player, EngineRequest::new(2, mate));
+        let reply = round_trip(player, EngineRequest::new(2, mate, Provider::Jev));
         assert_eq!(reply.outcome, EngineOutcome::GameOver);
+    }
+
+    #[test]
+    fn laya_status_and_provider() {
+        let off = ComputerPlayer::from_config(EngineConfig::laya_from_vars(|_| None));
+        assert_eq!(off.status(), LAYA_LOCAL_SEARCH_STATUS);
+        assert_eq!(Engine::provider(&off), Provider::Laya);
+        assert!(!Engine::enabled(&off));
+
+        let url = "http://127.0.0.1:8000/v1/systemone";
+        let on = ComputerPlayer::from_config(EngineConfig::laya_from_vars(|name| {
+            (name == "LAYA_URL").then(|| url.to_string())
+        }));
+        assert_eq!(on.status(), format!("Laya ready ({url})"));
+        assert!(Engine::enabled(&on));
+
+        let long = format!("http://{}/v1/systemone", "h".repeat(60));
+        let long = ComputerPlayer::from_config(EngineConfig::laya_from_vars(|name| {
+            (name == "LAYA_URL").then(|| long.clone())
+        }));
+        let status = long.status();
+        assert!(
+            status.chars().count() <= "Laya ready ()".len() + 40,
+            "{status}"
+        );
+    }
+
+    #[test]
+    fn a_request_carries_its_provider() {
+        let request = EngineRequest::new(7, Game::new(), Provider::Laya);
+        assert_eq!(request.provider, Provider::Laya);
+        assert_eq!(request.generation, 7);
     }
 }

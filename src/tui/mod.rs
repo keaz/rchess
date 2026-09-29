@@ -37,7 +37,7 @@ use ratatui::backend::Backend;
 use ratatui::crossterm::event::{Event, KeyEventKind, MouseEventKind};
 
 use crate::core::Game;
-use crate::engine::{ComputerMove, ComputerPlayer, EngineConfig};
+use crate::engine::{ComputerMove, ComputerPlayer, EngineConfig, Provider};
 
 use self::app::{Action, App};
 use self::board::CellSize;
@@ -416,8 +416,12 @@ impl Engine for PanickingEngine {
         self.0.status()
     }
 
-    fn uses_jev(&self) -> bool {
-        self.0.uses_jev()
+    fn provider(&self) -> Provider {
+        self.0.provider()
+    }
+
+    fn enabled(&self) -> bool {
+        self.0.enabled()
     }
 
     fn warnings(&self) -> Vec<String> {
@@ -1688,7 +1692,11 @@ mod tests {
         let engine: Arc<dyn Engine> = Arc::new(PanickingEngine(local_engine()));
         assert_eq!(engine.status(), "No JEV_API_KEY — local search");
         let (tx, rx) = mpsc::channel();
-        request_engine(worker::EngineRequest::new(1, Game::new()), &engine, &tx);
+        request_engine(
+            worker::EngineRequest::new(1, Game::new(), Provider::Jev),
+            &engine,
+            &tx,
+        );
         let reply = rx.recv_timeout(REPLY_TIMEOUT).expect("a reply arrives");
         let EngineOutcome::Move(computer) = reply.outcome else {
             panic!("expected the fallback move, got {:?}", reply.outcome);
@@ -1733,7 +1741,7 @@ mod tests {
     fn engine_requests_are_answered_on_the_reply_channel() {
         let engine = local_engine();
         let (tx, rx) = mpsc::channel();
-        let request = worker::EngineRequest::new(7, crate::core::Game::new());
+        let request = worker::EngineRequest::new(7, crate::core::Game::new(), Provider::Jev);
         let hash = request.hash;
 
         request_engine(request, &engine, &tx);
@@ -1780,8 +1788,12 @@ mod tests {
             self.inner.status()
         }
 
-        fn uses_jev(&self) -> bool {
-            self.inner.uses_jev()
+        fn provider(&self) -> Provider {
+            self.inner.provider()
+        }
+
+        fn enabled(&self) -> bool {
+            self.inner.enabled()
         }
 
         fn warnings(&self) -> Vec<String> {

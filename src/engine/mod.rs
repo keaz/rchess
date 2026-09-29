@@ -17,7 +17,7 @@ pub use describe::JevState;
 pub(crate) use jev::tests::recorded_exchange;
 pub use jev::{
     ChoiceAnswer, ChoiceOption, ChoiceRequest, JEV_ENDPOINT, JevAttempt, JevClient, JevError,
-    JevExchange, MoveChooser,
+    JevExchange, MoveChooser, printable,
 };
 pub use player::{ComputerMove, ComputerPlayer, MoveSource};
 pub use search::{MATE, ScoredMove, analyse};

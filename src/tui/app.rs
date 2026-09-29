@@ -77,7 +77,7 @@ use super::worker::{
     ENGINE_ERROR_NOTE, Engine, EngineOutcome, EngineReply, EngineRequest, is_current,
 };
 use crate::core::{ChessError, Color as Side, Game, Move, Outcome, PieceKind, Square};
-use crate::engine::ComputerMove;
+use crate::engine::{ComputerMove, Provider};
 
 /// Smallest terminal the UI draws in; below it only [`TOO_SMALL`] is shown.
 pub const MIN_WIDTH: u16 = 60;
@@ -710,7 +710,7 @@ impl App {
         warnings: Vec<String>,
     ) -> App {
         let engine_status = engine.status();
-        let uses_jev = engine.uses_jev();
+        let uses_jev = engine.enabled();
         let mut all_warnings = engine.warnings();
         for warning in warnings {
             if !all_warnings.contains(&warning) {
@@ -1814,7 +1814,11 @@ impl App {
         }
         self.pending = Some(Pending { since: now });
         self.in_flight += 1;
-        Some(EngineRequest::new(self.generation, self.game.clone()))
+        Some(EngineRequest::new(
+            self.generation,
+            self.game.clone(),
+            Provider::Jev,
+        ))
     }
 
     // ----- game actions -----

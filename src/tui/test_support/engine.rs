@@ -16,7 +16,7 @@ use super::{char_events, chord_event, key_event, mouse_event, paste_event};
 use crate::core::{Game, Move, Position as ChessPosition};
 use crate::engine::{ComputerMove, JEV_ENDPOINT, JevAttempt, JevExchange, MoveSource, Provider};
 use crate::tui::event::AppEvent;
-use crate::tui::worker::{Engine, LOCAL_SEARCH_STATUS};
+use crate::tui::worker::{Engine, LAYA_LOCAL_SEARCH_STATUS, LOCAL_SEARCH_STATUS};
 
 /// How long a test waits for a worker thread's reply: generous, so a broken worker fails
 /// the test instead of hanging it.
@@ -80,23 +80,45 @@ pub(crate) fn jev_move(pos: &ChessPosition, uci: &str) -> ComputerMove {
 
 /// The note a player without a Jev key puts on its moves.
 pub(crate) const LOCAL_NOTE: &str = "JEV_API_KEY not set — local search";
+/// [`Engine::status`] of [`FakeEngine::laya`].
+pub(crate) const LAYA_STATUS: &str = "Laya ready (http://127.0.0.1:8000/v1/systemone)";
+/// The note a Laya player without `LAYA_URL` puts on its moves.
+pub(crate) const LAYA_LOCAL_NOTE: &str = "LAYA_URL not set — local search";
 
-/// `uci` played in `pos` as a player without a Jev key reports it: the local search's
-/// move, with none of Jev's details (runners-up, confidence, model, tokens) and 1234 ms
-/// latency, so screens that show it are deterministic.
-pub(crate) fn local_move(pos: &ChessPosition, uci: &str) -> ComputerMove {
+/// `uci` played in `pos` as the fake `provider` model reports it (see [`jev_move`]).
+pub(crate) fn model_move(pos: &ChessPosition, uci: &str, provider: Provider) -> ComputerMove {
+    let model = match provider {
+        Provider::Jev => "jev-test",
+        Provider::Laya => "laya-test",
+    };
+    ComputerMove {
+        provider,
+        model: Some(model.to_string()),
+        ..jev_move(pos, uci)
+    }
+}
+
+/// `uci` played in `pos` as `provider`'s player without its setting (`JEV_API_KEY`,
+/// `LAYA_URL`) reports it: the local search's move, with none of the model's details
+/// (runners-up, confidence, model, tokens) and 1234 ms latency, so screens that show it
+/// are deterministic.
+pub(crate) fn local_move_for(pos: &ChessPosition, uci: &str, provider: Provider) -> ComputerMove {
+    let note = match provider {
+        Provider::Jev => LOCAL_NOTE,
+        Provider::Laya => LAYA_LOCAL_NOTE,
+    };
     let mv = pos.parse_uci(uci).expect("scripted move is legal");
     ComputerMove {
         mv,
         san: pos.to_san(mv),
         source: MoveSource::Fallback,
-        provider: Provider::Jev,
+        provider,
         top: Vec::new(),
         confidence: None,
         model: None,
         latency: Duration::from_millis(1234),
         input_tokens: None,
-        note: Some(LOCAL_NOTE.to_string()),
+        note: Some(note.to_string()),
         exchange: None,
     }
 }
@@ -165,7 +187,7 @@ pub(crate) fn traced_jev_move(pos: &ChessPosition, uci: &str) -> ComputerMove {
 
 /// What a [`FakeEngine`] does with one request.
 pub(crate) enum Turn {
-    /// Plays this UCI move, reported as [`jev_move`] reports it ([`local_move`] for
+    /// Plays this UCI move, reported as [`jev_move`] reports it ([`local_move_for`] for
     /// [`FakeEngine::local`]).
     Play(&'static str),
     /// Finds no move, as for a finished game.
@@ -187,10 +209,12 @@ pub(crate) enum Turn {
 ///
 /// Each request takes the next scripted [`Turn`]. Once the script is used up it plays the
 /// first legal move in UCI order, or finds none when the game is over. Its moves look like
-/// Jev's ([`FakeEngine::jev`]) or like the local search's ([`FakeEngine::local`]). It records
-/// the name of every thread it ran on.
+/// the model's ([`FakeEngine::jev`], [`FakeEngine::laya`]) or like the local search's
+/// ([`FakeEngine::local`], [`FakeEngine::local_laya`]). It records the name of every thread
+/// it ran on.
 pub(crate) struct FakeEngine {
-    uses_jev: bool,
+    provider: Provider,
+    enabled: bool,
     warnings: Vec<String>,
     script: Mutex<VecDeque<Turn>>,
     threads: Mutex<Vec<Option<String>>>,
@@ -199,18 +223,30 @@ pub(crate) struct FakeEngine {
 impl FakeEngine {
     /// A player with a Jev key: status [`JEV_STATUS`].
     pub(crate) fn jev() -> FakeEngine {
-        FakeEngine::new(true)
+        FakeEngine::new(Provider::Jev, true)
     }
 
     /// A player without a Jev key: status [`LOCAL_SEARCH_STATUS`], and moves reported as
-    /// the local search's ([`local_move`]).
+    /// the local search's ([`local_move_for`]).
     pub(crate) fn local() -> FakeEngine {
-        FakeEngine::new(false)
+        FakeEngine::new(Provider::Jev, false)
     }
 
-    fn new(uses_jev: bool) -> FakeEngine {
+    /// A Laya player with `LAYA_URL`: status [`LAYA_STATUS`], moves reported as Laya's.
+    pub(crate) fn laya() -> FakeEngine {
+        FakeEngine::new(Provider::Laya, true)
+    }
+
+    /// A Laya player without `LAYA_URL`: status [`LAYA_LOCAL_SEARCH_STATUS`], moves
+    /// reported as the local search's with [`LAYA_LOCAL_NOTE`].
+    pub(crate) fn local_laya() -> FakeEngine {
+        FakeEngine::new(Provider::Laya, false)
+    }
+
+    fn new(provider: Provider, enabled: bool) -> FakeEngine {
         FakeEngine {
-            uses_jev,
+            provider,
+            enabled,
             warnings: Vec::new(),
             script: Mutex::new(VecDeque::new()),
             threads: Mutex::new(Vec::new()),
@@ -251,15 +287,18 @@ impl Engine for FakeEngine {
             .push(thread::current().name().map(str::to_string));
         let turn = self.script.lock().expect("script lock").pop_front();
         let computer_move = |uci: &str| {
-            if self.uses_jev {
-                jev_move(game.position(), uci)
+            if self.enabled {
+                model_move(game.position(), uci, self.provider)
             } else {
-                local_move(game.position(), uci)
+                local_move_for(game.position(), uci, self.provider)
             }
         };
         match turn {
             Some(Turn::Play(uci)) => Some(computer_move(uci)),
-            Some(Turn::Traced(uci)) if self.uses_jev => Some(traced_jev_move(game.position(), uci)),
+            Some(Turn::Traced(uci)) if self.enabled => Some(ComputerMove {
+                exchange: Some(Box::new(jev_exchange())),
+                ..model_move(game.position(), uci, self.provider)
+            }),
             Some(Turn::Traced(uci)) => Some(computer_move(uci)),
             Some(Turn::GameOver) => None,
             Some(Turn::Panic(message)) => panic::panic_any(message),
@@ -285,15 +324,20 @@ impl Engine for FakeEngine {
     }
 
     fn status(&self) -> String {
-        if self.uses_jev {
-            JEV_STATUS.to_string()
-        } else {
-            LOCAL_SEARCH_STATUS.to_string()
+        match (self.provider, self.enabled) {
+            (Provider::Jev, true) => JEV_STATUS.to_string(),
+            (Provider::Jev, false) => LOCAL_SEARCH_STATUS.to_string(),
+            (Provider::Laya, true) => LAYA_STATUS.to_string(),
+            (Provider::Laya, false) => LAYA_LOCAL_SEARCH_STATUS.to_string(),
         }
     }
 
-    fn uses_jev(&self) -> bool {
-        self.uses_jev
+    fn provider(&self) -> Provider {
+        self.provider
+    }
+
+    fn enabled(&self) -> bool {
+        self.enabled
     }
 
     fn warnings(&self) -> Vec<String> {
@@ -327,8 +371,29 @@ mod tests {
                 "a local player records no exchange"
             );
         }
-        assert!(!engine.uses_jev());
+        assert!(!engine.enabled());
         assert_eq!(engine.status(), LOCAL_SEARCH_STATUS);
+    }
+
+    #[test]
+    fn the_laya_fakes_report_laya() {
+        let game = game_from(START_FEN, &[]);
+        let laya = FakeEngine::laya().playing(&["e2e4"]);
+        let computer = laya.choose(&game).expect("a move");
+        assert_eq!(computer.provider, Provider::Laya);
+        assert_eq!(computer.source, MoveSource::Model);
+        assert_eq!(computer.model.as_deref(), Some("laya-test"));
+        assert_eq!(laya.status(), LAYA_STATUS);
+        assert!(laya.enabled());
+        assert_eq!(Engine::provider(&laya), Provider::Laya);
+
+        let local = FakeEngine::local_laya().playing(&["e2e4"]);
+        let computer = local.choose(&game).expect("a move");
+        assert_eq!(computer.provider, Provider::Laya);
+        assert_eq!(computer.source, MoveSource::Fallback);
+        assert_eq!(computer.note.as_deref(), Some(LAYA_LOCAL_NOTE));
+        assert_eq!(local.status(), LAYA_LOCAL_SEARCH_STATUS);
+        assert!(!local.enabled());
     }
 
     #[test]
