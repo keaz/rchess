@@ -4,10 +4,10 @@ Read this first. Follow the protocol in section 8 of
 `docs/superpowers/specs/2026-09-26-rchess-redesign-design.md`.
 
 ## Current
-Sub-project: laya (Laya as a second computer player; Jev vs Laya) | Spec: docs/superpowers/specs/2026-09-29-laya-integration-design.md
-Branch: feat/laya (from main at fe1eb73)
+Sub-project: laya done (Laya as a second computer player; spec docs/superpowers/specs/2026-09-29-laya-integration-design.md)
+Branch: main (feat/laya merged locally at bc33854 and deleted; not pushed — main is ahead of origin/main)
 Last completed task: all 8 plan tasks, plus the final-review fix pass (panic fallback provider, LAYA_URL userinfo rejected)
-Next task: the manual test below with a real laya-serve (incl. the `model` field check), then merge feat/laya; deferred minors are in the final report
+Next task: manual test below with a real laya-serve (incl. the `model` field check); push main so CI runs. Deferred minors: identical watch rows when both engines are off; "no Jev requests yet" under a Laya exchange title; clear-text warning host not sanitized; 0.0.0.0 counted as remote; harness reply_with answers disabled-Jev requests with jev_move
 State: green (cargo test 730 passed / 4 ignored, fmt, clippy, pty smoke ALL CHECKS PASSED)
 Earlier: main is ahead of origin/main (not pushed); pushing it is still pending.
 
