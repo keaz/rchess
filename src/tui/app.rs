@@ -2813,8 +2813,8 @@ mod tests {
     use crate::tui::graphics;
     use crate::tui::panels::HELP_LINES;
     use crate::tui::test_support::engine::{
-        FakeEngine, LAYA_LOCAL_NOTE, REPLY_TIMEOUT, SENTINEL_KEY, chord, jev_move, key, mouse,
-        paste, traced_jev_move,
+        FakeEngine, LAYA_LOCAL_NOTE, LOCAL_NOTE, REPLY_TIMEOUT, SENTINEL_KEY, chord, jev_move, key,
+        mouse, paste, traced_jev_move,
     };
     use crate::tui::test_support::harness::{Harness, request};
     use crate::tui::test_support::{PROMOTION_FEN, TempDir, buffer_text, game_from, key_event, sq};
@@ -6205,5 +6205,16 @@ mod tests {
         );
         h.click_hit(Hit::MenuComputer(Provider::Jev));
         assert_eq!(h.app.computer(), Provider::Jev);
+    }
+
+    #[test]
+    fn a_reply_from_a_jev_engine_that_is_off_is_the_local_search() {
+        let mut h = Harness::with_engines(FakeEngine::local(), FakeEngine::laya());
+        let _ = h.char('3');
+        h.reply("e2e4");
+        let computer = h.app.last_computer().expect("the computer moved");
+        assert_eq!(computer.source, MoveSource::Fallback);
+        assert_eq!(computer.note.as_deref(), Some(LOCAL_NOTE));
+        assert_eq!(computer.provider, Provider::Jev);
     }
 }
