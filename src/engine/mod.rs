@@ -10,7 +10,7 @@ mod search;
 mod see;
 
 pub use annotate::{Annotation, Bucket};
-pub use config::EngineConfig;
+pub use config::{EngineConfig, Provider};
 pub use describe::JevState;
 /// A really recorded, redacted exchange for the TUI's key tests.
 #[cfg(test)]
