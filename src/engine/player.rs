@@ -249,9 +249,12 @@ impl<C: MoveChooser> ComputerPlayer<C> {
                 .cloned()
                 .collect(),
             confidence: Some(answer.confidence),
-            model: Some(printable(&self.redacted(&answer.model), MODEL_CHARS)),
+            model: answer
+                .model
+                .as_deref()
+                .map(|model| printable(&self.redacted(model), MODEL_CHARS)),
             latency: started.elapsed(),
-            input_tokens: Some(answer.input_tokens),
+            input_tokens: answer.input_tokens,
             note,
             exchange,
         })
@@ -365,8 +368,8 @@ mod tests {
                         .map(|(k, p)| (k.to_string(), *p))
                         .collect(),
                     confidence: 0.8,
-                    model: self.model.clone(),
-                    input_tokens: 900,
+                    model: Some(self.model.clone()),
+                    input_tokens: Some(900),
                 }),
                 Reply::Error(error) => Err(error.clone()),
             }
