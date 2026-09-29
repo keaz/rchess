@@ -1,7 +1,8 @@
 # rchess
 
 Chess in the terminal, written in Rust. Play against a friend at the same keyboard, against
-**Jev** (TypeSafe's System One model), or sit back and watch Jev play itself. The board fills the
+**Jev** (TypeSafe's System One model) or **Laya** (an open-weights model you run yourself), or
+sit back and watch Jev and Laya play themselves or each other. The board fills the
 terminal and draws real piece pictures in terminals that support graphics (Ghostty, Kitty,
 WezTerm, iTerm2, Sixel terminals), with text pieces everywhere else.
 
@@ -25,6 +26,7 @@ down, the game carries on with the local search.
 - [Architecture](#architecture)
 - [How Jev plays](#how-jev-plays)
 - [Why it works this way](#why-it-works-this-way)
+- [Playing Laya](#playing-laya)
 - [Debug mode](#debug-mode)
 - [Configuration](#configuration)
 - [Development](#development)
@@ -88,8 +90,10 @@ from the font's pixel size so they look square.
 
 ## Playing
 
-The menu offers Human vs Human, Human vs Jev (play White, Black or a random side), Jev vs Jev
-(watch), and Load FEN. A game against Jev as Black starts with the board flipped.
+The menu offers Human vs Human, Human vs the computer (play White, Black or a random side),
+four watching pairings (Jev vs Jev, Laya vs Laya, Jev (White) vs Laya, Laya (White) vs Jev),
+and Load FEN. The `Computer: Jev  Laya` switch at the top of the menu (Tab, the arrow keys or a
+click) picks who "Human vs …" plays against. A game as Black starts with the board flipped.
 
 Moving a piece:
 
@@ -419,6 +423,25 @@ agreement with the search's best move, 0 vetoes, 0 fallbacks, 311 ms mean latenc
 input tokens in total (about $0.0007). Agreement below 100% is the point: when several moves are
 close, Jev chooses by judgment rather than by the search's small score differences.
 
+## Playing Laya
+
+[Laya](https://huggingface.co/convaiinnovations/laya) is an open-weights (Apache 2.0) System One
+decision model. It has no hosted API: you run it with `laya-serve`, which answers the same
+`POST /v1/systemone` requests as Jev, so rchess asks it exactly the way it asks Jev (shortlist,
+one `choice` question, blunder veto, local-search fallback).
+
+```sh
+pip install "laya[serve]"
+laya-serve                    # binds 0.0.0.0:8000; LAYA_DEVICE=cuda for a GPU
+LAYA_URL=http://127.0.0.1:8000/v1/systemone ./target/release/chess
+```
+
+Press Tab on the menu to play Laya, or pick one of the watching rows to see Jev and Laya play
+each other. Without `LAYA_URL` the Laya player is the local search, and if `laya-serve` is down
+each Laya move falls back to the local search with a note. When `laya-serve` runs with
+`LAYA_API_KEY`, set the same key for rchess. Laya's base checkpoint is weak at this kind of
+question without fine-tuning, so the engine's veto overrides it more often than it does Jev.
+
 ## Debug mode
 
 `--debug` (or `RCHESS_DEBUG=1`) keeps the last 50 Jev exchanges in memory and shows `DEBUG` in
@@ -443,6 +466,11 @@ The API key never appears anywhere the app writes: not in the view, the log, not
 | `JEV_MODEL` | `jev-latest` | Model alias or versioned ID. |
 | `JEV_MAX_OPTIONS` | `40` | Shortlist size, 1–255. |
 | `JEV_FILTER_LOSING` | `true` | Keep `losing` moves off the shortlist when others exist. |
+| `LAYA_URL` | none | `laya-serve` endpoint, e.g. `http://127.0.0.1:8000/v1/systemone` (no `user:pass@`; use `LAYA_API_KEY`). Without it, Laya uses local search. |
+| `LAYA_API_KEY` | none | Key `laya-serve` asks for, if it was started with one. |
+| `LAYA_MODEL` | `laya` | Model sent to `laya-serve`. |
+| `LAYA_MAX_OPTIONS` | `40` | Laya's shortlist size, 1–255. |
+| `LAYA_FILTER_LOSING` | `true` | As `JEV_FILTER_LOSING`, for Laya. |
 | `RCHESS_GLYPHS` | best available | `image`, `solid`, `outline` or `ascii` (same as `--glyphs`). |
 | `RCHESS_IMAGES` | on | `off` skips the graphics query and the pictures. |
 | `RCHESS_DEBUG` | off | Debug mode, as `--debug`. |
@@ -450,25 +478,25 @@ The API key never appears anywhere the app writes: not in the view, the log, not
 | `NO_COLOR` | unset | No colours: outline glyphs and text marks for highlights. |
 | `COLORTERM` | — | `truecolor` or `24bit` selects 24-bit colours. |
 
-An invalid value falls back to its default and shows a warning on the menu. The endpoint is
+An invalid value falls back to its default and shows a warning on the menu. Jev's endpoint is
 fixed: `https://api.typesafe.ai/v1/systemone`.
 
 ## Development
 
 ```sh
 cargo build
-env -u JEV_API_KEY -u TYPESAFE_API_KEY cargo test        # the whole offline suite
+env -u JEV_API_KEY -u TYPESAFE_API_KEY -u LAYA_URL -u LAYA_API_KEY cargo test   # offline suite
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo bench                                              # criterion perft benchmark
-cargo build && env -u JEV_API_KEY -u TYPESAFE_API_KEY python3 tests/pty_smoke.py --no-build
+cargo build && env -u JEV_API_KEY -u TYPESAFE_API_KEY -u LAYA_URL -u LAYA_API_KEY python3 tests/pty_smoke.py --no-build
 cargo run --release --example jev_eval                   # needs a key; calls the API
 ```
 
 - Tests never touch the network: the HTTP client is tested against a scripted server on
-  127.0.0.1, and the player against a mock `MoveChooser`. Run them with the key variables unset
-  so nothing can reach the API. Three tests are `#[ignore]`d on purpose (a deep perft suite, a
-  release-mode timing budget, and a live Jev round trip).
+  127.0.0.1, and the player against a mock `MoveChooser`. Run them with the key and Laya variables
+  unset so nothing can reach the API or a Laya server. Four tests are `#[ignore]`d on purpose (a deep perft suite, a
+  release-mode timing budget, and live Jev and Laya round trips).
 - UI screens are covered by `insta` snapshots in `src/tui/snapshots/`, and `tests/pty_smoke.py`
   runs the real binary on pseudo-terminals (setup and restore, signals, hangups, the graphics
   query, pictures, debug mode).

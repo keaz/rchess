@@ -1,4 +1,5 @@
-//! TypeSafe Jev client: request/response types, the retry policy and the HTTP
+//! System One client (TypeSafe Jev, or Laya's `laya-serve`, which speaks the same
+//! API): request/response types, the retry policy and the HTTP
 //! transport (spec 5.1, 5.7). Everything is tested offline; the transport tests
 //! talk to a scripted HTTP server on 127.0.0.1. For debug mode the client can also
 //! record each request and its responses as a [`JevExchange`], with the API key
@@ -19,8 +20,8 @@ use thiserror::Error;
 use super::annotate::Bucket;
 use super::config::EngineConfig;
 
-/// The TypeSafe System One endpoint every Jev request goes to (the URL of the
-/// TypeSafe quickstart). It is fixed, not configurable.
+/// The TypeSafe System One endpoint Jev requests go to (the URL of the TypeSafe
+/// quickstart). It is fixed; Laya's endpoint comes from `LAYA_URL`.
 pub const JEV_ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
 
 /// Maximum attempts for one request, counting the first.
@@ -105,10 +106,10 @@ pub struct ChoiceAnswer {
     pub probabilities: Vec<(String, f32)>,
     /// Jev's confidence in its choice, from 0 to 1.
     pub confidence: f32,
-    /// Versioned model ID that answered, e.g. `jev-1.13.0`.
-    pub model: String,
-    /// Input tokens billed for the request.
-    pub input_tokens: u32,
+    /// Versioned model ID that answered, e.g. `jev-1.13.0`; `laya-serve` may leave it out.
+    pub model: Option<String>,
+    /// Input tokens billed for the request, when the server reports usage.
+    pub input_tokens: Option<u32>,
 }
 
 /// Why a Jev request failed. Messages never contain the API key: `JevClient`
@@ -196,9 +197,11 @@ pub trait MoveChooser: Send + Sync {
 
 #[derive(Deserialize)]
 struct ApiResponse {
-    model: String,
+    #[serde(default)]
+    model: Option<String>,
     answers: HashMap<String, ApiAnswer>,
-    usage: ApiUsage,
+    #[serde(default)]
+    usage: Option<ApiUsage>,
 }
 
 #[derive(Deserialize)]
@@ -232,7 +235,7 @@ pub fn parse_answer(body: &str) -> Result<ChoiceAnswer, JevError> {
         probabilities,
         confidence: answer.confidence,
         model: response.model,
-        input_tokens: response.usage.input_tokens,
+        input_tokens: response.usage.map(|u| u.input_tokens),
     })
 }
 
@@ -444,13 +447,14 @@ fn request_error(error: ureq::Error) -> JevError {
     }
 }
 
-/// HTTP client for `POST https://api.typesafe.ai/v1/systemone` ([`JEV_ENDPOINT`]),
-/// sending `Authorization: Bearer <key>` and a JSON body as in the TypeSafe quickstart.
+/// HTTP client for a System One endpoint (`config.endpoint`: [`JEV_ENDPOINT`] or
+/// `laya-serve`), sending `Authorization: Bearer <key>` when the config has a key and
+/// a JSON body as in the TypeSafe quickstart.
 pub struct JevClient {
     agent: ureq::Agent,
     url: String,
     model: String,
-    api_key: String,
+    api_key: Option<String>,
 }
 
 impl fmt::Debug for JevClient {
@@ -458,25 +462,18 @@ impl fmt::Debug for JevClient {
         f.debug_struct("JevClient")
             .field("url", &self.url)
             .field("model", &self.model)
-            .field("api_key", &"<redacted>")
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .finish()
     }
 }
 
 impl JevClient {
-    /// A client for [`JEV_ENDPOINT`]; `None` when the config has no API key.
+    /// A client for `config.endpoint`; `None` when the config is not
+    /// [`enabled`](EngineConfig::enabled).
     pub fn new(config: &EngineConfig) -> Option<JevClient> {
-        JevClient::build(config, JEV_ENDPOINT.to_string())
-    }
-
-    /// A client for another endpoint, for the offline transport tests only.
-    #[cfg(test)]
-    fn with_endpoint(config: &EngineConfig, endpoint: String) -> Option<JevClient> {
-        JevClient::build(config, endpoint)
-    }
-
-    fn build(config: &EngineConfig, url: String) -> Option<JevClient> {
-        let api_key = config.api_key.clone()?;
+        if !config.enabled() {
+            return None;
+        }
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_global(Some(config.timeout))
             .http_status_as_error(false)
@@ -484,23 +481,30 @@ impl JevClient {
             .into();
         Some(JevClient {
             agent,
-            url,
+            url: config.endpoint.clone(),
             model: config.model.clone(),
-            api_key,
+            api_key: config.api_key.clone(),
         })
+    }
+
+    /// The key to redact from everything recorded; empty (redacting nothing) without one.
+    fn secret(&self) -> &str {
+        self.api_key.as_deref().unwrap_or("")
     }
 
     /// The exchange record for `body` before any attempt: the redacted headers the
     /// client sends and the body with the key redacted.
     fn exchange(&self, body: &Value) -> JevExchange {
+        let mut headers = Vec::new();
+        if self.api_key.is_some() {
+            headers.push((AUTHORIZATION.to_string(), bearer(REDACTED)));
+        }
+        headers.push((CONTENT_TYPE_HEADER.to_string(), CONTENT_TYPE.to_string()));
         JevExchange {
             method: "POST".to_string(),
             url: self.url.clone(),
-            headers: vec![
-                (AUTHORIZATION.to_string(), bearer(REDACTED)),
-                (CONTENT_TYPE_HEADER.to_string(), CONTENT_TYPE.to_string()),
-            ],
-            body: redact_value(body, &self.api_key),
+            headers,
+            body: redact_value(body, self.secret()),
             attempts: Vec::new(),
         }
     }
@@ -545,19 +549,18 @@ impl JevClient {
     /// body and an error snippet come from the redacted body ([`redact_body`]), so no
     /// error can carry part of the key, and every error is redacted too.
     fn post_once(&self, body: &Value) -> RawAttempt {
-        let sent = self
-            .agent
-            .post(&self.url)
-            .header(AUTHORIZATION, &bearer(&self.api_key))
-            // `send_json` alone would send `application/json; charset=utf-8`; the
-            // TypeSafe quickstart sends plain `application/json`.
-            .content_type(CONTENT_TYPE)
-            .send_json(body);
+        let mut request = self.agent.post(&self.url);
+        if let Some(key) = &self.api_key {
+            request = request.header(AUTHORIZATION, &bearer(key));
+        }
+        // `send_json` alone would send `application/json; charset=utf-8`; the
+        // TypeSafe quickstart sends plain `application/json`.
+        let sent = request.content_type(CONTENT_TYPE).send_json(body);
         let mut response = match sent {
             Ok(response) => response,
             Err(error) => {
                 return RawAttempt {
-                    result: Err(redact_error(request_error(error), &self.api_key)),
+                    result: Err(redact_error(request_error(error), self.secret())),
                     status: None,
                     response: None,
                 };
@@ -577,7 +580,7 @@ impl JevClient {
             .read_to_string();
         let (result, response) = match text {
             Ok(text) => {
-                let recorded = redact_body(&text, &self.api_key);
+                let recorded = redact_body(&text, self.secret());
                 let result = if status == 200 {
                     parse_answer(&text)
                 } else {
@@ -597,7 +600,7 @@ impl JevClient {
             Err(error) => (Err(request_error(error)), None),
         };
         RawAttempt {
-            result: result.map_err(|error| redact_error(error, &self.api_key)),
+            result: result.map_err(|error| redact_error(error, self.secret())),
             status: Some(status),
             response,
         }
@@ -629,6 +632,8 @@ pub(crate) mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
+
+    use crate::engine::Provider;
 
     fn request() -> ChoiceRequest {
         ChoiceRequest {
@@ -690,8 +695,8 @@ pub(crate) mod tests {
             ]
         );
         assert_eq!(answer.confidence, 0.55);
-        assert_eq!(answer.model, "jev-1.13.0");
-        assert_eq!(answer.input_tokens, 812);
+        assert_eq!(answer.model.as_deref(), Some("jev-1.13.0"));
+        assert_eq!(answer.input_tokens, Some(812));
     }
 
     #[test]
@@ -815,6 +820,11 @@ pub(crate) mod tests {
 
     /// [`serve`] with a client that sends `api_key`.
     fn serve_with_key(responses: Vec<String>, api_key: &str) -> (JevClient, Requests) {
+        serve_config(responses, keyed_config(api_key))
+    }
+
+    /// [`serve`] with a client built from `config`, its endpoint pointed at the server.
+    fn serve_config(responses: Vec<String>, config: EngineConfig) -> (JevClient, Requests) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let requests = Requests::default();
@@ -830,21 +840,47 @@ pub(crate) mod tests {
                 let mut stream = reader.into_inner();
                 let _ = stream.write_all(response.as_bytes());
                 let _ = stream.flush();
-                // Dropping the stream closes the connection.
             }
         });
-        (client_for_port(port, api_key), requests)
+        let config = EngineConfig {
+            endpoint: format!("http://127.0.0.1:{port}/v1/systemone"),
+            ..config
+        };
+        (
+            JevClient::new(&config).expect("an enabled config"),
+            requests,
+        )
     }
 
-    /// A client for `http://127.0.0.1:<port>/v1/systemone` sending `api_key`.
-    fn client_for_port(port: u16, api_key: &str) -> JevClient {
-        let config = EngineConfig {
+    /// A Jev-shaped test config sending `api_key` with a 2 s timeout.
+    fn keyed_config(api_key: &str) -> EngineConfig {
+        EngineConfig {
             api_key: Some(api_key.to_string()),
             timeout: Duration::from_secs(2),
             ..EngineConfig::default()
-        };
-        let endpoint = format!("http://127.0.0.1:{port}/v1/systemone");
-        JevClient::with_endpoint(&config, endpoint).unwrap()
+        }
+    }
+
+    /// A Laya test config without a key (the endpoint is set by [`serve_config`]).
+    fn laya_config() -> EngineConfig {
+        EngineConfig {
+            provider: Provider::Laya,
+            endpoint: "http://127.0.0.1:9/v1/systemone".to_string(),
+            api_key: None,
+            timeout: Duration::from_secs(2),
+            ..EngineConfig::default()
+        }
+    }
+
+    /// The header values named `name` (lower case) in a raw request.
+    fn header_values(raw: &str, name: &str) -> Vec<String> {
+        let head = raw.split_once("\r\n\r\n").map_or(raw, |(head, _)| head);
+        head.split("\r\n")
+            .skip(1)
+            .filter_map(|line| line.split_once(':'))
+            .filter(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.trim().to_string())
+            .collect()
     }
 
     fn count(requests: &Requests) -> usize {
@@ -895,8 +931,8 @@ pub(crate) mod tests {
             answer.probabilities,
             vec![("O-O".to_string(), 0.75), ("Nxe5".to_string(), 0.25)]
         );
-        assert_eq!(answer.model, "jev-1.13.0");
-        assert_eq!(answer.input_tokens, 321);
+        assert_eq!(answer.model.as_deref(), Some("jev-1.13.0"));
+        assert_eq!(answer.input_tokens, Some(321));
         assert_eq!(count(&requests), 1);
 
         // The wire format of the TypeSafe quickstart: `curl -X POST
@@ -1141,7 +1177,11 @@ pub(crate) mod tests {
     fn traced_exchange_records_a_failed_connection_without_a_status() {
         // Port 1 (tcpmux) is privileged and never listened on here, so the connection
         // is refused; a freed ephemeral port could be reused by a parallel test.
-        let client = client_for_port(1, "test-key");
+        let client = JevClient::new(&EngineConfig {
+            endpoint: "http://127.0.0.1:1/v1/systemone".to_string(),
+            ..keyed_config("test-key")
+        })
+        .unwrap();
         let mut trace = None;
         let error = client.choose_traced(&request(), &mut trace).unwrap_err();
         assert!(matches!(error, JevError::Transport(_)), "{error:?}");
@@ -1279,7 +1319,7 @@ pub(crate) mod tests {
         let mut trace = None;
         let answer = client.choose_traced(&request(), &mut trace).unwrap();
         // The answer is parsed as received; only the record is redacted.
-        assert_eq!(answer.model, SENTINEL_KEY);
+        assert_eq!(answer.model.as_deref(), Some(SENTINEL_KEY));
         let text = trace.unwrap().attempts[0].response.clone().unwrap();
         let decoded: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(decoded["model"], "<redacted>");
@@ -1467,7 +1507,134 @@ pub(crate) mod tests {
             ["Nxe5", "O-O"].contains(&answer.choice.as_str()),
             "{answer:?}"
         );
-        assert!(answer.model.starts_with("jev-"));
-        assert!(answer.input_tokens > 0);
+        assert!(
+            answer
+                .model
+                .as_deref()
+                .is_some_and(|m| m.starts_with("jev-"))
+        );
+        assert!(answer.input_tokens.is_some_and(|n| n > 0));
+    }
+
+    #[test]
+    fn laya_without_a_key_sends_and_records_no_authorization() {
+        let (client, requests) = serve_config(
+            vec![response("200 OK", "application/json", ANSWER)],
+            laya_config(),
+        );
+        let mut trace = None;
+        let answer = client.choose_traced(&request(), &mut trace).unwrap();
+        assert_eq!(answer.choice, "O-O");
+        let raw = requests.lock().unwrap()[0].clone();
+        assert!(header_values(&raw, "authorization").is_empty(), "{raw}");
+        assert_eq!(
+            header_values(&raw, "content-type"),
+            vec!["application/json"]
+        );
+        let exchange = trace.expect("recorded");
+        assert_eq!(
+            exchange.headers,
+            vec![("Content-Type".to_string(), "application/json".to_string())]
+        );
+        assert!(
+            exchange.url.starts_with("http://127.0.0.1:"),
+            "{}",
+            exchange.url
+        );
+    }
+
+    #[test]
+    fn laya_with_a_key_sends_a_bearer_and_redacts_it() {
+        let config = EngineConfig {
+            api_key: Some(SENTINEL_KEY.to_string()),
+            ..laya_config()
+        };
+        let (client, requests) =
+            serve_config(vec![response("200 OK", "application/json", ANSWER)], config);
+        let mut trace = None;
+        client.choose_traced(&request(), &mut trace).unwrap();
+        let raw = requests.lock().unwrap()[0].clone();
+        assert_eq!(
+            header_values(&raw, "authorization"),
+            vec![format!("Bearer {SENTINEL_KEY}")]
+        );
+        let recorded = format!("{:?}", trace.expect("recorded"));
+        assert!(!recorded.contains(SENTINEL_KEY), "{recorded}");
+        assert!(recorded.contains("Bearer <redacted>"), "{recorded}");
+    }
+
+    #[test]
+    fn a_refused_connection_is_tried_three_times() {
+        // Port 1 is privileged and never listened on; a freed ephemeral port could be
+        // reused by a parallel test.
+        let config = EngineConfig {
+            endpoint: "http://127.0.0.1:1/v1/systemone".to_string(),
+            ..laya_config()
+        };
+        let client = JevClient::new(&config).unwrap();
+        let mut trace = None;
+        let error = client.choose_traced(&request(), &mut trace).unwrap_err();
+        assert!(matches!(error, JevError::Transport(_)), "{error:?}");
+        let attempts = trace.expect("recorded").attempts;
+        assert_eq!(attempts.len(), 3);
+        assert!(attempts.iter().all(|a| a.status.is_none()), "{attempts:?}");
+    }
+
+    #[test]
+    fn an_unprocessable_question_is_final() {
+        let rejected = response(
+            "422 Unprocessable Entity",
+            "application/json",
+            r#"{"detail":"criteria: too many options"}"#,
+        );
+        let (client, requests) = serve_config(vec![rejected], laya_config());
+        let error = client.choose(&request()).unwrap_err();
+        let JevError::Http {
+            status, message, ..
+        } = &error
+        else {
+            panic!("expected an HTTP error, got {error:?}");
+        };
+        assert_eq!(*status, 422);
+        assert!(message.contains("too many options"), "{message}");
+        assert_eq!(count(&requests), 1);
+    }
+
+    #[test]
+    fn parses_an_answer_without_usage_or_model() {
+        let body = r#"{"answers":{"move":{"type":"choice","choice":"Nxe5",
+            "probabilities":{"Nxe5":0.8,"O-O":0.2},"confidence":0.7}}}"#;
+        let answer = parse_answer(body).unwrap();
+        assert_eq!(answer.choice, "Nxe5");
+        assert_eq!(answer.model, None);
+        assert_eq!(answer.input_tokens, None);
+    }
+
+    #[test]
+    fn a_disabled_config_builds_no_client() {
+        assert!(JevClient::new(&EngineConfig::default()).is_none());
+        let off = EngineConfig {
+            endpoint: String::new(),
+            ..laya_config()
+        };
+        assert!(JevClient::new(&off).is_none());
+        assert!(
+            JevClient::new(&laya_config()).is_some(),
+            "Laya needs no key"
+        );
+    }
+
+    /// Real `laya-serve` round trip. Run with:
+    /// LAYA_URL=http://127.0.0.1:8000/v1/systemone cargo test --lib engine::jev -- --ignored live_laya
+    #[test]
+    #[ignore]
+    fn live_laya_choice_round_trip() {
+        let config = EngineConfig::laya_from_env();
+        let client = JevClient::new(&config).expect("set LAYA_URL to run the live Laya test");
+        let answer = client.choose(&request()).expect("Laya answered");
+        assert!(
+            ["Nxe5", "O-O"].contains(&answer.choice.as_str()),
+            "{answer:?}"
+        );
     }
 }

@@ -37,7 +37,7 @@ use ratatui::backend::Backend;
 use ratatui::crossterm::event::{Event, KeyEventKind, MouseEventKind};
 
 use crate::core::Game;
-use crate::engine::{ComputerMove, ComputerPlayer, EngineConfig};
+use crate::engine::{ComputerMove, ComputerPlayer, EngineConfig, Provider};
 
 use self::app::{Action, App};
 use self::board::CellSize;
@@ -67,7 +67,8 @@ const LOG_GRACE: Duration = Duration::from_millis(500);
 
 /// The `--help` text.
 const USAGE: &str = concat!(
-    "rchess: chess in the terminal, against a person or the Jev computer player\n",
+    "rchess: chess in the terminal, against a person or the Jev and Laya computer\n",
+    "players\n",
     "\n",
     "Usage: ",
     env!("CARGO_PKG_NAME"),
@@ -77,8 +78,9 @@ const USAGE: &str = concat!(
     "  --glyphs <set>     how pieces look: image (pictures; the default when the\n",
     "                     terminal can show them), solid (otherwise the default),\n",
     "                     outline or ascii; `g` cycles them during a game\n",
-    "  --debug            debug mode: keep every Jev request and answer, show them\n",
-    "                     with `d` during a game and append them to the debug log\n",
+    "  --debug            debug mode: keep every Jev and Laya request and answer,\n",
+    "                     show them with `d` during a game and append them to the\n",
+    "                     debug log\n",
     "  -h, --help         show this help and exit\n",
     "  -V, --version      show the version and exit\n",
     "\n",
@@ -88,6 +90,13 @@ const USAGE: &str = concat!(
     "  JEV_MODEL          Jev model (default jev-latest)\n",
     "  JEV_MAX_OPTIONS    moves offered to Jev per turn, 1-255 (default 40)\n",
     "  JEV_FILTER_LOSING  keep losing moves off Jev's shortlist (default true)\n",
+    "  LAYA_URL           laya-serve endpoint for the Laya computer player, e.g.\n",
+    "                     http://127.0.0.1:8000/v1/systemone; without it Laya is\n",
+    "                     local search\n",
+    "  LAYA_API_KEY       key laya-serve asks for, if any\n",
+    "  LAYA_MODEL         model sent to laya-serve (default laya)\n",
+    "  LAYA_MAX_OPTIONS   moves offered to Laya per turn, 1-255 (default 40)\n",
+    "  LAYA_FILTER_LOSING keep losing moves off Laya's shortlist (default true)\n",
     "  RCHESS_GLYPHS      glyph set when --glyphs is not given\n",
     "  RCHESS_IMAGES      off, 0, false or no: no piece pictures, and no graphics\n",
     "                     query at start\n",
@@ -123,10 +132,11 @@ fn print_quietly(out: &mut impl Write, text: &str) -> io::Result<()> {
 /// closed (`chess --help | true`), they return quietly. Unknown arguments and a
 /// missing or invalid `--glyphs` value do not stop the program: they are listed
 /// as warnings on the menu, like invalid engine settings, and so is a graphics
-/// query that failed. The computer player comes
-/// from `EngineConfig::from_env()`; with no `JEV_API_KEY` it plays by local
-/// search and never uses the network. In debug mode (`--debug` or `RCHESS_DEBUG`)
-/// it records its exchanges with Jev (`EngineConfig::trace`).
+/// query that failed. The computer players come from `EngineConfig::from_env()`
+/// (Jev) and `EngineConfig::laya_from_env()` (Laya); with no `JEV_API_KEY` or
+/// `LAYA_URL` that player plays by local search and never uses the network. In
+/// debug mode (`--debug` or `RCHESS_DEBUG`) they record their exchanges with the
+/// model (`EngineConfig::trace`).
 ///
 /// Unless images are off ([`glyphs::images_wanted`]), the terminal is asked about
 /// graphics right after it is set up, which takes up to [`graphics::QUERY_TIMEOUT`]
@@ -164,17 +174,20 @@ pub fn run(args: impl IntoIterator<Item = String>) -> io::Result<()> {
         .extend(env_warnings(debug, |name| std::env::var_os(name)));
     let images = glyphs::images_wanted(options.glyphs.as_deref(), env);
     let fault = injected_fault(env("RCHESS_FAULT").as_deref());
-    let config = engine_config(EngineConfig::from_env(), debug);
-    let mut engine: Arc<dyn Engine> = Arc::new(ComputerPlayer::from_config(config));
+    let jev_config = engine_config(EngineConfig::from_env(), debug);
+    let laya_config = engine_config(EngineConfig::laya_from_env(), debug);
+    let mut jev: Arc<dyn Engine> = Arc::new(ComputerPlayer::from_config(jev_config));
+    let mut laya: Arc<dyn Engine> = Arc::new(ComputerPlayer::from_config(laya_config));
     if fault == Some(Fault::EnginePanic) {
-        engine = Arc::new(PanickingEngine(engine));
+        jev = Arc::new(PanickingEngine(jev));
+        laya = Arc::new(PanickingEngine(laya));
     }
 
     // Before `enter`, so a signal that arrives during setup still ends in a
     // clean restore instead of killing the process with the terminal in raw mode.
     let quit = terminal::register_signals()?;
     let result = play(&quit, images, fault, |graphics| {
-        build_app(options, engine, graphics, env)
+        build_app(options, jev, laya, graphics, env)
     });
     let signal = if result.is_err() {
         signal_after_error(&quit, SIGNAL_GRACE, terminal::stdin_looks_closed)
@@ -238,7 +251,8 @@ fn terminal_problem(stdin_is_terminal: bool, stdout_is_terminal: bool) -> Option
 /// it starts the debug log at [`debug::log_path`].
 fn build_app(
     options: Options,
-    engine: Arc<dyn Engine>,
+    jev: Arc<dyn Engine>,
+    laya: Arc<dyn Engine>,
     graphics: Graphics,
     get: impl Fn(&str) -> Option<String>,
 ) -> App {
@@ -247,9 +261,15 @@ fn build_app(
     let mut warnings = options.warnings;
     warnings.extend(glyph_warnings);
     warnings.extend(graphics.warning);
-    let mut app = App::new(engine, glyph_set, glyphs::detect_truecolor(&get), warnings)
-        .with_no_color(glyphs::no_color(&get))
-        .with_picker(graphics.picker);
+    let mut app = App::new(
+        jev,
+        laya,
+        glyph_set,
+        glyphs::detect_truecolor(&get),
+        warnings,
+    )
+    .with_no_color(glyphs::no_color(&get))
+    .with_picker(graphics.picker);
     if debug::enabled(options.debug, &get) {
         app = app.with_debug(DebugLog::open(debug::log_path(&get)));
     }
@@ -416,8 +436,12 @@ impl Engine for PanickingEngine {
         self.0.status()
     }
 
-    fn uses_jev(&self) -> bool {
-        self.0.uses_jev()
+    fn provider(&self) -> Provider {
+        self.0.provider()
+    }
+
+    fn enabled(&self) -> bool {
+        self.0.enabled()
     }
 
     fn warnings(&self) -> Vec<String> {
@@ -542,7 +566,8 @@ fn run_loop(
             for action in app.handle(event, now) {
                 match action {
                     Action::RequestEngine(request) => {
-                        request_engine(request, app.engine(), &replies_tx);
+                        let engine = app.engine(request.provider).clone();
+                        request_engine(request, &engine, &replies_tx);
                     }
                     Action::MeasureFont => measure = true,
                 }
@@ -813,6 +838,11 @@ mod tests {
             "JEV_MODEL",
             "JEV_MAX_OPTIONS",
             "JEV_FILTER_LOSING",
+            "LAYA_URL",
+            "LAYA_API_KEY",
+            "LAYA_MODEL",
+            "LAYA_MAX_OPTIONS",
+            "LAYA_FILTER_LOSING",
             "RCHESS_GLYPHS",
             "RCHESS_IMAGES",
             "RCHESS_DEBUG",
@@ -907,7 +937,13 @@ mod tests {
             warning: None,
             answers_pending: false,
         };
-        let app = build_app(options(None, &[]), local_engine(), graphics, |_| None);
+        let app = build_app(
+            options(None, &[]),
+            local_engine(),
+            local_laya_engine(),
+            graphics,
+            |_| None,
+        );
         assert_eq!(app.glyphs(), GlyphSet::Image);
         assert!(app.images_available());
         assert_eq!(
@@ -931,6 +967,7 @@ mod tests {
         let app = build_app(
             options(Some("fancy"), &[unknown]),
             local_engine(),
+            local_laya_engine(),
             graphics,
             |_| None,
         );
@@ -951,7 +988,13 @@ mod tests {
     fn without_images_the_app_has_no_picker() {
         let get = |name: &str| (name == "NO_COLOR").then(|| "1".to_string());
         let cell = CellSize::new(8, 16);
-        let app = build_app(options(None, &[]), local_engine(), Graphics::off(cell), get);
+        let app = build_app(
+            options(None, &[]),
+            local_engine(),
+            local_laya_engine(),
+            Graphics::off(cell),
+            get,
+        );
         assert_eq!(app.glyphs(), GlyphSet::Outline);
         assert!(!app.images_available());
         assert!(app.picker().is_none());
@@ -977,9 +1020,21 @@ mod tests {
             }
         };
         let off = Graphics::off(CellSize::DEFAULT);
-        let app = build_app(options(None, &[]), local_engine(), off.clone(), vars("0"));
+        let app = build_app(
+            options(None, &[]),
+            local_engine(),
+            local_laya_engine(),
+            off.clone(),
+            vars("0"),
+        );
         assert!(!app.debug_mode());
-        let mut app = build_app(options(None, &[]), local_engine(), off.clone(), vars("1"));
+        let mut app = build_app(
+            options(None, &[]),
+            local_engine(),
+            local_laya_engine(),
+            off.clone(),
+            vars("1"),
+        );
         assert!(app.debug_mode());
         assert!(app.exchanges().is_some_and(debug::History::is_empty));
         app.close_debug_log(Duration::from_secs(10));
@@ -988,7 +1043,7 @@ mod tests {
             debug: true,
             ..Options::default()
         };
-        let app = build_app(flagged, local_engine(), off, vars(""));
+        let app = build_app(flagged, local_engine(), local_laya_engine(), off, vars(""));
         assert!(app.debug_mode(), "--debug alone");
     }
 
@@ -1012,8 +1067,23 @@ mod tests {
         ))
     }
 
+    /// An offline Laya player: no `LAYA_URL`, so every move comes from local search.
+    fn local_laya_engine() -> Arc<dyn Engine> {
+        Arc::new(ComputerPlayer::<JevClient>::new(
+            None,
+            EngineConfig::laya_from_vars(|_| None),
+        ))
+    }
+
     fn new_app() -> App {
-        App::new(local_engine(), GlyphSet::Solid, true, Vec::new()).with_home(None)
+        App::new(
+            local_engine(),
+            local_laya_engine(),
+            GlyphSet::Solid,
+            true,
+            Vec::new(),
+        )
+        .with_home(None)
     }
 
     /// What a scripted run of [`run_loop`] did.
@@ -1211,7 +1281,13 @@ mod tests {
             vec![Step::Events(answer.clone()), Step::Signal],
         );
         run.result.expect("loop ends cleanly");
-        assert_eq!(app.mode(), Mode::HumanVsJev { human: Side::Black });
+        assert_eq!(
+            app.mode(),
+            Mode::HumanVsComputer {
+                human: Side::Black,
+                computer: Provider::Jev
+            }
+        );
 
         let graphics = Graphics {
             answers_pending: true,
@@ -1241,9 +1317,15 @@ mod tests {
         let dir = TempDir::new("debug-loop");
         let path = dir.join("jev.jsonl");
         let engine = Arc::new(FakeEngine::jev().scripted([Turn::Traced("e2e4")]));
-        let mut app = App::new(engine, GlyphSet::Solid, true, Vec::new())
-            .with_home(None)
-            .with_debug(DebugLog::start(path.clone()));
+        let mut app = App::new(
+            engine,
+            local_laya_engine(),
+            GlyphSet::Solid,
+            true,
+            Vec::new(),
+        )
+        .with_home(None)
+        .with_debug(DebugLog::start(path.clone()));
         let quit = AtomicI32::new(0);
         let run = drive(
             &mut app,
@@ -1297,6 +1379,7 @@ mod tests {
             let mut app = build_app(
                 Options::default(),
                 engine,
+                local_laya_engine(),
                 Graphics::off(CellSize::DEFAULT),
                 get,
             );
@@ -1508,7 +1591,13 @@ mod tests {
 
         run.result.expect("loop ends cleanly");
         assert_eq!(run.unused_steps, 0);
-        assert_eq!(app.mode(), Mode::HumanVsJev { human: Side::Black });
+        assert_eq!(
+            app.mode(),
+            Mode::HumanVsComputer {
+                human: Side::Black,
+                computer: Provider::Jev
+            }
+        );
         assert!(app.flipped(), "playing Black starts flipped");
         assert_eq!(
             app.game().moves().len(),
@@ -1688,7 +1777,11 @@ mod tests {
         let engine: Arc<dyn Engine> = Arc::new(PanickingEngine(local_engine()));
         assert_eq!(engine.status(), "No JEV_API_KEY — local search");
         let (tx, rx) = mpsc::channel();
-        request_engine(worker::EngineRequest::new(1, Game::new()), &engine, &tx);
+        request_engine(
+            worker::EngineRequest::new(1, Game::new(), Provider::Jev),
+            &engine,
+            &tx,
+        );
         let reply = rx.recv_timeout(REPLY_TIMEOUT).expect("a reply arrives");
         let EngineOutcome::Move(computer) = reply.outcome else {
             panic!("expected the fallback move, got {:?}", reply.outcome);
@@ -1706,7 +1799,7 @@ mod tests {
         };
         let (generation, hash) = (request.generation, request.hash);
         let (tx, rx) = mpsc::channel();
-        request_engine_with(request, app.engine(), &tx, |_, _, _| {
+        request_engine_with(request, app.engine(Provider::Jev), &tx, |_, _, _| {
             Err(io::Error::other("out of threads"))
         });
         let reply = rx.try_recv().expect("answered at once, without a thread");
@@ -1733,7 +1826,7 @@ mod tests {
     fn engine_requests_are_answered_on_the_reply_channel() {
         let engine = local_engine();
         let (tx, rx) = mpsc::channel();
-        let request = worker::EngineRequest::new(7, crate::core::Game::new());
+        let request = worker::EngineRequest::new(7, crate::core::Game::new(), Provider::Jev);
         let hash = request.hash;
 
         request_engine(request, &engine, &tx);
@@ -1780,8 +1873,12 @@ mod tests {
             self.inner.status()
         }
 
-        fn uses_jev(&self) -> bool {
-            self.inner.uses_jev()
+        fn provider(&self) -> Provider {
+            self.inner.provider()
+        }
+
+        fn enabled(&self) -> bool {
+            self.inner.enabled()
         }
 
         fn warnings(&self) -> Vec<String> {
@@ -1804,7 +1901,14 @@ mod tests {
             release: std::sync::Mutex::new(released),
             inner: local_engine(),
         });
-        let mut app = App::new(engine, GlyphSet::Solid, true, Vec::new()).with_home(None);
+        let mut app = App::new(
+            engine,
+            local_laya_engine(),
+            GlyphSet::Solid,
+            true,
+            Vec::new(),
+        )
+        .with_home(None);
         let quit = AtomicI32::new(0);
         // Human vs Jev as White: after e4 the engine is asked, and never answers. With a
         // move played, `q` asks first, and `y` quits.

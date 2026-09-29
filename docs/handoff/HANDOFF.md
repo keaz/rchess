@@ -4,16 +4,27 @@ Read this first. Follow the protocol in section 8 of
 `docs/superpowers/specs/2026-09-26-rchess-redesign-design.md`.
 
 ## Current
-Sub-project: none in progress (core, engine, tui, tui-polish and cleanup are done)
-Branch: main (chore/cleanup merged locally at ab2383e; not pushed — main is ahead of origin/main; origin/chore/cleanup is an older copy at 7ddb5b2)
-Last completed task: cleanup sub-project merged (all 7 tasks, final review fixed and re-reviewed)
-Next task: push main to GitHub so the new CI (Ubuntu + macOS: fmt, clippy, build, test) runs; the follow-ups below are optional
-State: green (cargo test fully green, fmt and clippy -D warnings clean, pty smoke green locally)
+Sub-project: laya (Laya as a second computer player; Jev vs Laya) | Spec: docs/superpowers/specs/2026-09-29-laya-integration-design.md
+Branch: feat/laya (from main at fe1eb73)
+Last completed task: all 8 plan tasks, plus the final-review fix pass (panic fallback provider, LAYA_URL userinfo rejected)
+Next task: the manual test below with a real laya-serve (incl. the `model` field check), then merge feat/laya; deferred minors are in the final report
+State: green (cargo test 730 passed / 4 ignored, fmt, clippy, pty smoke ALL CHECKS PASSED)
+Earlier: main is ahead of origin/main (not pushed); pushing it is still pending.
 
 ## Verify before continuing
-env -u JEV_API_KEY -u TYPESAFE_API_KEY INSTA_UPDATE=no cargo test
+env -u JEV_API_KEY -u TYPESAFE_API_KEY -u LAYA_URL -u LAYA_API_KEY INSTA_UPDATE=no cargo test
 cargo fmt --check && cargo clippy --all-targets -- -D warnings
-cargo build && env -u JEV_API_KEY -u TYPESAFE_API_KEY python3 tests/pty_smoke.py --no-build
+cargo build && env -u JEV_API_KEY -u TYPESAFE_API_KEY -u LAYA_URL -u LAYA_API_KEY python3 tests/pty_smoke.py --no-build
+
+## Manual test (laya; spec section 8)
+With `pip install "laya[serve]"` and `laya-serve` running:
+- `LAYA_URL=http://127.0.0.1:8000/v1/systemone cargo run -- --debug`; the menu shows `Laya ready (...)`;
+- Tab switches the computer to Laya; a game against Laya shows Laya's picks in the side panel;
+- `d` shows the request with no `Authorization` header and Laya's answer; if laya-serve rejects the
+  `model` field with 422, drop it for Laya and record that in the spec;
+- Jev (White) vs Laya with `JEV_API_KEY` set: titles and panels name both, and the debug log's records
+  carry `"engine": "Jev"` and `"engine": "Laya"`;
+- stop laya-serve mid-game: Laya's moves fall back with a note and the game continues.
 
 ## Manual test (tui-polish, by the user; spec 9.6)
 Run `cargo run` in Ghostty and in one other terminal (Kitty, WezTerm or Alacritty) and check:

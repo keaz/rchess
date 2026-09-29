@@ -4,8 +4,9 @@
 Not run by cargo: `python3 tests/pty_smoke.py [--release] [--no-build]`.
 
 Each scenario starts the binary on a fresh 80x24 pty whose environment has no
-JEV_API_KEY or TYPESAFE_API_KEY (so the computer player is local search and
-nothing touches the network), drives it with keystrokes or signals, and checks:
+JEV_API_KEY, TYPESAFE_API_KEY or LAYA_API_KEY, and no LAYA_URL unless a scenario
+sets it (so the computer players are local search and nothing touches the
+network), drives it with keystrokes or signals, and checks:
 
 * setup writes ?1049h, then ?1000h ?1002h ?1006h (click-and-drag mouse, SGR)
   and ?2004h (bracketed paste), and never ?1003h (any-motion) or ?1015h;
@@ -18,6 +19,9 @@ nothing touches the network), drives it with keystrokes or signals, and checks:
 * `3` (play Black against the computer) gets a first move from the engine
   thread, and without a key the screen calls the computer "Local search";
   without debug mode `d` says so;
+* `7` (Jev vs Laya) with LAYA_URL pointing at a closed port on 127.0.0.1: the
+  menu says Laya is ready, Laya's moves fall back to the local search with a
+  "Laya unavailable" note, the game goes on, and quitting restores the terminal;
 * --debug (and RCHESS_DEBUG=1) against the local search: the Status border says
   DEBUG, `d` shows an exchange view with "no Jev requests yet", and no debug log
   is created, since no Jev request was made;
@@ -180,7 +184,7 @@ ITERM2_PICTURE = b"\x1b]1337;File="
 KITTY_ATTRIBUTES_ANSWER = b"\x1b[?62;c"
 # Kitty's unicode placeholder: every cell of a kitty picture holds one.
 PLACEHOLDER = "\U0010EEEE"
-SECRET_VARS = ("JEV_API_KEY", "TYPESAFE_API_KEY")
+SECRET_VARS = ("JEV_API_KEY", "TYPESAFE_API_KEY", "LAYA_API_KEY")
 
 failures = []
 
@@ -688,6 +692,33 @@ def scenario_computer_opens(binary):
         check(app.wait_exit(), "process exits after y")
         check(app.status == 0, "exit status 0", f"status {app.status}")
         check_teardown(app, quit_at, "quit vs computer")
+    finally:
+        app.close()
+
+
+def scenario_laya_offline(binary):
+    print("scenario: menu 7 (Jev vs Laya) with laya-serve down plays on and quits cleanly")
+    # Port 1 is privileged and never listened on, so every Laya attempt is refused.
+    app = App(binary, env={"LAYA_URL": "http://127.0.0.1:1/v1/systemone"})
+    try:
+        check_setup(app)
+        check(app.wait_screen("1. Human vs Human"), "menu renders")
+        text = app.screen().text()
+        check("Laya ready (" in text, "the menu shows Laya ready with LAYA_URL set")
+        check("No JEV_API_KEY — local search" in text, "Jev is local search without a key")
+        app.send(b"7", settle=0)
+        check(app.wait_screen("Laya unavailable", timeout=15.0), "Laya's move falls back with a note")
+        check(app.wait_screen("3.", timeout=20.0), "the game keeps going")
+        text = app.screen().text()
+        check("Local search vs Laya" in text, "the title names both sides")
+        app.screen().show("laya offline")
+        app.send(b"q")
+        check(app.wait_screen("Quit the game in progress?"), "q asks for confirmation")
+        quit_at = len(app.stream)
+        app.send(b"y", settle=0)
+        check(app.wait_exit(), "process exits after y")
+        check(app.status == 0, "exit status 0", f"status {app.status}")
+        check_teardown(app, quit_at, "quit Jev vs Laya")
     finally:
         app.close()
 
@@ -1725,6 +1756,7 @@ def main():
 
     scenario_play_and_quit(binary)
     scenario_computer_opens(binary)
+    scenario_laya_offline(binary)
     for via_env in (False, True):
         scenario_debug(binary, via_env)
     scenario_query_unanswered(binary)
