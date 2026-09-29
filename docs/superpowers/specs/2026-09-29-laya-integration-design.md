@@ -279,3 +279,16 @@ With `pip install "laya[serve]"` and `laya-serve` running:
 - `README.md`: running `laya-serve`, `LAYA_URL`, the new menu rows and the Jev vs Laya pairing.
 - `docs/handoff/HANDOFF.md`: the new sub-project, per spec section 8 of the redesign spec.
 - The redesign spec is not edited; this spec supersedes its "Jev only" statements.
+
+## 10. Changes during planning and implementation
+
+- `laya-serve` may omit `model` and `usage`: `ChoiceAnswer.model` and `ChoiceAnswer.input_tokens`
+  are optional, and an answer without them is used.
+- A disabled engine keeps the existing note on its moves: `JEV_API_KEY not set — local search` /
+  `LAYA_URL not set — local search` (section 6 said no note).
+- Menu at the minimum size: the blank row under the heading is gone, and the line describing the
+  highlighted row is left out when the menu does not fit, so both engine statuses keep their rows.
+  The key hint has a brief form. `MIN_HEIGHT` stays 20.
+- The menu toggle names the models (`Jev`, `Laya`) even when an engine is off, so the two choices
+  stay distinguishable.
+- `--help` lists the Laya variables.

@@ -4,25 +4,27 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-The user's shell has `JEV_API_KEY` set. Run tests and the pty smoke test with both key variables
-unset, so nothing can reach the Jev API:
+The user's shell has `JEV_API_KEY` set and may set `LAYA_URL`. Run tests and the pty smoke test
+with the key and Laya variables unset, so nothing can reach Jev or a Laya server:
 
 ```sh
 cargo build
 cargo run                               # the terminal UI; needs a real terminal
 cargo run -- --debug                    # debug mode: Jev exchanges on `d` and in the debug log
-env -u JEV_API_KEY -u TYPESAFE_API_KEY cargo test                  # whole suite
-env -u JEV_API_KEY -u TYPESAFE_API_KEY cargo test tui::panels      # tests whose path contains a string
-env -u JEV_API_KEY -u TYPESAFE_API_KEY cargo test -- --exact tui::input::tests::a_pasted_tab_becomes_a_space
-cargo build && env -u JEV_API_KEY -u TYPESAFE_API_KEY python3 tests/pty_smoke.py --no-build   # the TUI on a pty
+LAYA_URL=http://127.0.0.1:8000/v1/systemone cargo run   # play Laya; needs laya-serve running
+env -u JEV_API_KEY -u TYPESAFE_API_KEY -u LAYA_URL -u LAYA_API_KEY cargo test                  # whole suite
+env -u JEV_API_KEY -u TYPESAFE_API_KEY -u LAYA_URL -u LAYA_API_KEY cargo test tui::panels      # tests whose path contains a string
+env -u JEV_API_KEY -u TYPESAFE_API_KEY -u LAYA_URL -u LAYA_API_KEY cargo test -- --exact tui::input::tests::a_pasted_tab_becomes_a_space
+cargo build && env -u JEV_API_KEY -u TYPESAFE_API_KEY -u LAYA_URL -u LAYA_API_KEY python3 tests/pty_smoke.py --no-build   # the TUI on a pty
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo bench                             # criterion perft benchmark
 cargo run --release --example jev_eval  # Jev evaluation harness; needs the key, calls the API
 ```
 
-`cargo test` is fully green. Three tests are `#[ignore]`d on purpose: the deep perft suite, the
-search time budget (run it with `--release`) and a live Jev round trip (needs the key).
+`cargo test` is fully green. Four tests are `#[ignore]`d on purpose: the deep perft suite, the
+search time budget (run it with `--release`), a live Jev round trip (needs the key) and a live
+Laya round trip (needs `LAYA_URL` and a running `laya-serve`).
 
 Snapshot tests (insta) live in `src/tui/snapshots/`. A mismatch writes a `.snap.new`; never accept
 snapshots blindly (`INSTA_UPDATE=always`, `cargo insta accept`). Review each `.snap.new` by hand,
@@ -45,7 +47,8 @@ Package `chess` (directory `rchess`), Rust 2024. `src/main.rs` only calls `chess
 `src/lib.rs` declares three layers, each built only on the ones before it:
 
 - `core`: chess rules. Pure logic, no I/O, no trait objects.
-- `engine`: the computer player (local search plus the Jev API).
+- `engine`: the computer player (local search plus a System One model: Jev, or Laya through
+  `laya-serve`).
 - `tui`: the terminal UI (ratatui and crossterm).
 
 The design is in `docs/superpowers/specs/2026-09-26-rchess-redesign-design.md` (sections 4-6, 9
@@ -72,16 +75,21 @@ is tracked in `docs/handoff/HANDOFF.md` (the protocol is spec section 8).
   pin-aware.
 - `annotate`: plain-language facts about each move plus a bucket from its score (Jev sees the
   words, never the numbers). `describe`: the position as the `state` object sent to Jev.
-- `config`: `EngineConfig::from_env` (`JEV_API_KEY` or `TYPESAFE_API_KEY`, `JEV_MODEL`,
-  `JEV_MAX_OPTIONS`, `JEV_FILTER_LOSING`); a bad value falls back to its default with a warning.
-  The endpoint is the fixed `chess::engine::JEV_ENDPOINT`.
-- `jev`: the HTTP client (ureq), retries, a 1 MiB body cap. With `trace` on (debug mode) it
+- `config`: `Provider` (Jev or Laya). `EngineConfig::from_env` reads Jev (`JEV_API_KEY` or
+  `TYPESAFE_API_KEY`, `JEV_MODEL`, `JEV_MAX_OPTIONS`, `JEV_FILTER_LOSING`; the endpoint is the
+  fixed `chess::engine::JEV_ENDPOINT`). `EngineConfig::laya_from_env` reads Laya (`LAYA_URL`,
+  `LAYA_API_KEY`, `LAYA_MODEL`, `LAYA_MAX_OPTIONS`, `LAYA_FILTER_LOSING`; 10 s timeout).
+  `enabled()`: Jev has a key, Laya a URL. A bad value falls back to its default with a warning.
+- `jev`: the HTTP client (ureq) for any System One endpoint (Jev, or Laya's `laya-serve`, which
+  speaks the same API), retries, a 1 MiB body cap; `Authorization` only when there is a key;
+  `model` and `usage` in the answer are optional. With `trace` on (debug mode) it
   records each exchange with the API key redacted. Every transport test is offline, against a
   scripted server on 127.0.0.1.
 - `player`: `ComputerPlayer::choose_move` plays forced moves and mate-in-one directly, otherwise
   asks Jev one `choice` question over a shortlist and vetoes blunders. It never fails: every
   problem (no key, HTTP errors, a bad answer) falls back to the local search's best move, noted
-  in `ComputerMove.note`, with `MoveSource` saying where the move came from.
+  in `ComputerMove.note`, with `MoveSource` saying where the move came from
+  (`MoveSource::label(provider)` names the model) and `ComputerMove.provider` which model.
 
 ### tui
 
@@ -90,7 +98,10 @@ is tracked in `docs/handoff/HANDOFF.md` (the protocol is spec section 8).
 - `app.rs`: the state machine. `App::handle` takes `AppEvent`s and returns `Action`s (start the
   engine, measure the font); it never spawns threads, and saving a file (written and fsynced
   in place) is the only blocking work it does. Screens are Menu, Playing and
-  GameOver with a dialog stack on top.
+  GameOver with a dialog stack on top. Modes: Human vs Human, Human vs Computer (Jev or Laya,
+  from the menu's toggle), Watch (a provider per side). The app holds one engine per provider;
+  each `EngineRequest` names the provider that answers it. A disabled engine's player is named
+  "Local search".
 - `panels.rs`: draws every screen from `App`'s accessors and returns the `HitMap` for the next
   mouse event. `board.rs`: board layout, drawing, hit-testing, and `PieceImages`, the encoded
   piece pictures kept between frames.
@@ -137,7 +148,8 @@ production), so tests pass their own values instead of touching the process envi
   profile, and also the picture-encoding crates (a test checks that list). A crate added to the
   encoding path needs its own `[profile.dev.package]` entry, or debug builds stall on pictures.
 - Never enable TRACE logging for `ureq` or `ureq_proto`: it prints the `Authorization` header
-  with the key. Never print or log the key; the engine redacts it in everything it records.
+  with the key. Never print or log a key (`JEV_API_KEY` or `LAYA_API_KEY`); the engine redacts
+  whichever key it sends in everything it records.
 - Jev gets object keys in alphabetical order (serde_json without `preserve_order`, by ruling).
 - Nothing may panic while restoring the terminal: after a hangup every write fails, and
   `eprintln!` panics on a failed write. `leave` ignores errors and runs every step.
@@ -155,7 +167,8 @@ terminal, so anything written to it would corrupt the screen.
 `.github/workflows/rust.yml` runs on pushes and pull requests to `main`, and by hand
 (`workflow_dispatch`). A matrix of `ubuntu-latest` and `macos-latest` (Rust 1.98.1 with rustfmt
 and clippy, cached) runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
-`cargo build` and `cargo test`, each with `JEV_API_KEY` and `TYPESAFE_API_KEY` unset. It uses no
+`cargo build` and `cargo test`, each with `JEV_API_KEY` and `TYPESAFE_API_KEY` unset (CI never
+sets the Laya variables). It uses no
 secrets. `tests/pty_smoke.py` is not part of CI: run it locally (see Commands) before pushing a
 change to the terminal, signal or graphics code, together with the commands CI runs. The
 toolchain is pinned exactly so that a new clippy lint cannot turn CI red on its own; bumping it
