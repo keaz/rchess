@@ -100,8 +100,8 @@ fn main() {
             continue;
         };
         let (source, jev_pick) = match &result.source {
-            MoveSource::Jev => ("jev", Some(result.san.clone())),
-            MoveSource::Vetoed { jev_pick } => ("vetoed", Some(jev_pick.clone())),
+            MoveSource::Model => ("jev", Some(result.san.clone())),
+            MoveSource::Vetoed { pick } => ("vetoed", Some(pick.clone())),
             MoveSource::OnlyMove => ("only-move", None),
             MoveSource::MateInOne => ("mate-in-1", None),
             MoveSource::Fallback => ("fallback", None),

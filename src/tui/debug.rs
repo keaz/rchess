@@ -149,7 +149,7 @@ impl Exchange {
             ply: game.moves().len(),
             fullmove: game.position().fullmove_number(),
             san: computer.san.clone(),
-            source: computer.source.to_string(),
+            source: computer.source.label(computer.provider),
             latency: computer.latency,
             http,
         }

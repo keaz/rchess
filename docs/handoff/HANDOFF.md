@@ -6,8 +6,8 @@ Read this first. Follow the protocol in section 8 of
 ## Current
 Sub-project: laya (Laya as a second computer player; Jev vs Laya) | Spec: docs/superpowers/specs/2026-09-29-laya-integration-design.md
 Branch: feat/laya (from main at fe1eb73)
-Last completed task: Task 2 (one client for any System One endpoint)
-Next task: Task 3 (moves say which provider chose them)
+Last completed task: Task 3 (moves say which provider chose them)
+Next task: Task 4 (engines and requests carry a provider)
 State: green (cargo test, fmt, clippy)
 Earlier: main is ahead of origin/main (not pushed); pushing it is still pending.
 

@@ -236,6 +236,7 @@ fn local_search_move(game: &Game, started: Instant) -> Option<ComputerMove> {
         mv: best,
         san: game.position().to_san(best),
         source: MoveSource::Fallback,
+        provider: crate::engine::Provider::Jev,
         top: Vec::new(),
         confidence: None,
         model: None,
@@ -465,7 +466,7 @@ mod tests {
         assert_eq!(second.generation, 2);
         assert!(matches!(
             &second.outcome,
-            EngineOutcome::Move(mv) if mv.source == MoveSource::Jev && mv.san == "Nf3"
+            EngineOutcome::Move(mv) if mv.source == MoveSource::Model && mv.san == "Nf3"
         ));
         assert_eq!(engine.threads().len(), 2, "one engine, asked twice");
     }

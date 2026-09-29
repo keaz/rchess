@@ -833,7 +833,7 @@ impl JevText {
         // source says just "vetoed" then, which saves a row on narrow panels.
         let source = match (&computer.source, &computer.note) {
             (MoveSource::Vetoed { .. }, Some(_)) => "vetoed".to_string(),
-            (source, _) => source.to_string(),
+            (source, _) => source.label(computer.provider),
         };
         let played = vec![
             vec![Span::raw("played "), Span::raw(computer.san.clone()).bold()],
@@ -1840,7 +1840,7 @@ mod tests {
         h.moves(&["e4"]);
         h.reply_with("g8f6", |computer| {
             computer.source = MoveSource::Vetoed {
-                jev_pick: "Qh4".to_string(),
+                pick: "Qh4".to_string(),
             };
             computer.top = vec![
                 ("Qh4".to_string(), 0.62),
@@ -2717,7 +2717,8 @@ mod tests {
         let mut computer = ComputerMove {
             mv,
             san: "Nf3".to_string(),
-            source: MoveSource::Jev,
+            source: MoveSource::Model,
+            provider: crate::engine::Provider::Jev,
             top: vec![
                 ("Nf3".to_string(), 0.615),
                 ("e4".to_string(), 0.2),

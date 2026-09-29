@@ -14,7 +14,7 @@ use serde_json::json;
 
 use super::{char_events, chord_event, key_event, mouse_event, paste_event};
 use crate::core::{Game, Move, Position as ChessPosition};
-use crate::engine::{ComputerMove, JEV_ENDPOINT, JevAttempt, JevExchange, MoveSource};
+use crate::engine::{ComputerMove, JEV_ENDPOINT, JevAttempt, JevExchange, MoveSource, Provider};
 use crate::tui::event::AppEvent;
 use crate::tui::worker::{Engine, LOCAL_SEARCH_STATUS};
 
@@ -62,7 +62,8 @@ pub(crate) fn jev_move(pos: &ChessPosition, uci: &str) -> ComputerMove {
     ComputerMove {
         mv,
         san: san.clone(),
-        source: MoveSource::Jev,
+        source: MoveSource::Model,
+        provider: Provider::Jev,
         top: vec![
             (san, 0.62),
             ("e5".to_string(), 0.21),
@@ -89,6 +90,7 @@ pub(crate) fn local_move(pos: &ChessPosition, uci: &str) -> ComputerMove {
         mv,
         san: pos.to_san(mv),
         source: MoveSource::Fallback,
+        provider: Provider::Jev,
         top: Vec::new(),
         confidence: None,
         model: None,
@@ -339,6 +341,6 @@ mod tests {
         assert_eq!(traced, traced_jev_move(game.position(), "d2d4"));
         let unscripted = engine.choose(&game).expect("a move");
         assert_eq!((unscripted.san.as_str(), unscripted.top.len()), ("a3", 1));
-        assert_eq!(unscripted.source, MoveSource::Jev);
+        assert_eq!(unscripted.source, MoveSource::Model);
     }
 }

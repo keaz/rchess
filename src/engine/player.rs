@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use crate::core::{Game, Move};
 
 use super::annotate::{Annotation, Bucket, annotate};
-use super::config::{EngineConfig, MAX_CHOICE_OPTIONS};
+use super::config::{EngineConfig, MAX_CHOICE_OPTIONS, Provider};
 use super::describe::describe;
 use super::jev::{
     ChoiceOption, ChoiceRequest, JevClient, JevExchange, MoveChooser, printable, redact,
@@ -27,31 +27,31 @@ prefer ones that remove threats against our pieces and keep our king safe.";
 /// Where a computer move came from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MoveSource {
-    /// Jev's pick.
-    Jev,
-    /// The only legal move; Jev was not asked.
+    /// The model's pick (Jev's or Laya's, see [`ComputerMove::provider`]).
+    Model,
+    /// The only legal move; the model was not asked.
     OnlyMove,
-    /// A mate in one; Jev was not asked.
+    /// A mate in one; the model was not asked.
     MateInOne,
-    /// Jev picked `jev_pick`, but it scored too far below the search best.
+    /// The model picked `pick`, but it scored too far below the search best.
     Vetoed {
-        /// SAN of the option Jev picked.
-        jev_pick: String,
+        /// SAN of the option the model picked.
+        pick: String,
     },
-    /// Jev was unavailable or answered unusably; the search best was played.
+    /// The model was unavailable or answered unusably; the search best was played.
     Fallback,
 }
 
-impl fmt::Display for MoveSource {
-    /// A short label for the TUI: `Jev`, `only move`, `mate in one`,
-    /// `vetoed (Jev picked Qxd5)` or `local search`.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl MoveSource {
+    /// A short label for the TUI with the model called by `provider`'s name: `Laya`,
+    /// `only move`, `mate in one`, `vetoed (Laya picked Qxd5)` or `local search`.
+    pub fn label(&self, provider: Provider) -> String {
         match self {
-            MoveSource::Jev => f.write_str("Jev"),
-            MoveSource::OnlyMove => f.write_str("only move"),
-            MoveSource::MateInOne => f.write_str("mate in one"),
-            MoveSource::Vetoed { jev_pick } => write!(f, "vetoed (Jev picked {jev_pick})"),
-            MoveSource::Fallback => f.write_str("local search"),
+            MoveSource::Model => provider.name().to_string(),
+            MoveSource::OnlyMove => "only move".to_string(),
+            MoveSource::MateInOne => "mate in one".to_string(),
+            MoveSource::Vetoed { pick } => format!("vetoed ({} picked {pick})", provider.name()),
+            MoveSource::Fallback => "local search".to_string(),
         }
     }
 }
@@ -65,9 +65,11 @@ pub struct ComputerMove {
     pub san: String,
     /// Where the move came from.
     pub source: MoveSource,
-    /// Up to three Jev options with probabilities, most likely first.
+    /// The model this player asks (or would have asked), from its config.
+    pub provider: Provider,
+    /// Up to three of the model's options with probabilities, most likely first.
     pub top: Vec<(String, f32)>,
-    /// Jev's confidence in its choice, when Jev answered.
+    /// The model's confidence in its choice, when it answered.
     pub confidence: Option<f32>,
     /// Versioned model ID that answered, with the API key redacted and control
     /// characters replaced, at most 40 characters.
@@ -128,6 +130,8 @@ impl<C: MoveChooser> ComputerPlayer<C> {
     /// The move to play, or `None` when the game is over.
     pub fn choose_move(&self, game: &Game) -> Option<ComputerMove> {
         let started = Instant::now();
+        let provider = self.config.provider;
+        let name = provider.name();
         if game.outcome().is_some() {
             return None;
         }
@@ -138,6 +142,7 @@ impl<C: MoveChooser> ComputerPlayer<C> {
             mv,
             san: pos.to_san(mv),
             source,
+            provider,
             top: Vec::new(),
             confidence: None,
             model: None,
@@ -154,7 +159,7 @@ impl<C: MoveChooser> ComputerPlayer<C> {
             return Some(plain(best.mv, MoveSource::MateInOne, None));
         }
         let Some(chooser) = &self.chooser else {
-            let note = "JEV_API_KEY not set — local search".to_string();
+            let note = format!("{} not set — local search", provider.setting());
             return Some(plain(best.mv, MoveSource::Fallback, Some(note)));
         };
 
@@ -188,7 +193,7 @@ impl<C: MoveChooser> ComputerPlayer<C> {
         let answer = match answer {
             Ok(answer) => answer,
             Err(error) => {
-                let note = self.redacted(&format!("Jev unavailable ({error}) — local search"));
+                let note = self.redacted(&format!("{name} unavailable ({error}) — local search"));
                 return Some(ComputerMove {
                     exchange,
                     ..plain(best.mv, MoveSource::Fallback, Some(note))
@@ -203,7 +208,7 @@ impl<C: MoveChooser> ComputerPlayer<C> {
                 ""
             };
             let note = format!(
-                "Jev returned an unknown option ({}{cut}) — local search",
+                "{name} returned an unknown option ({}{cut}) — local search",
                 printable(&choice, NOTE_KEY_CHARS)
             );
             return Some(ComputerMove {
@@ -223,24 +228,25 @@ impl<C: MoveChooser> ComputerPlayer<C> {
                 .find(|a| best.score - a.score <= margin)
                 .unwrap_or(&fallback);
             let note = format!(
-                "Jev picked {}, which the search rates much worse; played {}",
+                "{name} picked {}, which the search rates much worse; played {}",
                 pick.san, chosen.san
             );
             (
                 *chosen,
                 MoveSource::Vetoed {
-                    jev_pick: pick.san.clone(),
+                    pick: pick.san.clone(),
                 },
                 Some(note),
             )
         } else {
-            (*pick, MoveSource::Jev, None)
+            (*pick, MoveSource::Model, None)
         };
 
         Some(ComputerMove {
             mv: chosen.mv,
             san: chosen.san.clone(),
             source,
+            provider,
             top: answer
                 .probabilities
                 .iter()
@@ -279,6 +285,7 @@ fn shortlist(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::Provider;
     use crate::engine::jev::{ChoiceAnswer, JevAttempt, JevError, JevExchange, http_error};
     use serde_json::json;
     use std::sync::Mutex;
@@ -474,7 +481,8 @@ mod tests {
         ));
         let result = p.choose_move(&game(HANGING_QUEEN_TRAP)).unwrap();
         assert_eq!(result.san, "Kd2");
-        assert_eq!(result.source, MoveSource::Jev);
+        assert_eq!(result.source, MoveSource::Model);
+        assert_eq!(result.provider, Provider::Jev);
         assert_eq!(result.top[0], ("Kd2".to_string(), 0.6));
         assert_eq!(result.confidence, Some(0.8));
         assert_eq!(result.model.as_deref(), Some("jev-1.13.0"));
@@ -601,7 +609,7 @@ mod tests {
         assert_eq!(
             result.source,
             MoveSource::Vetoed {
-                jev_pick: "Qxd5".to_string()
+                pick: "Qxd5".to_string()
             }
         );
         assert_eq!(
@@ -670,7 +678,7 @@ mod tests {
         let result = keyed_player(mock)
             .choose_move(&game(HANGING_QUEEN_TRAP))
             .unwrap();
-        assert_eq!(result.source, MoveSource::Jev);
+        assert_eq!(result.source, MoveSource::Model);
         assert_eq!(result.model.as_deref(), Some("jev-1.13.0   [2J <redacted>"));
 
         let long = "m".repeat(100);
@@ -704,18 +712,69 @@ mod tests {
     }
 
     #[test]
-    fn move_source_labels() {
-        assert_eq!(MoveSource::Jev.to_string(), "Jev");
-        assert_eq!(MoveSource::OnlyMove.to_string(), "only move");
-        assert_eq!(MoveSource::MateInOne.to_string(), "mate in one");
+    fn move_source_labels_name_the_provider() {
+        for (provider, name) in [(Provider::Jev, "Jev"), (Provider::Laya, "Laya")] {
+            assert_eq!(MoveSource::Model.label(provider), name);
+            assert_eq!(
+                MoveSource::Vetoed {
+                    pick: "Qxd5".to_string()
+                }
+                .label(provider),
+                format!("vetoed ({name} picked Qxd5)")
+            );
+            assert_eq!(MoveSource::OnlyMove.label(provider), "only move");
+            assert_eq!(MoveSource::MateInOne.label(provider), "mate in one");
+            assert_eq!(MoveSource::Fallback.label(provider), "local search");
+        }
+    }
+
+    /// `player` with a Laya config.
+    fn laya_player(mock: MockChooser) -> ComputerPlayer<MockChooser> {
+        ComputerPlayer::new(
+            Some(mock),
+            EngineConfig {
+                provider: Provider::Laya,
+                endpoint: "http://127.0.0.1:8000/v1/systemone".to_string(),
+                ..EngineConfig::default()
+            },
+        )
+    }
+
+    #[test]
+    fn laya_moves_and_notes_name_laya() {
+        let result = laya_player(MockChooser::failing(JevError::Transport(
+            "connection refused".to_string(),
+        )))
+        .choose_move(&game(HANGING_QUEEN_TRAP))
+        .unwrap();
+        assert_eq!(result.provider, Provider::Laya);
+        assert_eq!(result.source, MoveSource::Fallback);
         assert_eq!(
-            MoveSource::Vetoed {
-                jev_pick: "Qxd5".to_string()
-            }
-            .to_string(),
-            "vetoed (Jev picked Qxd5)"
+            result.note.as_deref(),
+            Some("Laya unavailable (network error: connection refused) — local search")
         );
-        assert_eq!(MoveSource::Fallback.to_string(), "local search");
+        let picked = laya_player(MockChooser::answering("Kd2", vec![("Kd2", 1.0)]))
+            .choose_move(&game(HANGING_QUEEN_TRAP))
+            .unwrap();
+        assert_eq!(picked.provider, Provider::Laya);
+    }
+
+    #[test]
+    fn a_laya_player_without_a_url_notes_laya_url() {
+        let player = ComputerPlayer::<MockChooser>::new(
+            None,
+            EngineConfig {
+                provider: Provider::Laya,
+                endpoint: String::new(),
+                ..EngineConfig::default()
+            },
+        );
+        let result = player.choose_move(&game(HANGING_QUEEN_TRAP)).unwrap();
+        assert_eq!(
+            result.note.as_deref(),
+            Some("LAYA_URL not set — local search")
+        );
+        assert_eq!(result.provider, Provider::Laya);
     }
 
     #[test]
@@ -749,7 +808,7 @@ mod tests {
             vec![("Nf3", 0.5), ("Kd2", 0.4), ("zz", 0.1)],
         ));
         let result = p.choose_move(&game(HANGING_QUEEN_TRAP)).unwrap();
-        assert_eq!(result.source, MoveSource::Jev);
+        assert_eq!(result.source, MoveSource::Model);
         assert_eq!(result.top, vec![("Kd2".to_string(), 0.4)]);
     }
 
@@ -757,7 +816,7 @@ mod tests {
     fn trace_attaches_the_exchange_to_a_jev_move() {
         let p = traced_player(MockChooser::answering("Kd2", vec![("Kd2", 1.0)]));
         let result = p.choose_move(&game(HANGING_QUEEN_TRAP)).unwrap();
-        assert_eq!(result.source, MoveSource::Jev);
+        assert_eq!(result.source, MoveSource::Model);
         assert_eq!(result.exchange, Some(Box::new(mock_exchange())));
         assert_eq!(p.chooser.as_ref().unwrap().traced_calls(), 1);
     }
@@ -799,7 +858,7 @@ mod tests {
     fn no_exchange_without_trace() {
         let p = player(MockChooser::answering("Kd2", vec![("Kd2", 1.0)]));
         let result = p.choose_move(&game(HANGING_QUEEN_TRAP)).unwrap();
-        assert_eq!(result.source, MoveSource::Jev);
+        assert_eq!(result.source, MoveSource::Model);
         assert_eq!(result.exchange, None);
         let mock = p.chooser.as_ref().unwrap();
         assert_eq!(mock.requests().len(), 1);
@@ -844,7 +903,7 @@ mod tests {
         let chooser = Untraced(MockChooser::answering("Kd2", vec![("Kd2", 1.0)]));
         let p = ComputerPlayer::new(Some(chooser), config);
         let result = p.choose_move(&game(HANGING_QUEEN_TRAP)).unwrap();
-        assert_eq!(result.source, MoveSource::Jev);
+        assert_eq!(result.source, MoveSource::Model);
         assert_eq!(result.exchange, None);
     }
 }

@@ -4126,6 +4126,7 @@ mod tests {
             mv: best,
             san: request.game.position().to_san(best),
             source: MoveSource::Fallback,
+            provider: crate::engine::Provider::Jev,
             top: Vec::new(),
             confidence: None,
             model: None,
