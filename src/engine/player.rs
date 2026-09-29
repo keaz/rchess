@@ -163,7 +163,7 @@ impl<C: MoveChooser> ComputerPlayer<C> {
             return Some(plain(best.mv, MoveSource::Fallback, Some(note)));
         };
 
-        let annotations = annotate(&pos, &scored);
+        let annotations = without_repetitions(game, annotate(&pos, &scored));
         let candidates = shortlist(
             &annotations,
             self.config.filter_losing,
@@ -265,6 +265,28 @@ impl<C: MoveChooser> ComputerPlayer<C> {
             exchange,
         })
     }
+}
+
+/// `annotations` without the moves that return to a position already seen since the
+/// last irreversible move, unless no other move scores at least a draw (0): a side that
+/// is worse may welcome a repetition. A model that answers the same position the same
+/// way would otherwise shuffle back and forth into threefold repetition, because the
+/// search scores a repeated position as a draw, level with the best quiet moves.
+fn without_repetitions(game: &Game, annotations: Vec<Annotation>) -> Vec<Annotation> {
+    let pos = game.position();
+    let window = pos.halfmove_clock() as usize + 1;
+    let seen: Vec<u64> = game
+        .positions()
+        .iter()
+        .rev()
+        .take(window)
+        .map(|p| p.hash())
+        .collect();
+    let repeats = |a: &Annotation| seen.contains(&pos.play(a.mv).hash());
+    if !annotations.iter().any(|a| !repeats(a) && a.score >= 0) {
+        return annotations;
+    }
+    annotations.into_iter().filter(|a| !repeats(a)).collect()
 }
 
 /// Options for Jev: drop `losing` moves when filtering is on and anything else
@@ -905,5 +927,50 @@ mod tests {
         let result = p.choose_move(&game(HANGING_QUEEN_TRAP)).unwrap();
         assert_eq!(result.source, MoveSource::Model);
         assert_eq!(result.exchange, None);
+    }
+
+    /// `fen` (or the start position) with `uci` played.
+    fn played(fen: Option<&str>, uci: &[&str]) -> Game {
+        let mut game = fen.map_or_else(Game::new, |fen| Game::from_fen(fen).unwrap());
+        for m in uci {
+            let mv = game.position().parse_uci(m).unwrap();
+            game.play(mv).unwrap();
+        }
+        game
+    }
+
+    /// The option keys the chooser was offered in its first request.
+    fn offered(mock: &MockChooser) -> Vec<String> {
+        mock.requests()[0]
+            .options
+            .iter()
+            .map(|o| o.key.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_move_back_to_an_earlier_position_is_not_offered_in_a_level_game() {
+        // 1. e3 e5 2. Qe2 Qe7 3. Qd1 Qd8: 4. Qe2 would return to the position after 2. Qe2.
+        let game = played(None, &["e2e3", "e7e5", "d1e2", "d8e7", "e2d1", "e7d8"]);
+        let p = player(MockChooser::answering("e4", vec![("e4", 1.0)]));
+        let result = p.choose_move(&game).unwrap();
+        let keys = offered(p.chooser.as_ref().unwrap());
+        assert!(!keys.contains(&"Qe2".to_string()), "{keys:?}");
+        assert!(keys.contains(&"e4".to_string()), "{keys:?}");
+        assert_eq!(result.san, "e4");
+    }
+
+    #[test]
+    fn a_losing_side_may_still_repeat() {
+        // White is a queen down; 3. Kd1 repeats the position after 1. Kd1, and the draw is
+        // the best White can get.
+        let game = played(
+            Some("4k3/8/8/8/8/8/q7/4K3 w - - 0 1"),
+            &["e1d1", "a2a3", "d1e1", "a3a2"],
+        );
+        let p = player(MockChooser::answering("Kd1", vec![("Kd1", 1.0)]));
+        p.choose_move(&game).unwrap();
+        let keys = offered(p.chooser.as_ref().unwrap());
+        assert!(keys.contains(&"Kd1".to_string()), "{keys:?}");
     }
 }

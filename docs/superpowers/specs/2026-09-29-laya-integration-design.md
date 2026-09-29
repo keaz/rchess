@@ -301,3 +301,7 @@ With `pip install "laya[serve]"` and `laya-serve` running:
   `no requests yet` and is titled ` Exchange ` in a game without a computer.
 - The clear-text key warning treats `0.0.0.0` and `[::]` (laya-serve's bind addresses) as local
   and cuts the host it quotes to 60 printable characters.
+- Moves that return to a position seen since the last irreversible move are left off the
+  shortlist while another move scores at least a draw. Laya answers a position the same way every
+  time, and the search scores a repetition as a level draw, so without this every Laya checkpoint
+  shuffled a piece into threefold repetition within 15 plies. Jev shares the rule.

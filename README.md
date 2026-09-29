@@ -270,6 +270,10 @@ It also turns the score gap `d` between the move and the best move into one word
 | `bad` | 150 < `d` ≤ 300 |
 | `losing` | `d` > 300, or the move allows checkmate |
 
+Moves that return to a position already seen (since the last capture or pawn move) are left off
+the shortlist while any other move scores at least a draw, so the model cannot shuffle into a
+threefold repetition; a side that is worse keeps them, since a draw may be its best result.
+
 `describe.rs` writes the position from the point of view of the side to move: whose move it is,
 the move number, the phase (opening, middlegame, endgame), the material balance in words, whether
 we are in check, our pieces and theirs, the last six plies, and up to three of our pieces the

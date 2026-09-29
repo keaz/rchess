@@ -6,9 +6,9 @@ Read this first. Follow the protocol in section 8 of
 ## Current
 Sub-project: laya done (Laya as a second computer player; spec docs/superpowers/specs/2026-09-29-laya-integration-design.md)
 Branch: main (feat/laya merged at bc33854 and pushed; fix/laya-minors merged on top)
-Last completed task: laya deferred minors fixed (menu "(off)" labels, exchange view wording, clear-text warning host, 0.0.0.0 local, harness disabled-Jev replies)
+Last completed task: repetition guard: moves back to an earlier position are left off the model shortlist unless the side is worse (Laya was drawing by threefold repetition within 15 plies on every checkpoint)
 Next task: manual test below with a real laya-serve (incl. the `model` field check); push main so CI runs
-State: green (cargo test 735 passed / 4 ignored, fmt, clippy, pty smoke ALL CHECKS PASSED)
+State: green (cargo test 737 passed / 4 ignored, fmt, clippy, pty smoke ALL CHECKS PASSED)
 Earlier: main is ahead of origin/main (not pushed); pushing it is still pending.
 
 ## Verify before continuing
